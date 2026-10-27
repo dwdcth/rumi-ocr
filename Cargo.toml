@@ -2,6 +2,12 @@
 resolver = "3"
 members = ["capture", "cli", "ui", "plugins-worker", "ocr", "server"]
 
+[workspace.package]
+version = "0.1.0"
+license = "MulanPSL-2.0"
+repository = "https://github.com/dwdcth/rumi-ocr"
+edition = "2024"
+
 # 工作代号 Rumi：跨平台截图 OCR 应用（Umi-OCR 复刻）
 # - capture: 跨平台截图核心 crate（纯 lib）
 # - cli: rumi-capture CLI（组合 crate：bin 名不变，同时链接 capture+ocr，

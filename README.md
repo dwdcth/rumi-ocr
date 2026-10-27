@@ -107,7 +107,12 @@ POST /api/ocr     # {"base64":"..."} 或 {"path":"..."} → {"code":100,"data":[
 
 ## 📄 许可
 
-开源许可待定（对齐 Umi-OCR 的 MIT 之前请勿直接再分发）。
+本仓库代码以 [木兰宽松许可证，第2版（Mulan PSL v2）](LICENSE) 授权。
+
+致谢与依赖：本项目设计参考 [Umi-OCR](https://github.com/hiroi-sora/Umi-OCR)（MIT），
+识别引擎 [oar-ocr](https://github.com/GreatV/oar-ocr)、UI 框架 [Dioxus](https://dioxuslabs.com/)
+等依赖依其自身许可证授权；`plugins/demo_AbaOCR` 为 Umi-OCR 官方 demo 插件原样收录，
+版权归原项目。OCR 模型文件由 oar-ocr 运行时自动下载，模型许可见其项目页。
 
 ## 🙏 致谢
 
