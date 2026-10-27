@@ -55,7 +55,7 @@ xcap 输出 `image::RgbaImage` 与 K2 后全链路载体一致，零摩擦。
 
 根因是自家 CSS（`#main` 在 body flex row 下 shrink-to-fit，详见 `docs/开发记录.md`
 "最大化调查"节），`#main { width: 100% }` 一行修复，Wayland 门控已撤销。
-tao/wry/WebKitGTK 无需提 issue。咨询原文与经验提炼见 `docs/archive/` 与 `docs/开发经验.md`。
+tao/wry/WebKitGTK 无需提 issue。经验提炼见 `docs/开发经验.md`。
 
 ## 追加（2026-10-27 深夜）：Linux 托盘左键/双击唤出主窗口（换 ksni 后端）
 
