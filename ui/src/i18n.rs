@@ -148,9 +148,30 @@ pub mod k {
     pub const SET_PICKER_AUTO: &str = "set.picker_auto";
     pub const SET_PICKER_NATIVE: &str = "set.picker_native";
     pub const SET_PICKER_BUILTIN: &str = "set.picker_builtin";
+    /// 关闭按钮行为（设置页）
+    pub const SET_CLOSE_ACTION: &str = "set.close_action";
+    pub const SET_CLOSE_TRAY: &str = "set.close_tray";
+    pub const SET_CLOSE_QUIT: &str = "set.close_quit";
+    pub const SET_CLOSE_HINT: &str = "set.close_hint";
+    /// 运行日志（设置页卡片）
+    pub const SET_LOG_TITLE: &str = "set.log_title";
+    pub const SET_LOG_HINT: &str = "set.log_hint";
+    pub const SET_LOG_VIEW: &str = "set.log_view";
+    pub const SET_LOG_HIDE: &str = "set.log_hide";
+    pub const SET_LOG_COPY: &str = "set.log_copy";
+    pub const SET_LOG_EXPORT: &str = "set.log_export";
+    pub const SET_LOG_COPIED: &str = "set.log_copied";
+    pub const SET_LOG_EXPORTED: &str = "set.log_exported";
+    pub const SET_LOG_EXPORT_FAIL: &str = "set.log_export_fail";
+    /// 日志卡空态文案（无日志时显示在查看框里）
+    pub const SET_LOG_EMPTY: &str = "set.log_empty";
     /// Wave3：自定义标题栏按钮 tooltip
     pub const TB_MINIMIZE: &str = "tb.minimize";
     pub const TB_HIDE: &str = "tb.hide";
+    /// 标题栏按钮 tooltip（体验批次：最大化/还原/关闭）
+    pub const TB_MAXIMIZE: &str = "tb.maximize";
+    pub const TB_RESTORE: &str = "tb.restore";
+    pub const TB_CLOSE: &str = "tb.close";
     pub const SET_ENGINE: &str = "set.engine";
     pub const SET_MANAGE_ENGINE: &str = "set.manage_engine";
     pub const SET_NOTIFY: &str = "set.notify";
@@ -441,6 +462,12 @@ mod tests {
             k::BATCH_PICK_FOLDER, k::BATCH_FOLDER_SELECTED, k::BATCH_FOLDER_TRUNCATED,
             // Wave3 新词条：无边框窗口 / 自定义标题栏
             k::SET_FRAMELESS, k::SET_FRAMELESS_HINT, k::TB_MINIMIZE, k::TB_HIDE,
+            // 体验批次：标题栏/关闭行为/日志
+            k::TB_MAXIMIZE, k::TB_RESTORE, k::TB_CLOSE,
+            k::SET_CLOSE_ACTION, k::SET_CLOSE_TRAY, k::SET_CLOSE_QUIT, k::SET_CLOSE_HINT,
+            k::SET_LOG_TITLE, k::SET_LOG_HINT, k::SET_LOG_VIEW, k::SET_LOG_HIDE,
+            k::SET_LOG_COPY, k::SET_LOG_EXPORT, k::SET_LOG_COPIED, k::SET_LOG_EXPORTED,
+            k::SET_LOG_EXPORT_FAIL, k::SET_LOG_EMPTY,
             // M 波新词条：内置冻结帧选择器 / 窗口选择列表 / 选区方式
             k::KIND_REGION_BUILTIN, k::WIN_LABEL_TPL,
             k::PICKER_HINT, k::PICKER_GRABBING, k::PICKER_CANCEL,

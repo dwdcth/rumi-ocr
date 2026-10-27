@@ -22,6 +22,9 @@ pub const DEFAULT_LANG: &str = "zh_CN";
 pub const DEFAULT_THEME: &str = "light";
 /// 无边框窗口默认开（Wave3：自定义标题栏体验；出问题可在设置页关闭并重启回退）
 pub const DEFAULT_FRAMELESS: bool = true;
+/// 关闭按钮行为默认值（体验批次）：默认最小化到托盘，与 Umi-OCR 惯例一致；
+/// false = 点关闭直接退出。
+pub const DEFAULT_CLOSE_TO_TRAY: bool = true;
 /// 选区方式默认"跟随后端"（M 波：region_native=false 的后端自动走内置冻结帧选择器）
 pub const DEFAULT_PICKER_MODE: &str = "auto";
 /// 排版解析默认策略（P2 #11：by_line / merge_para / natural_para）
@@ -94,6 +97,9 @@ pub struct Settings {
     /// 最小化 + 隐藏到托盘）。与热键/端口同口径：**改动需重启应用生效**。
     /// 旧配置文件无该字段 → serde container default 补 [`DEFAULT_FRAMELESS`]。
     pub frameless: bool,
+    /// 关闭按钮行为（体验批次）：true = 最小化到托盘（默认，与 Umi-OCR 一致）；
+    /// false = 直接退出程序。启动时与点击时动态读取——设置页改完即生效，无需重启。
+    pub close_to_tray: bool,
     /// 选区方式（M 波冻结帧选择器）："auto"（跟随后端：caps.region_native=false
     /// 自动走内置冻结帧选择器）| "native"（强制原生选区）| "builtin"（强制内置
     /// 冻结帧拖选，Wayland 用户也可选它统一交互）。每次捕获时读取，保存即生效。
@@ -118,6 +124,7 @@ impl Default for Settings {
             formula_mode: false,
             sound: false,
             frameless: DEFAULT_FRAMELESS,
+            close_to_tray: DEFAULT_CLOSE_TO_TRAY,
             picker_mode: DEFAULT_PICKER_MODE.into(),
         }
     }
@@ -534,6 +541,36 @@ mod tests {
         let (s4, warn4) = load_from(&path);
         assert!(warn4.is_none());
         assert!(!s4.frameless);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 体验批次关闭按钮行为：旧配置（无 close_to_tray 字段）→ 默认 true
+    ///（最小化到托盘，与 Umi-OCR 一致）；用户显式选 false（点关闭直接退出）→
+    /// 落盘读回保持 false。
+    #[test]
+    fn close_to_tray_defaults_true_and_roundtrip() {
+        let dir = test_dir("rumi-cfg-close");
+        let path = dir.join("config.toml");
+
+        // 全新/缺失配置 → 默认 true
+        let (s, warn) = load_from(&path);
+        assert!(warn.is_none());
+        assert!(s.close_to_tray, "缺省应最小化到托盘（DEFAULT_CLOSE_TO_TRAY=true）");
+
+        // 旧配置文件：只有部分字段、无 close_to_tray 段 → serde container default 补 true
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "hotkey = \"alt+q\"\nhttp_port = 1224\ntheme = \"dark\"\n").unwrap();
+        let (s2, warn2) = load_from(&path);
+        assert!(warn2.is_none());
+        assert!(s2.close_to_tray, "旧配置缺 close_to_tray 字段应补默认 true");
+
+        // 显式 false（点关闭直接退出）→ 原样保留
+        let mut s3 = Settings::default();
+        s3.close_to_tray = false;
+        save_to(&path, &s3).unwrap();
+        let (s4, warn4) = load_from(&path);
+        assert!(warn4.is_none());
+        assert!(!s4.close_to_tray);
         std::fs::remove_dir_all(&dir).ok();
     }
 

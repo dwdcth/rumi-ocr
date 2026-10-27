@@ -39,6 +39,7 @@ mod batch;
 mod hotkey;
 mod i18n;
 mod icon;
+mod logger;
 mod ocr_flow;
 mod picker;
 mod plugins_ui;
@@ -46,8 +47,8 @@ mod settings;
 mod tray;
 
 use dioxus::desktop::{
-    use_muda_event_handler, use_wry_event_handler, Config, LogicalSize, WindowBuilder,
-    WindowCloseBehaviour, WindowEvent,
+    use_muda_event_handler, use_tray_icon_event_handler, use_wry_event_handler, Config, LogicalSize,
+    WindowBuilder, WindowCloseBehaviour, WindowEvent,
 };
 use dioxus::html::{Key, Modifiers};
 use dioxus::prelude::*;
@@ -101,33 +102,50 @@ fn show_main_window() {
     dc.window.set_focus();
 }
 
-/// 读取当前窗口几何并写进 settings（P0 #4：关闭隐藏前 / 托盘退出前调用）。
-/// 尺寸异常小（最小化中的假值等）时不保存，避免下次启动拿到坏几何。
+/// 读取当前窗口几何并写进 settings（关闭隐藏前 / 托盘退出前调用）。
+///
+/// 咨询结论（2026-10-27，Wayland/GDK 整数缩放错配）后的口径：
+/// - **持久化统一存逻辑尺寸**：`inner_size()` 返回物理像素（GDK 在分数缩放屏上
+///   按整数 scale=2 出 buffer），save/restore 全程 LogicalSize 才跨缩放稳定；
+/// - 最大化/全屏中的几何不是普通态几何，**跳过保存**；
+/// - Wayland 客户端拿不到自身位置（outer_position 恒 0/垃圾值），x/y 不更新，
+///   沿用上次持久化值且启动时不还原（由合成器摆放）。
 fn save_window_state() {
-    let dc = dioxus::desktop::window();
-    let win = &dc.window;
-    let Ok(pos) = win.outer_position() else {
-        return;
-    };
-    let size = win.inner_size();
-    if size.width < 300 || size.height < 200 {
+    let win = &dioxus::desktop::window().window;
+    if win.is_maximized() || win.fullscreen().is_some() {
         return;
     }
+    let size = win.inner_size();
+    let scale = win.scale_factor();
+    if scale <= 0.0 {
+        return;
+    }
+    let (lw, lh) = (
+        (size.width as f64 / scale).round() as u32,
+        (size.height as f64 / scale).round() as u32,
+    );
+    if lw < 300 || lh < 200 {
+        return; // 最小化中的假值等兜底
+    }
+    let prev = settings::get().window;
     let st = settings::WindowState {
-        x: pos.x,
-        y: pos.y,
-        w: size.width,
-        h: size.height,
+        x: prev.map(|p| p.x).unwrap_or(0),
+        y: prev.map(|p| p.y).unwrap_or(0),
+        w: lw,
+        h: lh,
     };
     let _ = settings::update(|s| {
         s.window = Some(st);
         Ok(())
     });
+    logger::info("window", format!("[window] 几何已保存(逻辑) {g:?}", g = st));
 }
 
 fn main() {
     // 启动读配置（解析警告在设置页显示）
     let _ = settings::init();
+    // 初始化运行日志（体验批次）：文件落盘，设置页可查看 / 复制 / 导出
+    logger::init();
     // 全局语言原子同步（i18n::tt 在 spawn 闭包里取词的来源）
     i18n::set_lang(&settings::get().lang);
     // 历史缓存目录超 50 个文件删最旧（LRU；识别侧内存上限同 HISTORY_CAP）
@@ -149,17 +167,22 @@ fn main() {
         builder = builder.with_decorations(false);
     }
     if let Some(w) = saved {
-        // 显式给出 position+size：dioxus 自身的 debug 态窗口恢复（resume_from_state）
-        // 见到显式值会跳过，两套持久化不打架
-        builder = builder
-            .with_position(dioxus::desktop::tao::dpi::PhysicalPosition::new(w.x, w.y))
-            .with_inner_size(dioxus::desktop::tao::dpi::PhysicalSize::new(w.w, w.h));
+        // 持久化统一为逻辑尺寸（save_window_state 注释）；只还原尺寸——Wayland 下
+        // 客户端位置请求会被合成器忽略（xdg-shell 无定位协议），由 KWin 自行摆放。
+        // 越界兜底：旧版本存过物理值（如 2000×1520），或换过显示器后超屏——
+        // 超出合理逻辑范围就回退默认尺寸，避免每次启动都拿到放不下的几何。
+        let sane = (400..=2560).contains(&w.w) && (300..=1600).contains(&w.h);
+        let (rw, rh) = if sane { (w.w, w.h) } else { (DEFAULT_WIN.0 as u32, DEFAULT_WIN.1 as u32) };
+        builder = builder.with_inner_size(LogicalSize::new(rw, rh));
     }
     let cfg = Config::default()
         .with_window(builder)
         .with_icon(icon::window_icon())
-        // 关闭按钮 = 隐藏到托盘（不退进程）；退出只走托盘菜单（M3 §2）
-        .with_close_behaviour(WindowCloseBehaviour::WindowHides);
+        // 关闭行为恒为 Hides（隐藏）；"直接退出"模式在 wry CloseRequested 处理器里
+        // 动态读 settings 决定（改设置即时生效，无需重启）。
+        .with_close_behaviour(WindowCloseBehaviour::WindowHides)
+        // 单击托盘不弹窗（菜单走右键）；显示主窗口 = 双击托盘 / 菜单项（见 App 内 handler）
+        .with_tray_icon_show_window_on_click(false);
     LaunchBuilder::new().with_cfg(cfg).launch(App);
 }
 
@@ -182,21 +205,27 @@ fn main() {
 /// 成对补齐的语义变量：`--danger-overlay` / `--danger-overlay-soft`（忽略区域
 /// 编辑态/拖拽态半透明红，深浅各自取自家 --danger 的色相）、`--img-bg`
 /// （透明 PNG 预览衬底，两套同用白色保证二维码可扫）。
+/// 现代化润色批次成对补齐：`--edge`（无边框窗口内描边色，body 用 inset
+/// box-shadow 画出窗口边界）、`--shadow`（卡片微投影）。--shadow 的值把颜色
+/// 写在长度前（rgba() 0 1px 3px，与 0 1px 3px rgba() 等价）：变量表审计测试
+/// 要求每个值以颜色字面量开头，纯长度开头会被判为非颜色。
 fn theme_vars(theme: &str) -> &'static str {
     if theme == "light" {
-        "--bg:#f3f5fa; --panel:#ffffff; --panel-2:#eef1f9; --secondary:#eef1f9; --border:#d9deed; --hover:#e9edf8;
+        "--bg:#f3f5fa; --panel:#ffffff; --panel-2:#eef1f9; --secondary:#eef1f9; --border:#c9d0e4; --hover:#e9edf8;
          --fg:#1c2340; --fg-dim:#5a6180; --fg-faint:#656c8c;
          --primary:#3f5be0; --primary-strong:#2f4bd0; --primary-soft:rgba(63,91,224,.10);
          --on-primary:#ffffff; --danger:#cc3d31; --danger-soft:rgba(204,61,49,.08);
          --danger-overlay:rgba(204,61,49,.22); --danger-overlay-soft:rgba(204,61,49,.15);
-         --img-bg:#ffffff; --ok:#128058; --warn:#8f6314;"
+         --img-bg:#ffffff; --ok:#128058; --warn:#8f6314;
+         --edge:#b9c1da; --shadow:rgba(23,32,64,.07) 0 1px 3px;"
     } else {
         "--bg:#0f1322; --panel:#161c31; --panel-2:#1d2440; --secondary:#1d2440; --border:#272e4e; --hover:#202848;
          --fg:#e8eaf6; --fg-dim:#9aa3c7; --fg-faint:#8e97bd;
          --primary:#5b7bfa; --primary-strong:#7391ff; --primary-soft:rgba(91,123,250,.16);
          --on-primary:#ffffff; --danger:#e06c5f; --danger-soft:rgba(224,108,95,.14);
          --danger-overlay:rgba(224,108,95,.25); --danger-overlay-soft:rgba(224,108,95,.18);
-         --img-bg:#ffffff; --ok:#3fc98f; --warn:#d8a13a;"
+         --img-bg:#ffffff; --ok:#3fc98f; --warn:#d8a13a;
+         --edge:#323c68; --shadow:rgba(0,0,0,.35) 0 1px 3px;"
     }
 }
 
@@ -208,14 +237,16 @@ fn css(theme: &str) -> String {
     format!(
         r#"
 :root {{ {vars};
-        --radius:10px; --radius-s:7px; --sp1:8px; --sp2:14px; --sp3:22px;
+        --radius:12px; --radius-s:8px; --sp1:8px; --sp2:14px; --sp3:22px;
         --fs-s:12px; --fs-m:14px; --fs-l:17px; color-scheme: {scheme}; }}
 * {{ box-sizing: border-box; }}
 html, body {{ height: 100%; }}
 #main {{ height: 100%; }}
 body {{ margin: 0; font-family: system-ui, "Noto Sans CJK SC", "Segoe UI", sans-serif;
        background: var(--bg); color: var(--fg); font-size: var(--fs-m); line-height: 1.5;
-       display: flex; flex-direction: row; overflow: hidden; }}
+       display: flex; flex-direction: row; overflow: hidden;
+       /* 无边框窗口的内描边 = 窗口边界：浅色模式下与白色桌面壁纸可分辨 */
+       box-shadow: inset 0 0 0 1px var(--edge); }}
 
 /* ── 原生表单控件深色审计（M 波用户报障修复）────────────────
    select 闭合态样式正确，但弹开的 option 列表走 UA 默认（WebKitGTK 深色下
@@ -245,30 +276,38 @@ label.chk input[type="checkbox"] {{ width: 15px; height: 15px; margin: 0; flex: 
            padding: 10px 8px; overflow-y: auto; }}
 .brand {{ display: flex; align-items: center; gap: 8px; font-weight: 700;
          font-size: var(--fs-l); padding: 4px 8px 14px; white-space: nowrap; }}
-.brand-mark {{ width: 24px; height: 24px; border-radius: 7px; background: var(--primary);
+.brand-mark {{ width: 24px; height: 24px; border-radius: 7px;
+              background: linear-gradient(135deg, var(--primary), var(--primary-strong));
               color: var(--on-primary); display: flex; align-items: center; justify-content: center;
               font-size: 13px; font-weight: 700; flex: 0 0 auto; }}
 .content {{ flex: 1; min-width: 0; overflow-y: auto; padding: var(--sp2) var(--sp3);
            display: flex; flex-direction: column; }}
 
 /* ── 自定义标题栏（Wave3 无边框窗口）────────────────────────
-   高 36px、横贯侧栏+内容区：左 = 拖拽区（应用名，onmousedown 起 GTK 移动），
-   右 = 最小化 / 隐藏到托盘 图形按钮（12px）。按钮走设计系统：--panel 底、
+   高 40px、横贯侧栏+内容区：左 = 拖拽区（应用名，onmousedown 起 GTK 移动），
+   右 = 最小化 / 隐藏到托盘 图形按钮（13px）。按钮走设计系统：--panel 底、
    --hover 反馈；关闭钮 hover 用 --danger。文字不可选中避免拖拽时反蓝。 */
-.titlebar {{ flex: 0 0 36px; height: 36px; display: flex; align-items: stretch;
+.titlebar {{ flex: 0 0 40px; height: 40px; display: flex; align-items: stretch;
             background: var(--panel); border-bottom: 1px solid var(--border);
             user-select: none; -webkit-user-select: none; }}
-.tb-drag {{ flex: 1; display: flex; align-items: center; padding: 0 14px;
+.tb-drag {{ flex: 1; display: flex; align-items: center; padding: 0 16px;
            font-size: var(--fs-s); color: var(--fg-dim); cursor: default; }}
 .tb-name {{ font-weight: 600; letter-spacing: .2px; }}
 .tb-actions {{ display: flex; align-items: stretch; }}
 button.tb-btn {{ width: 46px; padding: 0; border: none; border-radius: 0;
-                background: transparent; color: var(--fg-dim); font-size: 12px;
+                background: transparent; color: var(--fg-dim); font-size: 13px;
                 display: flex; align-items: center; justify-content: center;
                 transition: background .15s, color .15s; }}
 button.tb-btn:hover:not(:disabled) {{ background: var(--hover); color: var(--fg); border: none; }}
 button.tb-btn:active:not(:disabled) {{ transform: none; }}
 button.tb-btn.tb-close:hover:not(:disabled) {{ background: var(--danger); color: var(--on-primary); }}
+
+/* 运行日志卡片（体验批次）：头部行 + 只读等宽文本区 */
+.log-card {{ margin-bottom: var(--sp2); }}
+.log-head {{ display: flex; align-items: center; gap: 12px; }}
+.log-head .grow {{ flex: 1; min-width: 0; }}
+.log-view {{ margin-top: 10px; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+            font-size: 12px; line-height: 1.5; white-space: pre; overflow-x: auto; }}
 
 /* ── 字号层级：h1 → .page-title → 正文 → .hint（P0 #2）────── */
 h1 {{ font-size: 20px; font-weight: 700; margin: 0 0 var(--sp2); }}
@@ -276,16 +315,18 @@ h1 {{ font-size: 20px; font-weight: 700; margin: 0 0 var(--sp2); }}
 .hint {{ font-size: var(--fs-s); color: var(--fg-faint); }}
 
 /* ── 按钮体系：secondary（默认）/ primary / danger 全态 ────── */
-button {{ font: inherit; font-size: var(--fs-m); padding: 7px 14px; border-radius: var(--radius-s);
+button {{ font: inherit; font-size: var(--fs-m); padding: 7px 16px; border-radius: var(--radius-s);
          border: 1px solid var(--border); background: var(--secondary); color: var(--fg);
-         cursor: pointer; transition: background .15s, border-color .15s, color .15s; }}
+         cursor: pointer;
+         transition: background .15s, border-color .15s, color .15s, box-shadow .18s; }}
 button.secondary {{ background: var(--secondary); }}
 button:hover:not(:disabled) {{ background: var(--hover); border-color: var(--fg-faint); }}
 button:active:not(:disabled) {{ transform: translateY(1px); }}
 button:focus-visible {{ outline: 2px solid var(--primary); outline-offset: 1px; }}
 button:disabled {{ opacity: .5; cursor: not-allowed; }}
 button.primary {{ background: var(--primary); border-color: var(--primary); color: var(--on-primary); }}
-button.primary:hover:not(:disabled) {{ background: var(--primary-strong); border-color: var(--primary-strong); }}
+button.primary:hover:not(:disabled) {{ background: var(--primary-strong); border-color: var(--primary-strong);
+                                     box-shadow: 0 2px 10px var(--primary-soft); }}
 button.danger {{ background: transparent; border-color: var(--danger); color: var(--danger); }}
 button.danger:hover:not(:disabled) {{ background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }}
 button.btn-sm {{ padding: 3px 10px; font-size: var(--fs-s); }}
@@ -302,7 +343,8 @@ button.nav-item.active:hover:not(:disabled) {{ background: var(--primary-soft); 
 
 /* ── 输入控件 ─────────────────────────────────────────────── */
 input, select, textarea {{ font: inherit; font-size: var(--fs-m); padding: 7px 10px; border-radius: var(--radius-s);
-      border: 1px solid var(--border); background: var(--bg); color: var(--fg); min-width: 0; }}
+      border: 1px solid var(--border); background: var(--bg); color: var(--fg); min-width: 0;
+      transition: border-color .15s; }}
 input:focus-visible, select:focus-visible, textarea:focus-visible {{ outline: 2px solid var(--primary); outline-offset: -1px; }}
 textarea {{ resize: vertical; line-height: 1.45; }}
 .formrow {{ display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; }}
@@ -315,7 +357,7 @@ textarea {{ resize: vertical; line-height: 1.45; }}
 
 /* ── 卡片 / 引擎状态 / 徽标 ───────────────────────────────── */
 .card {{ background: var(--panel); border: 1px solid var(--border);
-        border-radius: var(--radius); padding: 12px 16px; }}
+        border-radius: var(--radius); padding: 12px 16px; box-shadow: var(--shadow); }}
 .engine-card {{ display: flex; align-items: center; gap: 12px; margin-bottom: var(--sp2); }}
 .engine-card .grow {{ flex: 1; min-width: 0; }}
 .engine-card-title {{ font-weight: 600; }}
@@ -482,6 +524,15 @@ button.win-row:hover {{ background: var(--hover); border-color: transparent; }}
 .win-title {{ font-size: var(--fs-m); overflow: hidden; text-overflow: ellipsis;
              white-space: nowrap; }}
 .win-sub {{ font-size: var(--fs-s); color: var(--fg-faint); }}
+
+/* ── 滚动条（现代化润色）：细圆角滑块、hover 提亮、轨道透明 ──────
+   thumb 用 2px 透明边框 + background-clip: content-box 做出"悬浮细条"观感；
+   hover 只换 background-color，保留 clip 形状不变。 */
+::-webkit-scrollbar {{ width: 10px; height: 10px; }}
+::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 5px;
+                            border: 2px solid transparent; background-clip: content-box; }}
+::-webkit-scrollbar-thumb:hover {{ background-color: var(--fg-faint); }}
+::-webkit-scrollbar-track {{ background: transparent; }}
 "#
     )
 }
@@ -585,7 +636,7 @@ fn NavItem(label: String, icon: NavIconName, active: bool, on_click: Callback) -
     }
 }
 
-// ── 自定义标题栏（Wave3 无边框窗口）──────────────────────────────────────────
+// ── 自定义标题栏（Wave3 无边框窗口；体验批次加最大化/还原 + 动态关闭行为）────
 //
 // 仅 settings.frameless（默认开）时渲染，置于界面最顶、横贯侧栏+内容区。
 // API 结论（读 ~/.cargo/registry dioxus-desktop 0.7.10 / tao 0.34.8 源码确认）：
@@ -593,10 +644,14 @@ fn NavItem(label: String, icon: NavIconName, active: bool, on_click: Callback) -
 //   `Window::drag_window()`（window.rs:1305，GTK 下 gtk_window_begin_move_drag）
 //   并带全屏守卫；官方注释即要求在 onmousedown 里调用。DesktopContext 没有
 //   drag_window 方法，须走 `.drag()` 或 `.window.drag_window()`，本处用前者。
+// - 双击标题栏拖拽区 / 最大化还原按钮：tao `Window::is_maximized()` 探测 +
+//   `set_maximized(to)` 切换，以窗口实际状态回写信号驱动按钮图形与 tooltip
+//   （titlebar_toggle_maximize，双击与按钮共用）。
 // - 最小化：tao `Window::set_minimized(true)`（window.rs:955）。
-// - 关闭 = 现有"隐藏到托盘"路径：set_visible(false)，与启动时注册的
-//   WindowCloseBehaviour::WindowHides 语义一致（不新增退出逻辑）；隐藏前先
-//   save_window_state()，与 CloseRequested 事件路径的几何保存同口径。
+// - 关闭按钮行为动态（close_to_tray ? 隐藏 : 退出）：onclick 现场读 settings，
+//   设置页改完即时生效、无需重启；托盘模式 = 存几何后 set_visible(false)
+//   （与启动时注册的 WindowCloseBehaviour::WindowHides 同口径），退出模式 =
+//   存几何后 exit(0)（与托盘菜单"退出"同口径）。tooltip 只是提示，不锁定行为。
 // 边缘 resize 依赖合成器（KWin 对 undecorated 窗口同样提供边缘拖拽），
 // 不做特殊处理。
 
@@ -605,24 +660,64 @@ fn titlebar_minimize() {
     dioxus::desktop::window().window.set_minimized(true);
 }
 
-/// 标题栏关闭：存几何 + 隐藏窗口（= 托盘化，与 WindowHides 同一路径）
-fn titlebar_hide_to_tray() {
+/// 最大化/还原切换（双击拖拽区与按钮共用）。
+/// Wayland 实证（KDE/tao 0.34.8/wry 0.53.5，详见 docs/开发记录.md）：
+/// - `set_maximized` 在 undecorated 窗口上触发 webview 渲染失同步（布局整体
+///   错乱+输入失效，focus/显隐 nudge 均无法修复）——不可用；
+/// - `set_fullscreen(Borderless)` 渲染正常，但输入命中区与渲染错位；进入后
+///   追加 `set_focus()` nudge 修复输入区（tao#1218 同类问题的上游经验）。
+/// 状态信号**不在这里乐观回写**：由 App 的 wry Resized 处理器同步。
+/// 最大化/还原切换（双击拖拽区与按钮共用）。
+/// 状态信号**不在这里乐观回写**：最大化是合成器异步确认的，
+/// 由 App 的 wry Resized 处理器读 `is_maximized()` 同步给 TitleBar 的按钮图形。
+fn titlebar_toggle_maximize() {
+    let w = &dioxus::desktop::window().window;
+    let to = !w.is_maximized();
+    logger::info("window", format!("[window] 最大化切换 -> {to}"));
+    w.set_maximized(to);
+}
+
+/// 标题栏关闭：行为随设置动态读取（改完即生效）——托盘模式存几何后隐藏；
+/// 退出模式存几何后直接退进程（与托盘菜单"退出"同口径）
+fn titlebar_close() {
     save_window_state();
-    dioxus::desktop::window().window.set_visible(false);
+    if settings::get().close_to_tray {
+        dioxus::desktop::window().window.set_visible(false);
+    } else {
+        logger::info("window", "[window] 关闭按钮 → 退出程序".into());
+        std::process::exit(0);
+    }
 }
 
 #[component]
-fn TitleBar() -> Element {
+fn TitleBar(maximized: Signal<bool>, show_maximize: bool) -> Element {
+    // tooltip 随设置/状态走；行为本身在 onclick 里动态读取，不受 tooltip 状态影响
+    let close_tip = if settings::get().close_to_tray {
+        i18n::tt(i18n::k::TB_HIDE).to_string()
+    } else {
+        i18n::tt(i18n::k::TB_CLOSE).to_string()
+    };
+    let max_tip = if maximized() {
+        i18n::tt(i18n::k::TB_RESTORE).to_string()
+    } else {
+        i18n::tt(i18n::k::TB_MAXIMIZE).to_string()
+    };
     rsx! {
         div { class: "titlebar",
             div {
                 class: "tb-drag",
-                // 左键按下即开始拖动窗口（松开自动结束）；右键不触发
+                // 左键按下即开始拖动窗口；双击 = 最大化/还原（桌面惯例，
+                // Wayland 下与最大化按钮同源禁用，见 show_maximize 注释）
                 onmousedown: move |e: MouseEvent| {
                     if e.trigger_button() != Some(dioxus::html::input_data::MouseButton::Primary) {
                         return;
                     }
                     dioxus::desktop::window().drag();
+                },
+                ondoubleclick: move |_| {
+                    if show_maximize {
+                        titlebar_toggle_maximize();
+                    }
                 },
                 span { class: "tb-name", "Rumi OCR" }
             }
@@ -630,8 +725,18 @@ fn TitleBar() -> Element {
                 button { class: "tb-btn", title: "{i18n::tt(i18n::k::TB_MINIMIZE)}",
                     onclick: move |_| titlebar_minimize(),
                     "—" }
-                button { class: "tb-btn tb-close", title: "{i18n::tt(i18n::k::TB_HIDE)}",
-                    onclick: move |_| titlebar_hide_to_tray(),
+                // Wayland 门控：undecorated + GTK 分数缩放（整数 scale 出 buffer）
+                // 下 set_maximized 触发 webview 渲染失同步——最大化后标题栏消失/
+                // 右侧空白、输入失效；focus/显隐/±1px/fullscreen 五种 nudge 实测
+                // 均无法绕开（X11 后端正常，坐实 GDK-Wayland 路径问题）。待上游
+                // 修复后移除门控；取证与复现计划见 docs/task-queue.md。
+                if show_maximize {
+                    button { class: "tb-btn", title: "{max_tip}",
+                        onclick: move |_| titlebar_toggle_maximize(),
+                        if maximized() { "❐" } else { "▢" } }
+                }
+                button { class: "tb-btn tb-close", title: "{close_tip}",
+                    onclick: move |_| titlebar_close(),
                     "✕" }
             }
         }
@@ -680,6 +785,9 @@ fn App() -> Element {
     let page_status = use_signal(|| "选择插件自动读取其配置 schema；可保存 options、切换引擎".to_string());
     // M 波：内置冻结帧选择器激活态（Some(全屏帧 data-url) = 主窗口全屏拖选态）
     let picker = use_signal(|| Option::<String>::None);
+    // 窗口最大化态（TitleBar 按钮图形用）：由 wry Resized 事件读 is_maximized 同步
+    // ——最大化是合成器异步确认的，不在点击处理器里乐观回写（咨询结论）
+    let mut win_maximized = use_signal(|| false);
 
     let ctx = CaptureCtx {
         shot,
@@ -713,6 +821,12 @@ fn App() -> Element {
     let mut caps_text = caps_text;
     let mut engine_st = engine_st;
     use_hook(move || {
+        // 缩放系数进日志（排障关键值：GDK 在分数缩放屏上按整数 scale 出 buffer，
+        // inner_size 是物理像素——几何换算/持久化口径见 save_window_state 注释）
+        logger::info(
+            "window",
+            format!("[window] scale_factor={}", dioxus::desktop::window().window.scale_factor()),
+        );
         spawn(async move {
             match Capturer::shared().await {
                 Ok(c) => {
@@ -783,7 +897,7 @@ fn App() -> Element {
     // 托盘事件，故直接挂在 muda handler 上（busctl 合成 Event + 最小复现实证）。
     use_muda_event_handler(move |ev| {
         // 排障插桩：托盘菜单事件是否送达（KDE→dbusmenu Event→gtk→muda→tao 链路）
-        eprintln!("[tray] menu event: id={}", ev.id().0);
+        logger::info("tray", format!("[tray] menu event: id={}", ev.id().0));
         match ev.id().0.as_str() {
             tray::ID_SHOW => show_main_window(),
             tray::ID_OCR => {
@@ -813,6 +927,18 @@ fn App() -> Element {
         }
     });
 
+    // 托盘图标交互：双击 = 显示主窗口；单击不动作（右键出菜单）。
+    // Linux/AppIndicator 宿主可能不派发 TrayIconEvent（tray.rs 已知限制），
+    // 菜单"打开主窗口"仍是等价兜底。
+    use_tray_icon_event_handler(move |ev| {
+        if let dioxus::desktop::trayicon::TrayIconEvent::DoubleClick { button, .. } = ev {
+            if *button == dioxus::desktop::trayicon::MouseButton::Left {
+                logger::info("tray", "[tray] 双击 → 显示主窗口".into());
+                show_main_window();
+            }
+        }
+    });
+
     // 托盘菜单 i18n + 原地刷新：语言 / 热键暂停态 / 热键提示任一变化都刷新词条。
     // 词条在 tray::refresh 里经 i18n::tt 读全局原子语言，这里先同步原子再刷新，
     // 保证组件路径（ts/Signal）与线程路径（tt/原子）看到同一份语言。
@@ -826,20 +952,41 @@ fn App() -> Element {
         menu_for_effect.refresh(&hotkey_for_menu_effect(), paused_for_menu_effect());
     });
 
-    // P0 #4：关闭按钮保存窗口几何。dioxus 对 CloseRequested 的处理（WindowHides →
-    // set_visible(false)）在 launch.rs 的事件 match 里，而 wry 事件 handler 在其之前的
-    // app.tick() 派发——此处先写盘，随后窗口才被隐藏。
+    // 关闭按钮：存几何 + 按设置决定去向。dioxus 对 CloseRequested 的默认处理
+    // （WindowHides → set_visible(false)）在 launch.rs 的事件 match 里，而 wry
+    // 事件 handler 在其之前的 app.tick() 派发——"直接退出"模式在这里 exit(0)，
+    // 隐藏动作来不及执行进程就退了；托盘模式则随之正常隐藏。
+    // Resized：最大化/还原是合成器异步确认的，按钮图形状态在这里同步（单窗口
+    // 应用直接读全局 window()，无需对 window_id 分流）。
     use_wry_event_handler(move |ev, _| {
-        if let TaoEvent::WindowEvent {
-            event: WindowEvent::CloseRequested,
-            ..
-        } = ev
-        {
-            save_window_state();
+        match ev {
+            TaoEvent::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                save_window_state();
+                if !settings::get().close_to_tray {
+                    logger::info("window", "[window] 关闭请求 → 退出程序".into());
+                    std::process::exit(0);
+                }
+            }
+            TaoEvent::WindowEvent {
+                event: WindowEvent::Resized(_),
+                ..
+            } => {
+                // 按钮图形状态跟踪：最大化是异步确认的，以窗口实况为准
+                let m = dioxus::desktop::window().window.is_maximized();
+                if win_maximized() != m {
+                    win_maximized.set(m);
+                }
+            }
+            _ => {}
         }
     });
 
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
+    // Wayland 门控（见 TitleBar 内注释）：最大化按钮/双击仅在非 Linux-Wayland 显示
+    let show_maximize = session != "wayland" || !cfg!(target_os = "linux");
     let tab_v = tab();
     let theme_v = theme();
     let css_text = css(&theme_v);
@@ -860,7 +1007,7 @@ fn App() -> Element {
         } else {
         div { class: "shell",
             if frameless_now {
-                TitleBar {}
+                TitleBar { maximized: win_maximized, show_maximize }
             }
             div { class: "shell-body",
                 Sidebar { tab, lang }
@@ -1528,8 +1675,8 @@ fn OcrRow(
                 class: "{locate_cls}",
                 title: "{locate_tip}",
                 onclick: move |_| {
-                    // 交接诊断插桩：点击是否触发 + 信号状态（ui_run.out 追踪定位链路）
-                    eprintln!("[locate] click no={no} box={locate_box:?} prev={:?}", locate());
+                    // 交接诊断插桩：点击是否触发 + 信号状态（追踪定位链路，落运行日志）
+                    logger::info("locate", format!("[locate] click no={no} box={locate_box:?} prev={:?}", locate()));
                     let Some(b) = locate_box else { return; };
                     let off = matches!(locate(), Some((n, _)) if n == no);
                     locate.set(if off { None } else { Some((no, b)) });
@@ -1698,8 +1845,8 @@ fn locate_view(
             ((b[3] - b[1]).max(1.0) as f64 / sh * dh).max(3.0),
         ))
     })();
-    // 交接诊断插桩：定位激活时的渲染几何（None = 尺寸守卫未过，见 ui_run.out）
-    eprintln!("[locate] view b={b:?} size={size:?} disp={disp:?} -> {out:?}");
+    // 交接诊断插桩：定位激活时的渲染几何（None = 尺寸守卫未过，落运行日志）
+    logger::info("locate", format!("[locate] view b={b:?} size={size:?} disp={disp:?} -> {out:?}"));
     out
 }
 
@@ -1863,6 +2010,14 @@ fn SettingsPage(
     let mut frameless_sel = use_signal(move || s.frameless);
     // M 波：选区方式三选（跟随后端 / 原生 / 内置；捕获时读取，保存即生效）
     let mut picker_sel = use_signal(move || s.picker_mode.clone());
+    // 关闭按钮行为（即时生效：onchange 即写盘，无需点保存）
+    let mut close_sel = use_signal(move || {
+        if s.close_to_tray { "tray".to_string() } else { "quit".to_string() }
+    });
+    // 运行日志：查看开关 + 尾部内容镜像
+    let mut log_show = use_signal(|| false);
+    let mut log_text = use_signal(String::new);
+    let log_path_str = logger::log_path().display().to_string();
     let cfg_path = settings::config_path().display().to_string();
     let load_warn = settings::load_warning();
     let pid = plugins_ui::active_worker_pid();
@@ -1999,9 +2154,83 @@ fn SettingsPage(
                     "{t(i18n::k::SET_MANAGE_ENGINE)}" }
             }
 
+            // 状态行放在日志卡之前：复制/导出的反馈写 page_status，若在日志卡之后，
+            // 展开 14 行日志时反馈会被顶到视口外看不见
             page_status_line { status: page_status }
             if let Some(w) = load_warn {
                 div { class: "warnline", "{w}" }
+            }
+
+            // 运行日志（体验批次）：查看 / 复制 / 导出，方便用户发开发者排障
+            div { class: "card log-card",
+                div { class: "log-head",
+                    div { class: "grow",
+                        div { class: "engine-card-title", "{t(i18n::k::SET_LOG_TITLE)}" }
+                        div { class: "engine-card-sub", "{t(i18n::k::SET_LOG_HINT)}" }
+                    }
+                    div { class: "row",
+                        button { onclick: move |_| {
+                                if log_show() {
+                                    log_show.set(false);
+                                } else {
+                                    log_text.set(logger::tail(64 * 1024));
+                                    log_show.set(true);
+                                }
+                            },
+                            if log_show() { "{t(i18n::k::SET_LOG_HIDE)}" } else { "{t(i18n::k::SET_LOG_VIEW)}" }
+                        }
+                        button { onclick: move |_| {
+                                match copy_text(&logger::read_all()) {
+                                    Ok(()) => page_status.set(i18n::tt(i18n::k::SET_LOG_COPIED).to_string()),
+                                    Err(e) => page_status.set(i18n::fill(i18n::tt(i18n::k::SET_LOG_EXPORT_FAIL), e)),
+                                }
+                            },
+                            "{t(i18n::k::SET_LOG_COPY)}"
+                        }
+                        button { class: "primary", onclick: move |_| {
+                                // rfd 同步对话框在 Linux GTK 后端会死锁主线程，
+                                // 统一经 run_blocking 放 std 线程（见 batch.rs pick_files）
+                                let rx = ocr_flow::run_blocking(|| {
+                                    rfd::FileDialog::new()
+                                        .set_file_name("rumi.log")
+                                        .save_file()
+                                });
+                                spawn(async move {
+                                    match rx.await {
+                                        Ok(Some(path)) => match logger::export_to(&path) {
+                                            Ok(()) => page_status.set(i18n::fill(
+                                                i18n::tt(i18n::k::SET_LOG_EXPORTED),
+                                                path.display().to_string(),
+                                            )),
+                                            Err(e) => page_status.set(i18n::fill(
+                                                i18n::tt(i18n::k::SET_LOG_EXPORT_FAIL),
+                                                e,
+                                            )),
+                                        },
+                                        Ok(None) => {} // 用户取消
+                                        Err(_) => page_status.set(i18n::tt(i18n::k::SET_THREAD_LOST).to_string()),
+                                    }
+                                });
+                            },
+                            "{t(i18n::k::SET_LOG_EXPORT)}"
+                        }
+                    }
+                }
+                if log_show() {
+                    textarea {
+                        class: "log-view",
+                        readonly: true,
+                        rows: "14",
+                        spellcheck: false,
+                        // 空态文案：刚装好/日志被清时给一句提示而不是空白框
+                        value: if log_text().is_empty() {
+                            t(i18n::k::SET_LOG_EMPTY).to_string()
+                        } else {
+                            log_text()
+                        },
+                    }
+                    span { class: "hint", "日志文件：{log_path_str}" }
+                }
             }
 
             div { class: "card",
@@ -2063,6 +2292,27 @@ fn SettingsPage(
                                 "{t(i18n::k::SET_PICKER_BUILTIN)}" }
                         }
                         span { class: "hint", "{t(i18n::k::SET_PICKER_HINT)}" }
+                    }
+                }
+                // 关闭按钮行为（体验批次）：托盘常驻（默认）/ 直接退出；即时生效
+                div { class: "formrow",
+                    label { title: "{t(i18n::k::SET_CLOSE_HINT)}", "{t(i18n::k::SET_CLOSE_ACTION)}" }
+                    div { class: "field",
+                        select { class: "ctl", value: "{close_sel()}",
+                            onchange: move |e| {
+                                let v = e.value();
+                                close_sel.set(v.clone());
+                                let _ = settings::update(|s| {
+                                    s.close_to_tray = v == "tray";
+                                    Ok(())
+                                });
+                            },
+                            option { value: "tray", selected: close_sel() == "tray",
+                                "{t(i18n::k::SET_CLOSE_TRAY)}" }
+                            option { value: "quit", selected: close_sel() == "quit",
+                                "{t(i18n::k::SET_CLOSE_QUIT)}" }
+                        }
+                        span { class: "hint", "{t(i18n::k::SET_CLOSE_HINT)}" }
                     }
                 }
                 // Wave3：无边框窗口（自定义标题栏）。与热键/端口同口径——重启生效，

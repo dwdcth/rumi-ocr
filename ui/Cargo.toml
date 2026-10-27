@@ -34,10 +34,12 @@ toml = "0.9"
 dirs = "6"
 # P2 #12：设置页忽略正则的行内校验（识别管线本体在 ocr crate 的 PostRules）
 regex = "1"
-# P1 #10：识别完成桌面通知（Linux 走 zbus/notify；默认关，设置页开关）。
-# 任务书写 notify-rust 5，但本机 ustc 镜像最高只有 4.18.x；基础 API
-# （Notification::new().summary().body().show()）4/5 一致，先落 4。
-notify-rust = "4"
 # J2 #4：识别完成提示音（无资产文件，运行时合成两短音）。ustc 镜像有 0.20.x，
 # API 与 0.19 同形（OutputStream::try_default 返回 (stream, handle) 元组）。
 rodio = "0.20"
+# 运行日志时间戳（本地时区 %Y-%m-%d %H:%M:%S）；已在依赖树，声明直用零成本
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# 桌面通知仅 Linux（zbus）；Win/macOS 接系统通知留 TODO
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = "4"

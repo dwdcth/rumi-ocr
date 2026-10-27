@@ -552,11 +552,15 @@ pub fn capture_and_ocr(ctx: CaptureCtx, kind: Kind) {
     }
     busy.set(true);
     status.set(i18n::fill(i18n::tt(i18n::k::STA_CAPTURING), kind.label()));
+    // 体验批次：运行日志（设置页可查）——每次捕获真正开始记一条（Kind 已派生 Debug）
+    crate::logger::info("ocr", format!("[ocr] 开始 kind={kind:?}"));
     spawn(async move {
         let cap = match Capturer::shared().await {
             Ok(c) => c,
             Err(e) => {
-                status.set(i18n::fill(i18n::tt(i18n::k::STA_PROBE_FAIL), e));
+                let msg = i18n::fill(i18n::tt(i18n::k::STA_PROBE_FAIL), e);
+                status.set(msg.clone());
+                crate::logger::err("ocr", msg);
                 busy.set(false);
                 return;
             }
@@ -584,15 +588,19 @@ pub fn capture_and_ocr(ctx: CaptureCtx, kind: Kind) {
                     recognize_captured(ctx, frame, url, kind.label().to_string()).await
                 }
                 Err(e) => {
-                    status.set(format!("{}{e}", i18n::tt(i18n::k::ERR_MARK)));
+                    let msg = format!("{}{e}", i18n::tt(i18n::k::ERR_MARK));
+                    status.set(msg.clone());
+                    crate::logger::err("ocr", msg);
                     busy.set(false);
                 }
             },
             Err(e) => {
-                status.set(i18n::filln(
+                let msg = i18n::filln(
                     i18n::tt(i18n::k::STA_CAP_FAIL),
                     &[&kind.label(), &e],
-                ));
+                );
+                status.set(msg.clone());
+                crate::logger::err("ocr", msg);
                 busy.set(false);
             }
         }
@@ -641,7 +649,9 @@ pub fn capture_region_builtin(ctx: CaptureCtx) {
         };
         let Ok(url) = frame_to_data_url(&frame) else {
             window_restore_normal();
-            status.set(format!("{}{}", i18n::tt(i18n::k::ERR_MARK), i18n::tt(i18n::k::PICKER_ENCODE_FAIL)));
+            let msg = format!("{}{}", i18n::tt(i18n::k::ERR_MARK), i18n::tt(i18n::k::PICKER_ENCODE_FAIL));
+            status.set(msg.clone());
+            crate::logger::err("ocr", msg);
             busy.set(false);
             return;
         };
@@ -687,11 +697,13 @@ pub async fn finish_builtin_region(ctx: CaptureCtx, rect: (f64, f64, f64, f64), 
         Some(frame) => {
             let label = i18n::tt(i18n::k::KIND_REGION_BUILTIN).to_string();
             let Ok(url) = frame_to_data_url(&frame) else {
-                status.set(format!(
+                let msg = format!(
                     "{}{}",
                     i18n::tt(i18n::k::ERR_MARK),
                     i18n::tt(i18n::k::PICKER_ENCODE_FAIL)
-                ));
+                );
+                status.set(msg.clone());
+                crate::logger::err("ocr", msg);
                 busy.set(false);
                 return;
             };
@@ -914,6 +926,8 @@ async fn finish_recognize(
         .unwrap_or_else(|| i18n::tt(i18n::k::STA_NO_TEXT).to_string());
     lines.set(ls.clone());
     texts.set(ls.iter().map(|l| l.text.clone()).collect());
+    // 体验批次：运行日志——识别成功落地记行数（设置页日志卡可回查）
+    crate::logger::info("ocr", format!("[ocr] 完成 lines={count}"));
     // 历史落盘：完整 PNG → 缓存目录；内存条目只留缩略图（磁盘 IO 放 std 线程）
     let png = frame_to_png(&frame.to_rgba_image()).unwrap_or_default();
     let at = now_secs();
@@ -973,15 +987,23 @@ async fn finish_recognize(
     if crate::settings::get().sound {
         sound::play_done_chime();
     }
-    // 桌面通知（P1 #10，默认关）：后台线程，失败静默（通知是尽力而为的副产物）
+    // 桌面通知（P1 #10，默认关）：后台线程，失败静默（通知是尽力而为的副产物）。
+    // notify-rust 仅 Linux（zbus，见 ui/Cargo.toml 平台门控）；非 Linux 记日志留 TODO
     if crate::settings::get().notify {
-        let body = i18n::fill(i18n::tt(i18n::k::NTF_DONE), count);
-        std::thread::spawn(move || {
-            let _ = notify_rust::Notification::new()
-                .summary("Rumi OCR")
-                .body(&body)
-                .show();
-        });
+        #[cfg(target_os = "linux")]
+        {
+            let body = i18n::fill(i18n::tt(i18n::k::NTF_DONE), count);
+            std::thread::spawn(move || {
+                let _ = notify_rust::Notification::new()
+                    .summary("Rumi OCR")
+                    .body(&body)
+                    .show();
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            crate::logger::err("notify", "桌面通知暂仅支持 Linux".into());
+        }
     }
 }
 
@@ -1137,12 +1159,15 @@ pub async fn recognize_captured(ctx: CaptureCtx, frame: Frame, url: String, labe
         }
         Ok((Err(e), _)) => {
             engine_st.set(EngineState::Error(e.clone()));
-            status.set(i18n::fill(i18n::tt(i18n::k::STA_RECOGNIZE_FAIL), e));
+            let msg = i18n::fill(i18n::tt(i18n::k::STA_RECOGNIZE_FAIL), e);
+            status.set(msg.clone());
+            crate::logger::err("ocr", msg);
         }
         Err(_) => {
             let lost = i18n::tt(i18n::k::STA_OCR_THREAD_LOST).to_string();
             engine_st.set(EngineState::Error(lost.clone()));
-            status.set(lost);
+            status.set(lost.clone());
+            crate::logger::err("ocr", lost);
         }
     }
     busy.set(false);
@@ -1206,12 +1231,15 @@ pub fn paste_and_ocr(ctx: CaptureCtx) {
                     }
                     Ok((Err(e), _)) => {
                         engine_st.set(EngineState::Error(e.clone()));
-                        status.set(i18n::fill(i18n::tt(i18n::k::STA_RECOGNIZE_FAIL), e));
+                        let msg = i18n::fill(i18n::tt(i18n::k::STA_RECOGNIZE_FAIL), e);
+                        status.set(msg.clone());
+                        crate::logger::err("ocr", msg);
                     }
                     Err(_) => {
                         let lost = i18n::tt(i18n::k::STA_OCR_THREAD_LOST).to_string();
                         engine_st.set(EngineState::Error(lost.clone()));
-                        status.set(lost);
+                        status.set(lost.clone());
+                        crate::logger::err("ocr", lost);
                     }
                 }
             }

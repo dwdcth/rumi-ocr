@@ -14,6 +14,8 @@ Rust 复刻自 [Umi-OCR](https://github.com/hiroi-sora/Umi-OCR)，兼容 Umi 插
 
 ## ✨ 特性
 
+![主界面（浅色）](docs/img/main-light.png)
+
 - **免费开源，离线运行**：识别全程本地完成，无需联网，不上传任何数据
 - **截图识别**：全屏 / 区域 / 活动窗口，一键截图即出文字；支持窗口内粘贴图片识别
 - **原生引擎**：[oar-ocr](https://github.com/GreatV/oar-ocr)（PP-OCRv6，纯 Rust 实现，模型自动下载缓存）
@@ -89,6 +91,10 @@ POST /api/ocr     # {"base64":"..."} 或 {"path":"..."} → {"code":100,"data":[
 
 ## ⚠️ 已知限制
 
+- **Linux · Wayland 最大化按钮**：undecorated 窗口 + GTK 分数缩放（整数 scale 出
+  buffer）组合下，运行时 `set_maximized` 会触发 webview 渲染失同步（标题栏消失/
+  右侧空白、输入失效）——Wayland 会话暂隐藏该按钮（X11/Windows/macOS 正常），
+  上游取证与跟进见 `docs/task-queue.md`
 - **Wayland 全局热键**：global-hotkey 在 Linux 是 X11 grab，纯 Wayland 焦点下不触发——
   托盘菜单是等价入口；彻底方案待接 org.kde.kglobalaccel
 - **portal 区域截图**：KDE 后端未实现规范 v3 的 target=Area，故区域截图走 Spectacle；
