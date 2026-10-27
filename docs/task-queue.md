@@ -51,15 +51,9 @@ xcap 输出 `image::RgbaImage` 与 K2 后全链路载体一致，零摩擦。
 - **下一条：N 波（标注编辑器）**，蓝本 Capter src/capture/draw.rs，挂选择器之上，标注层不参与 OCR。
 - 真机验收债：Windows/macOS（DPI、SCK 权限、多屏 Monitor[0] 判定）。
 
-## 追加（2026-10-27 晚，体验批次遗留）：Wayland 最大化上游取证
+## 追加（2026-10-27 深夜更新）：Wayland 最大化"上游取证"——已解决，无需跟进
 
-背景与完整实验矩阵见 `docs/开发记录.md`"最大化调查"节与 `docs/consult-maximize-wayland.md`。
-现状：Wayland 会话已门控隐藏最大化按钮（X11/Win/mac 正常），六种缓解全部实测无效。
-
-1. **最小复现**：纯 tao 0.34.8 + wry 0.53.5（不经 dioxus），undecorated 窗口 +
-   `set_maximized`，KDE Wayland 分数缩放（1.6）环境。复现 → 提 tao/wry issue；
-   不复现 → 提 dioxus-desktop issue（附复现步骤）。
-2. **WAYLAND_DEBUG=client 取证**：最大化时 `xdg_toplevel.configure` 尺寸 vs
-   `wl_surface.attach` buffer 尺寸 vs `set_buffer_scale`，确认失同步发生在
-   WebKit 渲染侧还是 GTK allocation 侧。
-3. issue 落地后回来移除 main.rs 的 `show_maximize` 门控（TitleBar 注释里有锚点）。
+根因是自家 CSS（`#main` 在 body flex row 下 shrink-to-fit，详见 `docs/开发记录.md`
+"最大化调查"节），`#main { width: 100% }` 一行修复，Wayland 门控已撤销。
+tao/wry/WebKitGTK 无需提 issue。咨询文档（consult-maximize-wayland*.md）保留作
+为排查方法论存档。

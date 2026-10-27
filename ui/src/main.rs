@@ -241,7 +241,11 @@ fn css(theme: &str) -> String {
         --fs-s:12px; --fs-m:14px; --fs-l:17px; color-scheme: {scheme}; }}
 * {{ box-sizing: border-box; }}
 html, body {{ height: 100%; }}
-#main {{ height: 100%; }}
+/* width 必须显式：body 是 flex row 容器（Wave3 遗留），#main 作为 flex item
+   缺省按内容收缩（shrink-to-fit）——窗口宽 > 内容 max-content（本机实测
+   ≈1550.64px，工具栏全展开宽）时 #main 停在内容宽，右侧空白、标题栏按钮
+   "消失"，曾误判为 Wayland 最大化上游 bug（完整复盘见 docs/开发记录.md）。 */
+#main {{ width: 100%; height: 100%; }}
 body {{ margin: 0; font-family: system-ui, "Noto Sans CJK SC", "Segoe UI", sans-serif;
        background: var(--bg); color: var(--fg); font-size: var(--fs-m); line-height: 1.5;
        display: flex; flex-direction: row; overflow: hidden;
@@ -690,7 +694,7 @@ fn titlebar_close() {
 }
 
 #[component]
-fn TitleBar(maximized: Signal<bool>, show_maximize: bool) -> Element {
+fn TitleBar(maximized: Signal<bool>) -> Element {
     // tooltip 随设置/状态走；行为本身在 onclick 里动态读取，不受 tooltip 状态影响
     let close_tip = if settings::get().close_to_tray {
         i18n::tt(i18n::k::TB_HIDE).to_string()
@@ -706,35 +710,23 @@ fn TitleBar(maximized: Signal<bool>, show_maximize: bool) -> Element {
         div { class: "titlebar",
             div {
                 class: "tb-drag",
-                // 左键按下即开始拖动窗口；双击 = 最大化/还原（桌面惯例，
-                // Wayland 下与最大化按钮同源禁用，见 show_maximize 注释）
+                // 左键按下即开始拖动窗口；双击 = 最大化/还原（桌面惯例）
                 onmousedown: move |e: MouseEvent| {
                     if e.trigger_button() != Some(dioxus::html::input_data::MouseButton::Primary) {
                         return;
                     }
                     dioxus::desktop::window().drag();
                 },
-                ondoubleclick: move |_| {
-                    if show_maximize {
-                        titlebar_toggle_maximize();
-                    }
-                },
+                ondoubleclick: move |_| titlebar_toggle_maximize(),
                 span { class: "tb-name", "Rumi OCR" }
             }
             div { class: "tb-actions",
                 button { class: "tb-btn", title: "{i18n::tt(i18n::k::TB_MINIMIZE)}",
                     onclick: move |_| titlebar_minimize(),
                     "—" }
-                // Wayland 门控：undecorated + GTK 分数缩放（整数 scale 出 buffer）
-                // 下 set_maximized 触发 webview 渲染失同步——最大化后标题栏消失/
-                // 右侧空白、输入失效；focus/显隐/±1px/fullscreen 五种 nudge 实测
-                // 均无法绕开（X11 后端正常，坐实 GDK-Wayland 路径问题）。待上游
-                // 修复后移除门控；取证与复现计划见 docs/task-queue.md。
-                if show_maximize {
-                    button { class: "tb-btn", title: "{max_tip}",
-                        onclick: move |_| titlebar_toggle_maximize(),
-                        if maximized() { "❐" } else { "▢" } }
-                }
+                button { class: "tb-btn", title: "{max_tip}",
+                    onclick: move |_| titlebar_toggle_maximize(),
+                    if maximized() { "❐" } else { "▢" } }
                 button { class: "tb-btn tb-close", title: "{close_tip}",
                     onclick: move |_| titlebar_close(),
                     "✕" }
@@ -985,8 +977,6 @@ fn App() -> Element {
     });
 
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
-    // Wayland 门控（见 TitleBar 内注释）：最大化按钮/双击仅在非 Linux-Wayland 显示
-    let show_maximize = session != "wayland" || !cfg!(target_os = "linux");
     let tab_v = tab();
     let theme_v = theme();
     let css_text = css(&theme_v);
@@ -1007,7 +997,7 @@ fn App() -> Element {
         } else {
         div { class: "shell",
             if frameless_now {
-                TitleBar { maximized: win_maximized, show_maximize }
+                TitleBar { maximized: win_maximized }
             }
             div { class: "shell-body",
                 Sidebar { tab, lang }
