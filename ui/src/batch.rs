@@ -675,7 +675,7 @@ pub fn BatchPage(mut busy: Signal<bool>, lang: Signal<String>) -> Element {
     let btn_start = if busy_v { "识别中…".to_string() } else { t(i18n::k::BATCH_START).to_string() };
 
     rsx! {
-        div { class: "page",
+        div { class: "page page-wide",
             div { class: "page-head",
                 span { class: "page-title", "{t(i18n::k::PAGE_BATCH)}" }
             }

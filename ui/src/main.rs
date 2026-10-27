@@ -392,6 +392,9 @@ textarea {{ resize: vertical; line-height: 1.45; }}
 
 /* ── 页面骨架 / 识别结果 ──────────────────────────────────── */
 .page {{ width: 100%; max-width: 980px; }}
+/* 宽窗口自适应：识别页/批量页解除上限铺满（预览与结果行随宽伸展）；
+   设置/插件页保留 980 上限（表单超宽可读性差） */
+.page.page-wide {{ max-width: none; }}
 .page-head {{ display: flex; align-items: center; gap: 12px; margin-bottom: var(--sp2); flex-wrap: wrap; }}
 .results {{ display: flex; gap: 10px; margin-top: var(--sp1); width: 100%; align-items: stretch; }}
 .shot-pane {{ flex: 0 0 42%; display: flex; align-items: flex-start; justify-content: center;
@@ -1213,7 +1216,7 @@ fn MainTab(
 
     rsx! {
         div {
-            class: "page",
+            class: "page page-wide",
             // P1 #8：识别页窗口内 Ctrl+V → 粘贴识别；ESC 取消划选（P1 #9）
             // 或关闭窗口选择列表面（M 波任务 3）
             tabindex: "0",
