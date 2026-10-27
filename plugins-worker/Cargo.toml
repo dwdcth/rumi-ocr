@@ -1,0 +1,11 @@
+[package]
+name = "plugins-worker"
+version = "0.1.0"
+edition = "2024"
+description = "Umi-OCR 插件协议兼容层（宿主侧）：python worker 进程管理、JSON-RPC 行协议、托管 venv"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# process：spawn python worker；io-util：stdin/stdout 行协议读写；rt：blocking 包装内置 runtime
+tokio = { version = "1", features = ["process", "io-util", "rt"] }

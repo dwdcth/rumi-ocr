@@ -1,0 +1,43 @@
+[package]
+name = "rumi-ui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rumi-ui"
+path = "src/main.rs"
+
+[dependencies]
+# Dioxus 0.7 桌面壳（wry/WebKitGTK）；launch_cfg 在 0.7 已不存在，用 LaunchBuilder
+dioxus = { version = "0.7", features = ["desktop"] }
+# 截图核心（探测 + 三种捕获）
+rumi-capture = { path = "../capture" }
+# OCR 引擎（全局单例，后台线程调用；见 ../ocr）
+rumi-ocr = { path = "../ocr" }
+# 插件 worker（M2）：引擎切换到 plugin:<name> 时经 PluginProcess 识图（runBytes）
+plugins-worker = { path = "../plugins-worker" }
+# 结果图 base64 data-URL 内嵌显示
+base64 = "0.22"
+# RGBA Frame → PNG 内存编码
+image = { version = "0.25", default-features = false, features = ["png"] }
+# 剪贴板（逐行/全部复制）。任务书写 arboard 0.2，但 0.2 无 Wayland 支持
+# （wl-clipboard-rs 数据源 3.1 才加入），本机为 Wayland，故用 3.x —— 已在交付报告注明
+arboard = { version = "3", features = ["wayland-data-control"] }
+rfd = "0.15"
+# std 线程结果经 oneshot 回到 dioxus spawn
+futures = "0.3"
+# M3b：设置持久化 config.toml + 插件 options 值（serde_json::Value 传给 worker init/start）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+# ~/.config 定位（Windows/macOS/Linux 统一）
+dirs = "6"
+# P2 #12：设置页忽略正则的行内校验（识别管线本体在 ocr crate 的 PostRules）
+regex = "1"
+# P1 #10：识别完成桌面通知（Linux 走 zbus/notify；默认关，设置页开关）。
+# 任务书写 notify-rust 5，但本机 ustc 镜像最高只有 4.18.x；基础 API
+# （Notification::new().summary().body().show()）4/5 一致，先落 4。
+notify-rust = "4"
+# J2 #4：识别完成提示音（无资产文件，运行时合成两短音）。ustc 镜像有 0.20.x，
+# API 与 0.19 同形（OutputStream::try_default 返回 (stream, handle) 元组）。
+rodio = "0.20"

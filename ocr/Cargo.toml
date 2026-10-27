@@ -1,0 +1,37 @@
+[package]
+name = "rumi-ocr"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rumi_ocr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rumi-ocr-cli"
+path = "src/bin/rumi_ocr_cli.rs"
+
+[dependencies]
+# oar-ocr 必须 git 版：crates.io 0.1.1 是旧版，没有 auto-download（主管实测）
+oar-ocr = { git = "https://github.com/GreatV/oar-ocr", features = ["auto-download"] }
+# 与 oar-ocr 同为 image 0.25，同一 crate 实例，RgbImage 直接互通；
+# 对外统一图像载体 image::RgbaImage（K2：不依赖 rumi-capture）；
+# png/jpeg/webp：load_frame / load_frame_from_bytes 支持的三种输入格式
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# 二维码识别（M3 §4）：纯 Rust、持续维护；bardecoder 已多年未更新故不选。
+# 注意 rqrr 0.9+ 依赖 image 0.25，与本 crate 同一实例，GrayImage 类型互通
+rqrr = "0.9"
+# 忽略规则正则（postprocess，P2 #12）
+regex = "1"
+# 二维码生成（P2 #13）：Nayuki 出品、零依赖、只产布尔矩阵，
+# PNG 编码复用上面的 image。原为 dev-deps（测试 scan_qr），现转正
+qrcodegen = "1"
+# PDF 智能路由：文字层分类/提取（F 代理）
+pdf-inspector = "1"
+# 双层可搜索 PDF 导出（G 代理）
+oxidize-pdf = "5"
+
+[dev-dependencies]
+# 合成测试图：白底黑字（imageproc 内部即用 ab_glyph 排版；ttc 集合需 ab_glyph 直加载）
+imageproc = "0.27"
+ab_glyph = "0.2"

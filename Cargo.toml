@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["capture", "cli", "ui", "plugins-worker", "ocr", "server"]
+
+# 工作代号 Rumi：跨平台截图 OCR 应用（Umi-OCR 复刻）
+# - capture: 跨平台截图核心 crate（纯 lib）
+# - cli: rumi-capture CLI（组合 crate：bin 名不变，同时链接 capture+ocr，
+#   化解 capture↔ocr 包循环依赖，ocr 子命令进程内直调引擎）
+# - ui: Dioxus 前端（rumi-ui）
+# - plugins-worker: Umi 协议 Python shim（宿主侧 worker 管理 + 托管 venv）
+# - server: Umi 兼容 HTTP API（axum，M3 §5）

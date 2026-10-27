@@ -1,0 +1,21 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# 运行产物 / 调试输出（根目录）
+/*.png
+/*.out
+/*.pid
+ui_run.out
+
+# Python
+__pycache__/
+*.pyc
+*.venv/
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,36 @@
+[package]
+name = "rumi-capture"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rumi_capture"
+path = "src/lib.rs"
+
+[dependencies]
+# portal（GNOME/通用 Wayland 全屏帧）
+ashpd = { version = "0.13", features = ["screenshot"] }
+# org.kde.Spectacle 专属 D-Bus（KDE 区域/窗口捕获）
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+# spectacle_call 泛型 body 约束需要 serde::Serialize trait（zbus 自身已依赖）
+serde = { version = "1", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+futures = "0.3"
+# M 波：X11 / Windows / macOS 像素层（xcb + libwayshot；Linux 上同时承担 x11 路径）。
+# default-features 关掉 image/default，只留我们需要的 png —— 与 capture 自己的 image
+# 0.25 同版本实例，RgbaImage 类型零摩擦互通。xcap 类型不外泄（只在 backend 内用）。
+xcap = { version = "0.9", default-features = false }
+
+[dependencies.tokio]
+version = "1"
+features = ["process"]
+optional = true
+
+[features]
+default = []
+# grim/slurp 后端需要异步起子进程
+grim = ["dep:tokio"]
+
+# 注：`rumi-capture` CLI（含 `ocr` 一条龙子命令）已迁至 ../cli（组合 crate
+# rumi-cli，bin 名不变，同时链接本 crate 与 rumi-ocr，进程内直调引擎）。
+# capture↔ocr 的包循环依赖由该组合层化解，本 crate 保持纯 lib、无 bin。
