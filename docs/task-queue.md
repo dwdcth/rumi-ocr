@@ -57,3 +57,11 @@ xcap 输出 `image::RgbaImage` 与 K2 后全链路载体一致，零摩擦。
 "最大化调查"节），`#main { width: 100% }` 一行修复，Wayland 门控已撤销。
 tao/wry/WebKitGTK 无需提 issue。咨询文档（consult-maximize-wayland*.md）保留作
 为排查方法论存档。
+
+## 追加（2026-10-27 深夜）：Linux 托盘左键/双击唤出主窗口（换 ksni 后端）
+
+上游 tray-icon 0.21.3 GTK 后端无图标点击事件（源码确认），双击唤窗仅 Win/mac 可用。
+若要 Linux 左键唤出主窗口：引入 ksni（纯 Rust SNI 实现，有 activate 回调），
+Linux 下绕开 dioxus 内置托盘自建 SNI 服务与菜单（双击可用两次 activate 间隔
+<400ms 判定）；Win/mac 保持现路径。注意 O 波教训：菜单对象不可整体重建
+（dbusmenu 断链），ksni 菜单刷新需原地更新。工作量：tray.rs 双后端改造 + 回归。

@@ -65,9 +65,14 @@
 //!
 //! P1 #10 的"暂停/恢复热键"用 muda `CheckMenuItemBuilder`，勾选状态反映在菜单上。
 //!
-//! 已知限制（写入报告）：Linux 上 tray-icon 走 StatusNotifier/AppIndicator，
-//! KDE 面板是否派发 `TrayIconEvent::Click` 取决于托盘宿主——左键显示窗口在
-//! 部分 AppIndicator 实现上不生效，此时用户从菜单"打开主窗口"进入（功能等价兜底）。
+//! 已知限制（2026-10-27 源码级确认）：**Linux 上图标点击事件（含双击）不可用**
+//! ——tray-icon 0.21.3 的 GTK 后端（platform_impl/gtk/mod.rs）只做
+//! set_icon/set_menu/set_label，没有任何 TrayIconEvent 管道；libappindicator
+//! 也不提供点击回调。Linux 托盘交互 = 单击/右键出菜单（KDE 单击即弹菜单），
+//! 菜单首项"打开主窗口"是等价入口。**双击唤出主窗口仅在 Windows/macOS 生效**
+//! （main.rs 的 DoubleClick handler 在 Linux 是死路径，保留给另两个平台）。
+//! 若未来要 Linux 左键唤出主窗口：换 ksni（纯 Rust SNI）自建托盘后端，
+//! 见 docs/task-queue.md。
 
 use dioxus::desktop::trayicon::{
     init_tray_icon, menu::{CheckMenuItem, CheckMenuItemBuilder, Menu, MenuItem, MenuItemBuilder, MenuId, PredefinedMenuItem},

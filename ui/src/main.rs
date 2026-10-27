@@ -217,7 +217,7 @@ fn theme_vars(theme: &str) -> &'static str {
          --on-primary:#ffffff; --danger:#cc3d31; --danger-soft:rgba(204,61,49,.08);
          --danger-overlay:rgba(204,61,49,.22); --danger-overlay-soft:rgba(204,61,49,.15);
          --img-bg:#ffffff; --ok:#128058; --warn:#8f6314;
-         --edge:#b9c1da; --shadow:rgba(23,32,64,.07) 0 1px 3px;"
+         --edge:#a9b4d4; --shadow:rgba(23,32,64,.07) 0 1px 3px;"
     } else {
         "--bg:#0f1322; --panel:#161c31; --panel-2:#1d2440; --secondary:#1d2440; --border:#272e4e; --hover:#202848;
          --fg:#e8eaf6; --fg-dim:#9aa3c7; --fg-faint:#8e97bd;
@@ -225,7 +225,7 @@ fn theme_vars(theme: &str) -> &'static str {
          --on-primary:#ffffff; --danger:#e06c5f; --danger-soft:rgba(224,108,95,.14);
          --danger-overlay:rgba(224,108,95,.25); --danger-overlay-soft:rgba(224,108,95,.18);
          --img-bg:#ffffff; --ok:#3fc98f; --warn:#d8a13a;
-         --edge:#323c68; --shadow:rgba(0,0,0,.35) 0 1px 3px;"
+         --edge:#414e86; --shadow:rgba(0,0,0,.35) 0 1px 3px;"
     }
 }
 
@@ -250,7 +250,7 @@ body {{ margin: 0; font-family: system-ui, "Noto Sans CJK SC", "Segoe UI", sans-
        background: var(--bg); color: var(--fg); font-size: var(--fs-m); line-height: 1.5;
        display: flex; flex-direction: row; overflow: hidden;
        /* 无边框窗口的内描边 = 窗口边界：浅色模式下与白色桌面壁纸可分辨 */
-       box-shadow: inset 0 0 0 1px var(--edge); }}
+       }}
 
 /* ── 原生表单控件深色审计（M 波用户报障修复）────────────────
    select 闭合态样式正确，但弹开的 option 列表走 UA 默认（WebKitGTK 深色下
@@ -395,6 +395,10 @@ textarea {{ resize: vertical; line-height: 1.45; }}
 /* 宽窗口自适应：识别页/批量页解除上限铺满（预览与结果行随宽伸展）；
    设置/插件页保留 980 上限（表单超宽可读性差） */
 .page.page-wide {{ max-width: none; }}
+/* 窗口边缘描边覆盖层：body 的 inset shadow 会被子元素不透明背景盖住，必须用
+   fixed 顶层覆盖层实现（pointer-events:none 不拦截任何交互） */
+.win-frame {{ position: fixed; inset: 0; border: 2px solid var(--edge);
+             pointer-events: none; z-index: 999; }}
 .page-head {{ display: flex; align-items: center; gap: 12px; margin-bottom: var(--sp2); flex-wrap: wrap; }}
 .results {{ display: flex; gap: 10px; margin-top: var(--sp1); width: 100%; align-items: stretch; }}
 .shot-pane {{ flex: 0 0 42%; display: flex; align-items: flex-start; justify-content: center;
@@ -923,8 +927,8 @@ fn App() -> Element {
     });
 
     // 托盘图标交互：双击 = 显示主窗口；单击不动作（右键出菜单）。
-    // Linux/AppIndicator 宿主可能不派发 TrayIconEvent（tray.rs 已知限制），
-    // 菜单"打开主窗口"仍是等价兜底。
+    // 注意：此事件仅在 Windows/macOS 生效——tray-icon 0.21.3 的 GTK 后端
+    // 没有图标事件管道（源码确认，见 tray.rs 注释）；Linux 走菜单首项。
     use_tray_icon_event_handler(move |ev| {
         if let dioxus::desktop::trayicon::TrayIconEvent::DoubleClick { button, .. } = ev {
             if *button == dioxus::desktop::trayicon::MouseButton::Left {
@@ -1026,6 +1030,10 @@ fn App() -> Element {
                 }
                 }
             }
+            // 窗口边缘描边（浅色壁纸下窗口边界可分辨的关键）：fixed 覆盖层画在
+            // 一切内容之上——body 的 inset box-shadow 会被 titlebar/sidebar 的
+            // 不透明背景盖住，画了也白画（实测踩坑）
+            div { class: "win-frame" }
         }
         }
     }
