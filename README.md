@@ -81,6 +81,12 @@ cargo run -p rumi-server                      # HTTP API（前台）
 - 宿主模块 `plugin_i18n`（i18n.csv 翻译）、`umi_log` 由随应用分发的 pyshim 提供
 - 有 pip 依赖的插件：自动用系统 python3 建托管 venv（`~/.local/share/rumi/venv`）并安装
 
+内置插件 `plugins/wechat_ocr`：调用**微信 4.x 本地 OCR 引擎**（离线、中文效果好），
+Win/Linux/macOS 通用，需系统安装微信 + python3 `protobuf`。可识别**普通二维码与
+微信小程序码**（原生引擎独有能力，小程序码返回原始载荷）；bytes 识别走**零拷贝
+Shared 通路**（RGBA + mmmojo attach 缓冲区，微信自身截图同款，逆向结论见
+[`docs/开发记录.md`](docs/开发记录.md) 2026-10-28 条目）。
+
 ## 🌐 HTTP API
 
 ```

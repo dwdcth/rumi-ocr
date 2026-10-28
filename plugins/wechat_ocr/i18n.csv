@@ -1,0 +1,12 @@
+key,en_US
+微信本地OCR,WeChat Local OCR
+微信本地OCR识别,WeChat Local OCR Recognition
+微信安装目录,WeChat install directory
+留空则自动探测（如 /opt/wechat-universal）。也可用环境变量 WECHAT_OCR_DIR 或 ~/.config/wechat_ocr/config.json 指定。,Leave empty to auto-detect (e.g. /opt/wechat-universal). Can also be set via WECHAT_OCR_DIR env var or ~/.config/wechat_ocr/config.json.
+识别超时（秒）,Recognition timeout (seconds)
+单张图片等待微信OCR返回的最长时间,Max wait time per image for WeChat OCR to respond
+二维码/小程序码,QR / Mini-program code
+仅当图中无文字时返回,Only when no text found
+总是附加在文字后,Always append after text
+不返回,Never return
+微信引擎可识别普通二维码（解码内容）与微信小程序码（返回原始载荷，需微信服务端解析跳转）,The engine recognizes both QR codes (decoded content) and WeChat mini-program codes (raw payload; jump target resolved by WeChat server)

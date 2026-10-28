@@ -129,6 +129,7 @@ logger = logging.getLogger("rumi-plugin")   # worker 里 basicCallback 到 stder
 | 插件 | pip 依赖 | 说明 |
 |---|---|---|
 | demo_AbaOCR | （无） | 纯 demo |
+| wechat_ocr（本仓库内置） | protobuf（零拷贝通路另需 Pillow） | 微信 4.x 本地引擎，库随插件 vendored（`plugins/wechat_ocr/wechat_ocr/`，上游 dwdcth/wechat_ocr MIT）；runBytes 走零拷贝 Shared 通路（RGBA+attach，request_id=10018，无 Pillow 回退 tmpfs 临时文件，见开发记录 2026-10-28）；可识别二维码(type=19)/小程序码(type=22)，条码走文字行 |
 | win7_x64_RapidOCR-json | （无，附 C++ 可执行） | 引擎走子进程 stdio JSON |
 | win_linux_PaddleOCR-json | （无，附可执行） | 同上 |
 | win7_x64_Pix2Text | pix2text | pip 依赖较重 |
