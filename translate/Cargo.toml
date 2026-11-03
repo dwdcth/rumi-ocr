@@ -42,10 +42,12 @@ dirs = "6"
 # Argos .argosmodel（zip）导入解包
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # 文档翻译（v1：解析→翻译单元→逐单元翻译→双语 Markdown 回写）。
-# 与 ocr crate 同一 git 源，cargo 统一 checkout；翻译场景 feature 集
-# （文本族随 default 自带）：encoding=中文编码链，lang-detect=源语言检测
-# （TranslationUnit.lang，v2 自动检测用），docx/epub/pdf=主流文档格式。
-docforge = { git = "https://github.com/dwdcth/docforge", default-features = false, features = ["encoding", "lang-detect", "docx", "epub", "pdf"] }
+# 与 ocr crate 同一 git 源，cargo 统一 checkout。default = 文本族
+# (md/csv/html/rtf，纯 Rust 轻依赖，txt 恒有)——不开 default 会让单包构建
+# （-p rumi-translate 的 CLI）翻不了这些格式；encoding=中文编码链，
+# lang-detect=源语言检测（TranslationUnit.lang，v2 自动检测用），
+# docx/epub/pdf=主流文档格式。
+docforge = { git = "https://github.com/dwdcth/docforge", features = ["encoding", "lang-detect", "docx", "epub", "pdf"] }
 
 [dev-dependencies]
 tempfile = "3"
