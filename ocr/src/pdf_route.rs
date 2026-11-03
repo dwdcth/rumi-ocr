@@ -111,8 +111,9 @@ pub fn route_pdf(path: &Path, opts: &RouteOptions) -> Result<Vec<PdfPage>, OcrEr
         },
     );
     let doc = DocumentEngine::new(registry)
-        // DocumentEngine::parse 收 &str（按扩展名嗅探格式）
-        .parse(&path.to_string_lossy())
+        // DocumentEngine::parse 收 impl AsRef<Path>（docforge@976d0808 起，
+        // 顺手支持非 UTF-8 路径）——直接传 Path，不再经 to_string_lossy
+        .parse(path)
         .map_err(|e| OcrError::Pdf(e.message))?;
     // docforge 的 warnings 挂在 meta.extra（末条优先），rumi 现状无 warnings
     // 概念：一行 eprintln 透传即可（正常解析无告警，静默）

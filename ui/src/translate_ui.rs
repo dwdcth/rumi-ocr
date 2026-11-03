@@ -836,6 +836,8 @@ pub fn TranslatePage(
     let doc_prog = use_signal(|| Option::<(usize, usize)>::None);
     let doc_status = use_signal(String::new);
     let doc_err = use_signal(|| Option::<String>::None);
+    // 双语布局（就地切换，初值取设置；切换即存回，与设置页同源）
+    let mut doc_layout = use_signal(|| settings::get().translate.doc_layout);
 
     // 挂载刷新清单：本组件随 tab 挂载，每次进翻译页都重新扫描一次
     //（效果叠加规格要求的"启动时 + 每次操作后"）；effect 内无信号读取 → 只跑一次
@@ -1107,7 +1109,23 @@ pub fn TranslatePage(
                             "{t(tr::GO_SETTINGS)}" }
                     }
                     // 「翻译文档…」（规格 K §5）：btn-sm 不抢主按钮视觉；与
-                    // 「翻译」共用 running 信号互斥（任一翻译进行中一并禁用）
+                    // 「翻译」共用 running 信号互斥（任一翻译进行中一并禁用）。
+                    // 旁边就地放「双语布局」下拉（2026-11-04 用户反馈：藏设置页
+                    // 找不到）——初值取 settings.doc_layout，切换即存回设置，
+                    // start_doc_translate 现场读取
+                    select {
+                        style: "padding: 2px 6px; font-size: var(--fs-s);",
+                        title: "{t(tr::SET_LAYOUT)}",
+                        disabled: running_v,
+                        onchange: move |e| {
+                            let v = e.value();
+                            doc_layout.set(v.clone());
+                            let _ = settings::update(move |st| { st.translate.doc_layout = v; Ok(()) });
+                        },
+                        option { value: "inline", selected: doc_layout() == "inline", "{t(tr::SET_LAYOUT_INLINE)}" }
+                        option { value: "page", selected: doc_layout() == "page", "{t(tr::SET_LAYOUT_PAGE)}" }
+                        option { value: "only", selected: doc_layout() == "only", "{t(tr::SET_LAYOUT_ONLY)}" }
+                    }
                     button { class: "btn-sm",
                         disabled: running_v,
                         onclick: move |_| start_doc_translate(
