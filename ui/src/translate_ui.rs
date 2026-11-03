@@ -90,6 +90,8 @@ pub(crate) mod tr {
     pub const DOC_RUNNING: &str = "translate.doc_running";
     pub const DOC_PROGRESS: &str = "translate.doc_progress";
     pub const DOC_DONE: &str = "translate.doc_done";
+    /// 布局退化说明（DocStats.note 的展示模板）。
+    pub const DOC_NOTE: &str = "translate.doc_note";
     pub const DOC_FAILED: &str = "translate.doc_failed";
     pub const DOC_FILTER: &str = "translate.doc_filter";
     // 设置页翻译小节（规格 §5 指定 settings.translate.* 前缀）
@@ -98,6 +100,10 @@ pub(crate) mod tr {
     pub const SET_COMPUTE: &str = "settings.translate.compute";
     pub const SET_COMPUTE_INT8: &str = "settings.translate.compute_int8";
     pub const SET_COMPUTE_FLOAT32: &str = "settings.translate.compute_float32";
+    pub const SET_LAYOUT: &str = "settings.translate.layout";
+    pub const SET_LAYOUT_INLINE: &str = "settings.translate.layout_inline";
+    pub const SET_LAYOUT_PAGE: &str = "settings.translate.layout_page";
+    pub const SET_LAYOUT_ONLY: &str = "settings.translate.layout_only";
     pub const SET_POLISH: &str = "settings.translate.polish";
     pub const SET_AUTO_OCR: &str = "settings.translate.auto_ocr";
     pub const SET_DEEPL_KEY: &str = "settings.translate.deepl_key";
@@ -174,6 +180,15 @@ pub(crate) fn take_prefill(p: &mut TranslatePrefill) -> Option<(String, bool)> {
     let out = Some((std::mem::take(&mut p.text), p.run));
     p.run = false;
     out
+}
+
+/// 设置的布局值 → docmt 策略（纯函数可测）：inline 默认/未知回退段落对照。
+fn doc_strategy_from_layout(layout: &str) -> rumi_translate::docmt::BiStrategy {
+    match layout {
+        "page" => rumi_translate::docmt::BiStrategy::PageAlt,
+        "only" => rumi_translate::docmt::BiStrategy::Only,
+        _ => rumi_translate::docmt::BiStrategy::Inline,
+    }
 }
 
 /// 文档翻译默认输出路径（规格 K §5/§7）：与输入同目录、同名去扩展名 +
@@ -339,7 +354,12 @@ fn start_doc_translate(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "translation.bilingual.md".to_string());
-        let mut save = rfd::FileDialog::new().set_file_name(&out_name);
+        let mut save = rfd::FileDialog::new().set_file_name(&out_name)
+            // 输出格式按扩展名分派（docmt::translate_document）：
+            // .md=双语 Markdown；.docx/.epub=保原样式回写（输入需同格式）
+            .add_filter("Markdown (*.md)", &["md"])
+            .add_filter("Word (*.docx)", &["docx"])
+            .add_filter("EPUB (*.epub)", &["epub"]);
         if let Some(dir) = input.parent() {
             save = save.set_directory(dir);
         }
@@ -353,7 +373,8 @@ fn start_doc_translate(
             engine,
             from,
             to,
-            strategy: rumi_translate::docmt::BiStrategy::Inline,
+            // 双语布局取设置（settings.translate.doc_layout）；未知值回退段落对照
+            strategy: doc_strategy_from_layout(&st.doc_layout),
             polish: st.polish,
             min_chars: 2,
             on_progress: Some(std::sync::Arc::new(move |done, total| {
@@ -390,6 +411,14 @@ fn start_doc_translate(
                         .replace("{p2}", &format!("{:.1}", stats.elapsed_ms as f64 / 1000.0))
                         .replace("{p3}", &name),
                 );
+                // 布局退化说明（如 page 遇 docx 等无页概念格式 → 原文+译文附录）
+                if let Some(note) = stats.note {
+                    doc_status.set(format!(
+                        "{}\n{}",
+                        doc_status(),
+                        i18n::tt(tr::DOC_NOTE).replace("{p}", &note)
+                    ));
+                }
             }
             Ok(DocOutcome::Failed(e)) => {
                 doc_err.set(Some(i18n::tt(tr::DOC_FAILED).replace("{p}", &e)));
@@ -1583,5 +1612,21 @@ mod tests {
                 assert_ne!(i18n::ts(lang, key), key, "{lang} 缺词：{key}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::doc_strategy_from_layout;
+    use rumi_translate::docmt::BiStrategy;
+
+    /// 设置布局值 → 策略映射（未知/空回退 Inline——段落对照最安全默认）。
+    #[test]
+    fn layout_maps_to_strategy_with_safe_fallback() {
+        assert_eq!(doc_strategy_from_layout("inline"), BiStrategy::Inline);
+        assert_eq!(doc_strategy_from_layout("page"), BiStrategy::PageAlt);
+        assert_eq!(doc_strategy_from_layout("only"), BiStrategy::Only);
+        assert_eq!(doc_strategy_from_layout(""), BiStrategy::Inline);
+        assert_eq!(doc_strategy_from_layout("garbage"), BiStrategy::Inline);
     }
 }

@@ -26,9 +26,10 @@ const HELP: &str = r#"rumi-translate-cli —— 离线/在线翻译命令行
   --url <u>        deeplx 服务地址 / openai base_url
   --model <m>      openai 模型名（默认 gpt-4o-mini）
   --file <path>    从文件读文本（UTF-8）
-  --doc <path>     文档翻译模式：解析→翻译→双语 Markdown（与 --engine/--from/--to 组合）
-  --doc-out <path> 输出路径（默认 <输入名去扩展>.bilingual.md，存输入同目录）
-  --strategy <s>   inline(默认) | only | appendix
+  --doc <path>     文档翻译模式：解析→翻译→双语成品（与 --engine/--from/--to 组合）
+  --doc-out <path> 输出路径（默认 <输入名去扩展>.bilingual.md；扩展名分派格式：
+                   .md=双语 Markdown / .docx 与 .epub=定位改写保原样式回写）
+  --strategy <s>   inline(默认) | only | appendix | page（页级交替，仅 .md 输出完整支持，
   --no-polish      关闭 zh 译文标点润色
   --json           输出 {"engine":"...","elapsed_ms":N,"texts":[...]}
   --install <key>  安装离线语言包（zh_en / en_zh / nllb_600m），进度打 stderr，装完退出
@@ -266,13 +267,18 @@ fn doc_cmd(input: &str, args: &Args) {
         })),
     };
     match docmt::translate_document(&input_path, &out, &opts) {
-        Ok(stats) => println!(
-            "单元 {} · 字符 {} · 耗时 {:.1} s → {}",
-            stats.units,
-            stats.chars,
-            stats.elapsed_ms as f64 / 1000.0,
-            out.display()
-        ),
+        Ok(stats) => {
+            println!(
+                "单元 {} · 字符 {} · 耗时 {:.1} s → {}",
+                stats.units,
+                stats.chars,
+                stats.elapsed_ms as f64 / 1000.0,
+                out.display()
+            );
+            if let Some(note) = &stats.note {
+                println!("注：{note}");
+            }
+        }
         Err(e) => {
             eprintln!("{e}");
             exit(1);

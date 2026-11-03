@@ -236,3 +236,166 @@ fn e2e_doc_translate_txt_en_zh() {
         "应含中文：{md}"
     );
 }
+
+// ---------- 输出格式分派（docx/epub 回写，docforge@616fc626 起） ----------
+
+/// 现场构造最小可用 docx（writeback 解析侧读 word/document.xml，
+/// [Content_Types] 与 rels 为标准件）。段落文本取 ≥2 字符的合格翻译位。
+fn build_minimal_docx(dir: &std::path::Path, para: &str) -> std::path::PathBuf {
+    use std::io::Write;
+    let path = dir.join("in.docx");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut z = zip::ZipWriter::new(file);
+    let opts: zip::write::SimpleFileOptions = Default::default();
+    z.add_directory("_rels", opts).unwrap();
+    z.add_directory("word", opts).unwrap();
+    z.start_file("[Content_Types].xml", opts).unwrap();
+    z.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#,
+    )
+    .unwrap();
+    z.start_file("_rels/.rels", opts).unwrap();
+    z.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#,
+    )
+    .unwrap();
+    z.start_file("word/document.xml", opts).unwrap();
+    let doc_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>{para}</w:t></w:r></w:p><w:p><w:r><w:t>Second plain paragraph here.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#
+    );
+    z.write_all(doc_xml.as_bytes()).unwrap();
+    z.finish().unwrap();
+    path
+}
+
+/// docx 回写端到端（from==to 直通当"翻译"，零模型依赖；译文=原文，
+/// writeback 文本一致性双保险天然通过）。Inline 策略下输出 docx 的
+/// document.xml 应含两份段落（原块 + 插入的译文块）。
+#[test]
+fn docx_writeback_dispatch_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = "Hello world this is a test paragraph.";
+    let input = build_minimal_docx(dir.path(), text);
+    let out = dir.path().join("out.bilingual.docx");
+    docmt::translate_document(
+        &input,
+        &out,
+        &DocTranslateOptions {
+            engine: Engine::Offline,
+            from: "en".into(),
+            to: "en".into(), // 直通：译文 == 原文，链路零模型
+            strategy: BiStrategy::Inline,
+            polish: false,
+            min_chars: 2,
+            on_progress: None,
+        },
+    )
+    .unwrap();
+    assert!(out.is_file(), "输出 docx 应生成");
+    // 读回 zip 的 document.xml：Inline 语义 = 原段 + 译文段两份
+    use std::io::Read as _;
+    let f = std::fs::File::open(&out).unwrap();
+    let mut z = zip::ZipArchive::new(f).unwrap();
+    let mut buf = Vec::new();
+    z.by_name("word/document.xml").unwrap().read_to_end(&mut buf).unwrap();
+    let xml = String::from_utf8(buf).unwrap();
+    let hits = xml.matches("Hello world this is a test paragraph.").count();
+    assert!(hits >= 2, "Inline 应含原块+译文块两份，实得 {hits}：{xml}");
+}
+
+/// 不支持的输出扩展名 → 明确报错（不落盘）。
+#[test]
+fn unsupported_output_extension_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.txt");
+    std::fs::write(&input, "Hello world paragraph.").unwrap();
+    let err = docmt::translate_document(
+        &input,
+        &dir.path().join("out.bilingual.pdf"),
+        &DocTranslateOptions {
+            engine: Engine::Offline,
+            from: "en".into(),
+            to: "en".into(),
+            strategy: BiStrategy::Inline,
+            polish: false,
+            min_chars: 2,
+            on_progress: None,
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("不支持的输出格式"), "实得：{err}");
+}
+
+
+/// txt 回写分派端到端（from==to 直通，零模型）：Inline 下输出 txt 应含
+/// 原文两份（原块 + 插入译文块=原文）。
+#[test]
+fn txt_writeback_dispatch_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.txt");
+    std::fs::write(&input, "Hello world this is a test paragraph.\n").unwrap();
+    let out = dir.path().join("out.bilingual.txt");
+    docmt::translate_document(
+        &input,
+        &out,
+        &DocTranslateOptions {
+            engine: Engine::Offline,
+            from: "en".into(),
+            to: "en".into(),
+            strategy: BiStrategy::Inline,
+            polish: false,
+            min_chars: 2,
+            on_progress: None,
+        },
+    )
+    .unwrap();
+    let txt = std::fs::read_to_string(&out).unwrap();
+    let hits = txt.matches("Hello world this is a test paragraph.").count();
+    assert!(hits >= 2, "Inline 应含原块+译文块两份，实得 {hits}：{txt}");
+}
+
+// ---------- 页级交替（PageAlt，rumi 层策略） ----------
+
+/// PageAlt 遇无页概念格式（txt 输出）：退化为附录（原文+译文），note 携带说明。
+#[test]
+fn page_alt_falls_back_with_note_for_pageless_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.txt");
+    std::fs::write(&input, "Hello world this is a paragraph.\n").unwrap();
+    let out = dir.path().join("out.bilingual.txt");
+    let stats = docmt::translate_document(
+        &input,
+        &out,
+        &DocTranslateOptions {
+            engine: Engine::Offline,
+            from: "en".into(),
+            to: "en".into(),
+            strategy: BiStrategy::PageAlt,
+            polish: false,
+            min_chars: 2,
+            on_progress: None,
+        },
+    )
+    .unwrap();
+    let note = stats.note.expect("txt 页交替应携带退化说明");
+    assert!(note.contains("附录"), "实得：{note}");
+    assert!(out.is_file());
+}
+
+/// BiStrategy::parse 含 page 变体。
+#[test]
+fn bi_strategy_parse_includes_page() {
+    assert_eq!(BiStrategy::parse("page"), Some(BiStrategy::PageAlt));
+    assert_eq!(BiStrategy::parse("pagealt"), Some(BiStrategy::PageAlt));
+    assert_eq!(BiStrategy::parse("inline"), Some(BiStrategy::Inline));
+}

@@ -242,5 +242,10 @@
  "winpick.empty": "No capturable windows found",
  "winpick.load_fail": "❌ Window enumeration failed: {n}",
  "winpick.title": "Choose a window",
- "translate.more_langs": "More languages"
+ "translate.more_langs": "More languages",
+ "translate.doc_note": "Layout note: {p}",
+ "settings.translate.layout": "Bilingual layout",
+ "settings.translate.layout_inline": "Interleaved (paragraph by paragraph)",
+ "settings.translate.layout_page": "Page alternating (page by page)",
+ "settings.translate.layout_only": "Translation only"
 }

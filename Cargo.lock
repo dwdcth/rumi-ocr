@@ -2281,8 +2281,9 @@ dependencies = [
 [[package]]
 name = "docforge"
 version = "0.1.0"
-source = "git+https://github.com/dwdcth/docforge#6a1e183cf7f3d8b2c04041b40a300f0831bbfb54"
+source = "git+https://github.com/dwdcth/docforge#82cdbb46c7c7eda64b52181d30b71dbf46cefc5b"
 dependencies = [
+ "base64 0.23.1",
  "chardetng",
  "encoding_rs",
  "image",

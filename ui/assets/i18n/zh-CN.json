@@ -242,5 +242,10 @@
  "winpick.empty": "未枚举到可捕获的窗口",
  "winpick.load_fail": "❌ 窗口枚举失败: {n}",
  "winpick.title": "选择窗口",
- "translate.more_langs": "更多语言"
+ "translate.more_langs": "更多语言",
+ "translate.doc_note": "布局提示：{p}",
+ "settings.translate.layout": "双语布局",
+ "settings.translate.layout_inline": "段落对照（一段原文接一段译文）",
+ "settings.translate.layout_page": "页面交替（一页原文接一页译文）",
+ "settings.translate.layout_only": "仅译文"
 }

@@ -2082,6 +2082,7 @@ fn SettingsPage(
     let tr_now = s.translate.clone();
     let mut tr_engine = use_signal(move || s.translate.engine.clone());
     let mut tr_compute = use_signal(move || s.translate.compute.clone());
+    let mut tr_layout = use_signal(move || s.translate.doc_layout.clone());
     let mut tr_polish = use_signal(move || s.translate.polish);
     let mut tr_auto_ocr = use_signal(move || s.translate.auto_ocr);
     let mut tr_deepl_key = use_signal(move || s.translate.deepl_api_key.clone());
@@ -2510,6 +2511,21 @@ fn SettingsPage(
                             },
                             option { value: "int8", selected: tr_compute() == "int8", "{t(translate_ui::tr::SET_COMPUTE_INT8)}" }
                             option { value: "float32", selected: tr_compute() == "float32", "{t(translate_ui::tr::SET_COMPUTE_FLOAT32)}" }
+                        }
+                    }
+                }
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_LAYOUT)}" }
+                    div { class: "field",
+                        select { class: "ctl",
+                            onchange: move |e| {
+                                let v = e.value();
+                                tr_layout.set(v.clone());
+                                let _ = settings::update(move |st| { st.translate.doc_layout = v; Ok(()) });
+                            },
+                            option { value: "inline", selected: tr_layout() == "inline", "{t(translate_ui::tr::SET_LAYOUT_INLINE)}" }
+                            option { value: "page", selected: tr_layout() == "page", "{t(translate_ui::tr::SET_LAYOUT_PAGE)}" }
+                            option { value: "only", selected: tr_layout() == "only", "{t(translate_ui::tr::SET_LAYOUT_ONLY)}" }
                         }
                     }
                 }

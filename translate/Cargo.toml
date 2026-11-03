@@ -47,7 +47,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # （-p rumi-translate 的 CLI）翻不了这些格式；encoding=中文编码链，
 # lang-detect=源语言检测（TranslationUnit.lang，v2 自动检测用），
 # docx/epub/pdf=主流文档格式。
-docforge = { git = "https://github.com/dwdcth/docforge", features = ["encoding", "lang-detect", "docx", "epub", "pdf"] }
+docforge = { git = "https://github.com/dwdcth/docforge", features = ["encoding", "lang-detect", "docx", "epub", "pdf", "fb2", "odt"] }
 
 [dev-dependencies]
 tempfile = "3"
