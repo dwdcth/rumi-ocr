@@ -116,16 +116,23 @@ pub fn translate_document(
     let mut translated: Vec<(String, String)> = Vec::with_capacity(total);
     let mut chars = 0usize;
     for (done, unit) in units.iter().enumerate() {
-        let text = crate::translate(
-            std::slice::from_ref(&unit.text),
-            &opts.from,
-            &opts.to,
-            &opts.engine,
-            opts.polish,
-        )
-        .map_err(|e| format!("单元 {} 翻译失败：{}", unit.id, e))?
-        .pop()
-        .unwrap_or_default();
+        // 防幻觉过滤（docforge@b5bf9a87 谓词）：220V / -10 to 50 C 这类纯
+        // 数字/单位/短代码文本送引擎只会得到幻觉（实测 "220V 电话"），
+        // 直接原样回填——译文=原文，回写锚点不受影响
+        let text = if !unit.has_translatable_text() {
+            unit.text.clone()
+        } else {
+            crate::translate(
+                std::slice::from_ref(&unit.text),
+                &opts.from,
+                &opts.to,
+                &opts.engine,
+                opts.polish,
+            )
+            .map_err(|e| format!("单元 {} 翻译失败：{}", unit.id, e))?
+            .pop()
+            .unwrap_or_default()
+        };
         chars += unit.text.chars().count();
         translated.push((unit.id.clone(), text));
         let done = done + 1;
@@ -158,15 +165,29 @@ pub fn translate_document(
             "输出 .{ext} 需要同格式输入（当前输入 .{in_ext}）；跨格式请输出 .md"
         ));
     }
-    // PageAlt 的格式退化说明（仅 markdown 完整支持页级交替，见 BiStrategy）
-    let note = if opts.strategy == BiStrategy::PageAlt && !matches!(ext.as_str(), "md" | "markdown") {
+    // PageAlt 的格式支持面（docforge@b5bf9a87 起）：markdown 页级交替、
+    // epub 部件交替（真·一页原文一页译文，spine 插译文部件）；
+    // docx/odt 等无页概念格式仍退化为原文全文+译文附录
+    let epub_alt = opts.strategy == BiStrategy::PageAlt
+        && ext == "epub"
+        && in_ext == "epub";
+    let note = if opts.strategy == BiStrategy::PageAlt
+        && !matches!(ext.as_str(), "md" | "markdown")
+        && !epub_alt
+    {
         Some(format!(
-            ".{ext} 无固定页概念（Word 渲染时才分页、EPUB 页为部件），已按「原文全文 + 译文附录」输出"
+            ".{ext} 无固定页概念（Word 渲染时才分页），已按「原文全文 + 译文附录」输出"
         ))
     } else {
         None
     };
     match ext.as_str() {
+        "epub" if epub_alt => docforge::writeback::writeback_epub_alternating(
+            input,
+            &translated,
+            out,
+        )
+        .map_err(|e| format!("epub 部件交替回写失败：{e}"))?,
         "md" | "markdown" => {
             let md = if opts.strategy == BiStrategy::PageAlt {
                 page_alternating_markdown(&doc, &translated)
