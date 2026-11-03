@@ -16,6 +16,11 @@
 //!   轮询、也不在回调里碰 Signal；全部 sender 关闭（下载线程结束）后流自然收尾；
 //! - rfd 文件对话框一律 std 线程调（Linux GTK 后端同步对话框死锁主线程，
 //!   开发经验 §三），选文件与导入包在同一个后台线程里完成；
+//! - 文档翻译（规格 J/K §5）：「翻译文档…」按钮 → std 线程 rfd 选文件 + 保存
+//!   对话框（默认名 <原名>.bilingual.md，同线程）→ 同线程调
+//!   `rumi_translate::docmt::translate_document`（Inline 策略、min_chars=2）；
+//!   单元进度经 mpsc 无界通道泵成 doc_prog 信号（文案「已翻译 n/N 单元」）；
+//!   与文本「翻译」共用 running 信号互斥；默认输出名推导与过滤器表抽纯函数直测；
 //! - OCR 联动：识别页「翻译」按钮写 [`TranslatePrefill`]`{text, run:true}` 并切
 //!   tab，本页 use_effect 消费（读后清空），run=true 自动触发一次翻译。
 //!
@@ -80,6 +85,13 @@ pub(crate) mod tr {
     pub const MODELS_RETRY: &str = "translate.models.retry";
     pub const MODELS_VERSION: &str = "translate.models.version";
     pub const OCR_BUTTON: &str = "translate.ocr_button";
+    // 文档翻译（规格 J/K §6 逐字）
+    pub const DOC_BUTTON: &str = "translate.doc_button";
+    pub const DOC_RUNNING: &str = "translate.doc_running";
+    pub const DOC_PROGRESS: &str = "translate.doc_progress";
+    pub const DOC_DONE: &str = "translate.doc_done";
+    pub const DOC_FAILED: &str = "translate.doc_failed";
+    pub const DOC_FILTER: &str = "translate.doc_filter";
     // 设置页翻译小节（规格 §5 指定 settings.translate.* 前缀）
     pub const SET_SECTION: &str = "settings.translate";
     pub const SET_ENGINE: &str = "settings.translate.engine";
@@ -162,6 +174,22 @@ pub(crate) fn take_prefill(p: &mut TranslatePrefill) -> Option<(String, bool)> {
     let out = Some((std::mem::take(&mut p.text), p.run));
     p.run = false;
     out
+}
+
+/// 文档翻译默认输出路径（规格 K §5/§7）：与输入同目录、同名去扩展名 +
+/// `.bilingual.md`（与 CLI --doc-out 默认值同口径）。多点扩展名按 file_stem
+/// 口径去掉最后一段；路径无文件名（如以分隔符结尾）时保守拼接、不 panic。
+fn default_doc_out(input: &std::path::Path) -> std::path::PathBuf {
+    let stem = input
+        .file_stem()
+        .unwrap_or_else(|| input.file_name().unwrap_or_default());
+    input.with_file_name(format!("{}.bilingual.md", stem.to_string_lossy()))
+}
+
+/// 文档翻译文件选择器扩展名表（规格 K §5 顺序逐字：docforge v1 可解析的
+/// 9 种文本族格式）。纯函数直测「过滤器串构造」（规格 §7）。
+fn doc_filter_extensions() -> &'static [&'static str] {
+    &["pdf", "docx", "epub", "txt", "md", "html", "csv", "rtf", "srt"]
 }
 
 /// 设置里的语言码 → 下拉合法值：normalize 后不在候选里（空串/乱码）回退 def。
@@ -258,6 +286,122 @@ fn start_translate(
             Err(_) => result_err.set(Some(i18n::tt(tr::THREAD_LOST).to_string())),
         }
         running.set(false);
+    });
+}
+
+/// start_doc_translate 后台线程的结算（规格 K §5）：Cancelled = 用户在选文件/
+/// 保存对话框任一取消（静默复位）；Done = 成功（统计 + 输出全路径，状态行只
+/// 展示文件名）；Failed = translate_document 报错原文（红字展示）。
+enum DocOutcome {
+    Cancelled,
+    Done(rumi_translate::docmt::DocStats, std::path::PathBuf),
+    Failed(String),
+}
+
+/// 翻译整个文档（规格 K §5）：rfd 选文件与保存对话框必须在 std 线程（Linux
+/// GTK 同步对话框死锁主线程，开发经验 §三；模式照抄 start_import），两对话框
+/// 与 translate_document 重活合并进同一后台线程（选中→保存→翻译一气呵成）；
+/// - 互斥：与「翻译」按钮共用 running 信号（同一时刻只允许一个翻译动作）；
+/// - 选项：strategy=Inline、min_chars=2 为规格 §5 固定值；引擎/polish 取点击
+///   时设置快照，from/to 取当前下拉值；
+/// - 进度：on_progress 回调在翻译线程上产生 → futures mpsc 无界通道（非阻塞
+///   send；Signal !Send 绝不在工作线程碰）→ UI 端泵成 doc_prog 信号（文案
+///   「已翻译 n/N 单元」；doc 用单元口径，不与模型下载 prog 的字节口径混用）；
+/// - 结算：完成状态行「单元 N · 耗时 X s → 文件名」；失败/线程丢失红字；
+///   完成态保留到下次发起（发起时统一清空重置）。
+fn start_doc_translate(
+    from_sel: Signal<String>,
+    to_sel: Signal<String>,
+    mut running: Signal<bool>,
+    mut doc_running: Signal<bool>,
+    mut doc_prog: Signal<Option<(usize, usize)>>,
+    mut doc_status: Signal<String>,
+    mut doc_err: Signal<Option<String>>,
+) {
+    if running() {
+        return; // 与文本翻译互斥（按钮 disabled 兜底）
+    }
+    let st = settings::get().translate;
+    let from = from_sel();
+    let to = to_sel();
+    let engine = engine_from_settings(&st);
+    let (ptx, mut prx) = futures::channel::mpsc::unbounded::<(usize, usize)>();
+    let rx = crate::ocr_flow::run_blocking(move || {
+        // 对话框 1：选输入文件（过滤器名 i18n + 规格 §5 扩展名表）
+        let Some(input) = rfd::FileDialog::new()
+            .add_filter(i18n::tt(tr::DOC_FILTER), doc_filter_extensions())
+            .pick_file()
+        else {
+            return DocOutcome::Cancelled; // 用户取消
+        };
+        // 对话框 2：保存路径（默认名 <原名>.bilingual.md、存输入同目录，同线程）
+        let out_name = default_doc_out(&input)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "translation.bilingual.md".to_string());
+        let mut save = rfd::FileDialog::new().set_file_name(&out_name);
+        if let Some(dir) = input.parent() {
+            save = save.set_directory(dir);
+        }
+        let Some(out) = save.save_file() else {
+            return DocOutcome::Cancelled; // 用户取消
+        };
+        // 进度回调在翻译线程上被调：unbounded_send 非阻塞、UnboundedSender
+        // 满足 Send+Sync，克隆一份进回调；原句柄留在闭包内保证流生命周期
+        let sink = ptx.clone();
+        let opts = rumi_translate::docmt::DocTranslateOptions {
+            engine,
+            from,
+            to,
+            strategy: rumi_translate::docmt::BiStrategy::Inline,
+            polish: st.polish,
+            min_chars: 2,
+            on_progress: Some(std::sync::Arc::new(move |done, total| {
+                let _ = sink.unbounded_send((done, total));
+            })),
+        };
+        let res = rumi_translate::docmt::translate_document(&input, &out, &opts);
+        drop(ptx); // 关闭进度流：UI 端泵收尾退出
+        match res {
+            Ok(stats) => DocOutcome::Done(stats, out),
+            Err(e) => DocOutcome::Failed(e),
+        }
+    });
+    running.set(true);
+    doc_running.set(true);
+    doc_prog.set(None);
+    doc_status.set(String::new());
+    doc_err.set(None);
+    spawn(async move {
+        // 泵进度：翻译线程回调 → 信号（首个回调前界面显示「文档翻译中…」）
+        while let Some((done, total)) = prx.next().await {
+            doc_prog.set(Some((done, total)));
+        }
+        match rx.await {
+            Ok(DocOutcome::Done(stats, out)) => {
+                // 状态行按规格 K §6 模板插值：单元 N · 耗时 X s → 文件名
+                let name = out
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                doc_status.set(
+                    i18n::tt(tr::DOC_DONE)
+                        .replace("{p1}", &stats.units.to_string())
+                        .replace("{p2}", &format!("{:.1}", stats.elapsed_ms as f64 / 1000.0))
+                        .replace("{p3}", &name),
+                );
+            }
+            Ok(DocOutcome::Failed(e)) => {
+                doc_err.set(Some(i18n::tt(tr::DOC_FAILED).replace("{p}", &e)));
+            }
+            Ok(DocOutcome::Cancelled) => {} // 用户取消：静默复位
+            // 翻译线程意外退出（panic）：沿用现有 thread_lost 文案（规格外
+            // 补充，与 start_translate 同款；回报已注明）
+            Err(_) => doc_err.set(Some(i18n::tt(tr::THREAD_LOST).to_string())),
+        }
+        doc_prog.set(None);
+        running.set(false);
+        doc_running.set(false);
     });
 }
 
@@ -655,6 +799,14 @@ pub fn TranslatePage(
     // 更多语言包目录（§6.3）：展开态 + 拉取状态（首次展开拉一次，收起不丢）
     let mut catalog_open = use_signal(|| false);
     let catalog = use_signal(|| CatalogState::NotFetched);
+    // 文档翻译（规格 K §5）：running 与文本翻译共用（互斥，规格指定「同一
+    // busy 信号」）；doc_running 只标记「正在跑的是文档翻译」（区分按钮文案
+    // 与状态区归属）。进度/状态/错误独立成组——模型下载的 prog 是字节口径，
+    // 不与单元口径混用同一信号
+    let doc_running = use_signal(|| false);
+    let doc_prog = use_signal(|| Option::<(usize, usize)>::None);
+    let doc_status = use_signal(String::new);
+    let doc_err = use_signal(|| Option::<String>::None);
 
     // 挂载刷新清单：本组件随 tab 挂载，每次进翻译页都重新扫描一次
     //（效果叠加规格要求的"启动时 + 每次操作后"）；effect 内无信号读取 → 只跑一次
@@ -715,6 +867,22 @@ pub fn TranslatePage(
     let deleting_v = deleting();
     let highlight_v = highlight();
     let any_busy = busy_v.is_some();
+    // 文档翻译（规格 K §5）渲染快照 + 状态文案（rsx 外插值）：进度回退
+    // 「文档翻译中…」（首个回调前）；错误空串 = 无
+    let doc_running_v = doc_running();
+    let doc_prog_v = doc_prog();
+    let doc_status_v = doc_status();
+    let doc_err_v = doc_err();
+    let doc_prog_text = match doc_prog_v {
+        Some((done, total)) => i18n::ts(&lang_v, tr::DOC_PROGRESS)
+            .replace("{p1}", &done.to_string())
+            .replace("{p2}", &total.to_string()),
+        None => i18n::ts(&lang_v, tr::DOC_RUNNING).to_string(),
+    };
+    let doc_failed_text = doc_err_v
+        .as_ref()
+        .map(|e| i18n::ts(&lang_v, tr::DOC_FAILED).replace("{p}", e))
+        .unwrap_or_default();
     let import_err_text = model_err_v
         .as_ref()
         .and_then(|(_k, e, kind)| {
@@ -909,6 +1077,14 @@ pub fn TranslatePage(
                         button { class: "btn-sm", onclick: move |_| tab.set(crate::TAB_SETTINGS),
                             "{t(tr::GO_SETTINGS)}" }
                     }
+                    // 「翻译文档…」（规格 K §5）：btn-sm 不抢主按钮视觉；与
+                    // 「翻译」共用 running 信号互斥（任一翻译进行中一并禁用）
+                    button { class: "btn-sm",
+                        disabled: running_v,
+                        onclick: move |_| start_doc_translate(
+                            from_sel, to_sel, running, doc_running, doc_prog, doc_status, doc_err,
+                        ),
+                        if doc_running_v { "{t(tr::DOC_RUNNING)}" } else { "{t(tr::DOC_BUTTON)}" } }
                     button { class: "primary",
                         disabled: running_v || src_v.trim().is_empty(),
                         onclick: move |_| {
@@ -917,6 +1093,22 @@ pub fn TranslatePage(
                             );
                         },
                         if running_v { "{t(tr::RUNNING)}" } else { "{t(tr::RUN)}" } }
+                }
+
+                // 文档翻译状态区（规格 K §5）：运行中显示进度行（首个回调前
+                // 显示「文档翻译中…」）；结束后保留完成统计或红字错误，直到
+                // 下次发起时重置
+                if doc_running_v {
+                    div { class: "hint", style: "margin-top: 4px; font-variant-numeric: tabular-nums; word-break: break-all;",
+                        "{doc_prog_text}" }
+                } else if !doc_failed_text.is_empty() {
+                    div {
+                        style: "margin-top: 4px; font-size: var(--fs-s); color: var(--danger); word-break: break-all;",
+                        "{doc_failed_text}"
+                    }
+                } else if !doc_status_v.is_empty() {
+                    div { class: "hint", style: "margin-top: 4px; word-break: break-all;",
+                        "{doc_status_v}" }
                 }
 
                 // 源文本（10 行，placeholder 按规格）
@@ -1330,6 +1522,63 @@ mod tests {
                 tr::MODELS_FETCH_FAILED,
                 tr::MODELS_RETRY,
                 tr::MODELS_VERSION,
+            ] {
+                assert_ne!(i18n::ts(lang, key), key, "{lang} 缺词：{key}");
+            }
+        }
+    }
+
+    // ── 规格 J/K §7：文档翻译纯函数（默认输出名推导、过滤器串）+ 新词条 ──────
+
+    /// §5/§7 默认输出名推导：同名去扩展 + `.bilingual.md`、存输入同目录
+    /// （与 CLI --doc-out 默认值同口径）；无扩展名原样追加；多点扩展名取
+    /// file_stem（去掉最后一段）；无文件名路径保守拼接不 panic。
+    #[test]
+    fn default_doc_out_appends_bilingual_md() {
+        assert_eq!(
+            default_doc_out(std::path::Path::new("/tmp/report.pdf")),
+            std::path::Path::new("/tmp").join("report.bilingual.md"),
+            "有扩展名：去扩展 + .bilingual.md、同目录"
+        );
+        assert_eq!(
+            default_doc_out(std::path::Path::new("README")),
+            std::path::Path::new("README.bilingual.md"),
+            "无扩展名：原样追加"
+        );
+        assert_eq!(
+            default_doc_out(std::path::Path::new("a.b.c")),
+            std::path::Path::new("a.b.bilingual.md"),
+            "多点扩展名：file_stem 口径"
+        );
+        assert_eq!(
+            default_doc_out(std::path::Path::new("/")),
+            std::path::Path::new("/.bilingual.md"),
+            "无文件名路径：保守拼接"
+        );
+    }
+
+    /// §5/§7 过滤器串构造：9 种扩展名与规格 §5 顺序逐字一致
+    /// （rfd add_filter 直接吃该表）。
+    #[test]
+    fn doc_filter_extensions_match_spec() {
+        assert_eq!(
+            doc_filter_extensions(),
+            ["pdf", "docx", "epub", "txt", "md", "html", "csv", "rtf", "srt"].as_slice(),
+        );
+    }
+
+    /// §6 新词条（文档翻译）：zh / en 两表都要有——ts 对未知 key 原样返回
+    /// key 本身，漏配会被界面静默显示成 key，这里直接断言防回归
+    #[test]
+    fn doc_translate_keys_exist_in_both_langs() {
+        for lang in ["zh_CN", "en_US"] {
+            for key in [
+                tr::DOC_BUTTON,
+                tr::DOC_RUNNING,
+                tr::DOC_PROGRESS,
+                tr::DOC_DONE,
+                tr::DOC_FAILED,
+                tr::DOC_FILTER,
             ] {
                 assert_ne!(i18n::ts(lang, key), key, "{lang} 缺词：{key}");
             }

@@ -9,6 +9,7 @@ use std::process::exit;
 use std::time::Instant;
 
 use rumi_translate::download::{self, Mirrors};
+use rumi_translate::docmt::{self, BiStrategy, DocTranslateOptions};
 use rumi_translate::engine::OfflineEngine;
 use rumi_translate::{lang, postfix, registry, translate, Compute, Engine};
 
@@ -25,6 +26,9 @@ const HELP: &str = r#"rumi-translate-cli —— 离线/在线翻译命令行
   --url <u>        deeplx 服务地址 / openai base_url
   --model <m>      openai 模型名（默认 gpt-4o-mini）
   --file <path>    从文件读文本（UTF-8）
+  --doc <path>     文档翻译模式：解析→翻译→双语 Markdown（与 --engine/--from/--to 组合）
+  --doc-out <path> 输出路径（默认 <输入名去扩展>.bilingual.md，存输入同目录）
+  --strategy <s>   inline(默认) | only | appendix
   --no-polish      关闭 zh 译文标点润色
   --json           输出 {"engine":"...","elapsed_ms":N,"texts":[...]}
   --install <key>  安装离线语言包（zh_en / en_zh / nllb_600m），进度打 stderr，装完退出
@@ -44,6 +48,9 @@ struct Args {
     url: Option<String>,
     model: String,
     file: Option<String>,
+    doc: Option<String>,
+    doc_out: Option<String>,
+    strategy: String,
     no_polish: bool,
     json: bool,
     install: Option<String>,
@@ -65,6 +72,9 @@ impl Default for Args {
             url: None,
             model: "gpt-4o-mini".to_string(),
             file: None,
+            doc: None,
+            doc_out: None,
+            strategy: "inline".to_string(),
             no_polish: false,
             json: false,
             install: None,
@@ -94,6 +104,9 @@ fn parse_args() -> Args {
             "--url" => a.url = Some(next_value(&mut it, &arg)),
             "--model" => a.model = next_value(&mut it, &arg),
             "--file" => a.file = Some(next_value(&mut it, &arg)),
+            "--doc" => a.doc = Some(next_value(&mut it, &arg)),
+            "--doc-out" => a.doc_out = Some(next_value(&mut it, &arg)),
+            "--strategy" => a.strategy = next_value(&mut it, &arg),
             "--no-polish" => a.no_polish = true,
             "--json" => a.json = true,
             "--install" => a.install = Some(next_value(&mut it, &arg)),
@@ -154,6 +167,12 @@ fn main() {
         return;
     }
 
+    // --doc 文档翻译模式：忽略位置参数/stdin 文本源，独立链路（解析→翻译→回写）
+    if let Some(doc) = &args.doc {
+        doc_cmd(doc, &args);
+        return;
+    }
+
     // 语言码规范化：facade 与离线引擎都按内部两位码工作
     let from = lang::normalize(&args.from);
     let to = lang::normalize(&args.to);
@@ -196,6 +215,64 @@ fn main() {
                 println!("{out}");
             }
         }
+        Err(e) => {
+            eprintln!("{e}");
+            exit(1);
+        }
+    }
+}
+
+/// --doc-out 缺省名：输入同目录、去扩展名后接 .bilingual.md（a.b.txt → a.b.bilingual.md）。
+fn default_doc_out(input: &Path) -> PathBuf {
+    input.with_extension("bilingual.md")
+}
+
+/// --doc：文档翻译模式。进度打 stderr，完成打统计行；失败退出 1。
+fn doc_cmd(input: &str, args: &Args) {
+    let strategy = match BiStrategy::parse(&args.strategy) {
+        Some(s) => s,
+        None => {
+            eprintln!("未知策略：{}（可选 inline/only/appendix）", args.strategy);
+            exit(1);
+        }
+    };
+    let engine = match build_engine(args) {
+        // 文本模式绕过 shared() 直接 new；文档模式走 facade translate_document，
+        // 离线引擎即 shared() 单例（models_dir 按默认目录/env 固化）——
+        // --models-dir 对 --doc 无效，显式提醒以免静默装错目录
+        None => {
+            if args.models_dir.is_some() {
+                eprintln!("提示：--models-dir 对 --doc 离线翻译不生效（可用 RUMI_TRANSLATE_MODELS_DIR 环境变量）");
+            }
+            Engine::Offline
+        }
+        Some(e) => e,
+    };
+    let input_path = PathBuf::from(input);
+    let out = args
+        .doc_out
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_doc_out(&input_path));
+    let opts = DocTranslateOptions {
+        engine,
+        from: lang::normalize(&args.from),
+        to: lang::normalize(&args.to),
+        strategy,
+        polish: !args.no_polish,
+        min_chars: 2,
+        on_progress: Some(std::sync::Arc::new(|done, total| {
+            eprintln!("已翻译 {done}/{total} 单元");
+        })),
+    };
+    match docmt::translate_document(&input_path, &out, &opts) {
+        Ok(stats) => println!(
+            "单元 {} · 字符 {} · 耗时 {:.1} s → {}",
+            stats.units,
+            stats.chars,
+            stats.elapsed_ms as f64 / 1000.0,
+            out.display()
+        ),
         Err(e) => {
             eprintln!("{e}");
             exit(1);
