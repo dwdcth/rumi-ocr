@@ -8,8 +8,8 @@
 //! ```
 //!
 //! PDF 两种模式：
-//! - 默认（智能路由）：pdf-inspector 逐页分类，文字层页直接提取文本+坐标
-//!   （页标注 `[text-layer]`，跳过渲染与 OCR 引擎），扫描页才渲染+识别；
+//! - 默认（智能路由）：docforge 逐页路由，文字层页直接提取文本+坐标（零引擎），
+//!   扫描页 docforge 内渲染后由注入的引擎识别，行统一进 Text 变体直出；
 //! - `--force-raster`：旧行为，整本 pdftoppm 全渲染后走引擎。
 //!
 //! 输出：逐行 `[score] text @ 左上角坐标`，末尾统计（输入数 / 行数 / 平均置信度 / 耗时）。
@@ -188,57 +188,28 @@ fn run_pdf_raster(pdf: &PathBuf, dpi: u32, stats: &mut Stats) -> Result<(), Exit
     Ok(())
 }
 
-/// 智能路由：文字层页直接提取（零引擎），扫描页渲染后批量识别。
+/// 智能路由：docforge 页级路由端到端——文字层页直提（零引擎），扫描页
+/// docforge 内渲染 + 注入全局引擎逐页识别，全部页的行统一进 `PdfPage::Text`。
 fn run_pdf_route(pdf: &PathBuf, stats: &mut Stats) -> Result<(), Exit> {
     let t0 = Instant::now();
-    let pages =
-        rumi_ocr::pdf_route::route_pdf(pdf).map_err(|e| Exit::Fail(e.to_string()))?;
+    let pages = rumi_ocr::pdf_route::route_pdf(
+        pdf,
+        &rumi_ocr::pdf_route::RouteOptions::new(OcrEngine::global()),
+    )
+    .map_err(|e| Exit::Fail(e.to_string()))?;
     let route_elapsed = t0.elapsed();
 
-    // 扫描页帧收集起来，一次引擎锁批量识别；文字页行零成本直出
-    let raster_frames: Vec<_> = pages
-        .iter()
-        .filter_map(|p| match p {
-            PdfPage::Raster(frame) => Some(frame.clone()),
-            PdfPage::Text(_) => None,
-        })
-        .collect();
-    let mut recognized: Vec<Vec<OcrLine>> = Vec::new();
-    let mut ocr_elapsed = std::time::Duration::ZERO;
-    if !raster_frames.is_empty() {
-        let engine = OcrEngine::global();
-        engine
-            .warmup()
-            .map_err(|e| Exit::Fail(format!("引擎预热失败：{e}")))?;
-        let t1 = Instant::now();
-        recognized = engine
-            .recognize_many(&raster_frames)
-            .map_err(|e| Exit::Fail(format!("批量识别失败：{e}")))?;
-        ocr_elapsed = t1.elapsed();
-    }
-    let mut it = recognized.into_iter();
-
-    let mut text_pages = 0usize;
-    let mut raster_pages = 0usize;
     for (i, page) in pages.iter().enumerate() {
         match page {
             PdfPage::Text(lines) => {
-                text_pages += 1;
-                print_lines(&format!("{}#第{}页 [text-layer]", pdf.display(), i + 1), lines);
+                print_lines(&format!("{}#第{}页", pdf.display(), i + 1), lines);
                 stats.feed(lines);
-            }
-            PdfPage::Raster(_) => {
-                raster_pages += 1;
-                let lines = it.next().unwrap_or_default();
-                print_lines(&format!("{}#第{}页", pdf.display(), i + 1), &lines);
-                stats.feed(&lines);
             }
         }
     }
     println!(
-        "== PDF（智能路由）：{} 页 = 文字层 {text_pages}（直提取）+ 扫描 {raster_pages}（渲染+识别 {:.1}s），路由 {:.1}s",
+        "== PDF（智能路由）：{} 页全部行直出（扫描页渲染+识别在 docforge 内完成），路由 {:.1}s",
         pages.len(),
-        ocr_elapsed.as_secs_f32(),
         route_elapsed.as_secs_f32()
     );
     Ok(())

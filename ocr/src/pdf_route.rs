@@ -1,129 +1,166 @@
-//! pdf_route —— PDF 智能路由（快路径）。
+//! pdf_route —— PDF 智能路由（docforge 端到端）。
 //!
-//! 流程：pdf-inspector 分类（逐页）→ 文字层页直接提取文本+坐标（跳过渲染与 OCR），
-//! 扫描/图像页走 pdftoppm 渲染 + 图像识别。
+//! 文字层页直提行（pt、左下原点、y 向上，score=1.0）；扫描页 docforge 内部
+//! pdftoppm 渲染 + 注入的 rumi 引擎识别（像素、左上原点，带 confidence/quad）。
+//! 坐标系按页区分（与旧实现契约一致，消费者按 source/坐标系分派）。
 //!
-//! 坐标系说明（重要）：pdf-inspector 的 [`pdf_inspector::TextItem`] 报告的是
-//! **可见页框（CropBox∩MediaBox）内、左下角为原点、y 向上、单位 PDF 点（1/72 英寸）**的
-//! 坐标；`y` 对水平文本是基线（下缘），`height` 是 em 高。其公开 API 不暴露页框高度，
-//! 无法在不引入 lopdf 直读的前提下换算成渲染图像的左上原点坐标系，故文字层行的
-//! [`OcrLine::r#box`] 保持 **pdf-inspector 原坐标系**：四点顺序仍按我们的约定
-//! 左上→右上→右下→左下（这里的"上"= PDF 空间 y 更大的一侧），单位为 PDF 点。
-//! 该框自洽（并集/聚合等后处理几何不受 y 方向影响）；与渲染页（真图像坐标）混在
-//! 同一响应时，消费者按页区分即可。
-//!
-//! 探针结论（阶段一，2026-10）：oxidize-pdf 嵌入中文 TrueType 字体 + pdf-inspector
-//! 提取，整体相似度 ≥98%，快路径过关，详见 examples/pdf_text_probe.rs。
-//! 字体注意：oxidize-pdf 不支持 .ttc 集合（见 [`sample`]），探针用抽取的单面字体。
+//! 选型（2026-11，替换自 pdf-inspector 直调）：docforge 的 pdf 后端本身就构建于
+//! pdf-inspector 之上（行分组同一函数 `group_into_lines_preserving_all_text`，
+//! 文字层行与旧实现逐字节一致），且把"分类→渲染→OCR"整条管线收进一个
+//! 引擎注入式的 `parse` 调用——rumi 侧只剩适配器（[`RumiOcrAdapter`]）与
+//! 块→行的坐标重排。git 依赖为分发渠道，跟 main 滚动（`cargo update -p docforge`）。
 
 use crate::{OcrError, OcrLine};
-use image::RgbaImage;
-use pdf_inspector::extractor::{group_into_lines_preserving_all_text, ItemType};
-use pdf_inspector::{DetectionConfig, ScanStrategy};
-use std::collections::{HashMap, HashSet};
+use docforge::backends::pdf::{OcrMode, PdfOptions};
+use docforge::ocr::OcrEngine as DocforgeOcrEngine;
+use docforge::ocr::RecognizedLine;
+use docforge::{BlockSource, DocumentEngine, Registry};
 use std::path::Path;
+use std::sync::Arc;
 
-/// 单页路由结果
-#[derive(Debug)]
-pub enum PdfPage {
-    /// 文字层完整，直接提取的行（含 box）
-    Text(Vec<OcrLine>),
-    /// 需渲染后图像识别（RGBA 图像，K2：与 [`crate`] 的统一图像载体一致）
-    Raster(RgbaImage),
+/// 路由选项。
+///
+/// engine 取 `&'static`：docforge 的 `PdfOptions.engine` 是 `Arc<dyn OcrEngine>`
+///（对象默认 'static），借用式适配器活不过 parse 调用栈。rumi 的引擎本就是
+/// 进程级单例（[`crate::OcrEngine::global`] 等都返回 `&'static`），无损。
+pub struct RouteOptions {
+    /// rumi OCR 引擎（注入 docforge，扫描页识别用；避免模型双重加载）
+    pub engine: &'static crate::OcrEngine,
+    /// 页级进度回调透传：(已处理页数, 总页数) -> 是否继续（false 中止，
+    /// 已产出页保留，余页空占位——docforge Ok 语义）
+    pub on_progress: Option<Arc<dyn Fn(u32, u32) -> bool + Send + Sync>>,
+    /// 扫描页渲染 DPI（默认 200，对齐 docforge DEFAULT_DPI）
+    pub dpi: u32,
 }
 
-/// 分类 PDF 并按页路由。
+impl RouteOptions {
+    /// 手写构造函数（engine 无默认值，`Default` 不适用）：on_progress None、
+    /// dpi 200。需要进度/自定义 DPI 时结构体字面量补齐其余字段。
+    pub fn new(engine: &'static crate::OcrEngine) -> Self {
+        Self {
+            engine,
+            on_progress: None,
+            dpi: docforge::backends::pdf::DEFAULT_DPI,
+        }
+    }
+}
+
+/// 单页路由结果。Raster 变体已删除：渲染+OCR 在 docforge 内完成，
+/// OCR 页的行同样出现在 Text 里（source 区分见 docforge `BlockSource`；
+/// 文字层行 score=1.0、坐标 pt 左下原点，OCR 行带 confidence、坐标渲染像素）。
+#[derive(Debug)]
+pub enum PdfPage {
+    /// 本页全部行（文字层直提与扫描页 OCR 识别统一在此变体）
+    Text(Vec<OcrLine>),
+}
+
+/// rumi 引擎 → docforge OcrEngine 适配器（零拷贝：image 0.25 同实例，
+/// `&RgbaImage` 直通不复制）。engine 为 `&'static`（见 [`RouteOptions`] 注），
+/// 才能满足 `PdfOptions.engine = Arc<dyn OcrEngine>` 的 'static 对象约束。
+struct RumiOcrAdapter {
+    engine: &'static crate::OcrEngine,
+}
+
+impl DocforgeOcrEngine for RumiOcrAdapter {
+    fn name(&self) -> &str {
+        "rumi-oar"
+    }
+
+    fn recognize(&self, image: &image::RgbaImage) -> Result<Vec<RecognizedLine>, String> {
+        // engine.recognize 的 OcrLine{text, box, score} → RecognizedLine
+        // {text, score, quad}（box 四点直通，PaddleOCR det polys 天然形态）
+        self.engine
+            .recognize(image)
+            .map(|lines| lines.into_iter().map(to_recognized_line).collect())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// [`OcrLine`] → docforge [`RecognizedLine`] 字段映射（适配器单测的纯转换层）。
+fn to_recognized_line(l: OcrLine) -> RecognizedLine {
+    RecognizedLine {
+        text: l.text,
+        score: l.score,
+        quad: l.r#box,
+    }
+}
+
+/// 分类 PDF 并按页路由（docforge 端到端）。
 ///
-/// 分类用 [`ScanStrategy::Full`] 逐页扫描（默认 Sample(8) 对"图封面+正文"型文档
-/// 会误判，且逐页路由需要全量 per-page 结论）：`pages_needing_ocr` 即逐页路由依据。
-/// 扫描页按**连续区间**合并渲染（一次 pdftoppm -f/-l），页图顺序与页序一致。
-pub fn route_pdf(path: &Path) -> Result<Vec<PdfPage>, crate::OcrError> {
-    // 与 load_pdf 同款预检：错误文案保持"文件不存在：…"（server http 测试据此区分分支）
+/// 装配：`Registry` + pdf 后端（`OcrMode::Auto` 逐页判定：文字层页直提、
+/// 扫描页按连续区间 pdftoppm 渲染后走注入的 rumi 引擎）+ `DocumentEngine::parse`。
+/// 扫描页识别在 docforge 内逐页完成（旧实现是收集帧后批量 recognize_many，
+/// 行文本/行序一致，见模块注释）。
+pub fn route_pdf(path: &Path, opts: &RouteOptions) -> Result<Vec<PdfPage>, OcrError> {
+    // 与 load_pdf 同款预检：错误文案保持"文件不存在：…"（server http 测试据此
+    // 区分分支；docforge 预检同文案，但 rumi 侧先查可省一次装配）
     if !path.is_file() {
         return Err(OcrError::Pdf(format!("文件不存在：{}", path.display())));
     }
 
-    let info = pdf_inspector::detect_pdf_type_with_config(
-        path,
-        DetectionConfig {
-            strategy: ScanStrategy::Full,
-            ..Default::default()
+    let mut registry = Registry::new();
+    docforge::backends::pdf::register(
+        &mut registry,
+        PdfOptions {
+            mode: OcrMode::Auto,
+            dpi: opts.dpi,
+            engine: Some(Arc::new(RumiOcrAdapter { engine: opts.engine })),
+            intra_page: false,
+            on_progress: opts.on_progress.clone(),
+            keep_raster_pages: false,
         },
-    )
-    .map_err(|e| OcrError::Pdf(format!("PDF 分类失败（{}）：{e}", path.display())))?;
-
-    let page_count = info.page_count;
-    let raster_pages: HashSet<u32> = info.pages_needing_ocr.iter().copied().collect();
-    let text_pages: HashSet<u32> = (1..=page_count).filter(|p| !raster_pages.contains(p)).collect();
-
-    // 文字层页：提取 + 按行分组，按页归拢
-    let mut lines_by_page: HashMap<u32, Vec<OcrLine>> = HashMap::new();
-    if !text_pages.is_empty() {
-        let items = pdf_inspector::extract_text_with_positions_pages(path, Some(&text_pages))
-            .map_err(|e| OcrError::Pdf(format!("文字层提取失败（{}）：{e}", path.display())))?;
-        for line in group_into_lines_preserving_all_text(items) {
-            if let Some(l) = text_line_to_ocr(&line) {
-                lines_by_page.entry(line.page).or_default().push(l);
-            }
-        }
+    );
+    let doc = DocumentEngine::new(registry)
+        // DocumentEngine::parse 收 &str（按扩展名嗅探格式）
+        .parse(&path.to_string_lossy())
+        .map_err(|e| OcrError::Pdf(e.message))?;
+    // docforge 的 warnings 挂在 meta.extra（末条优先），rumi 现状无 warnings
+    // 概念：一行 eprintln 透传即可（正常解析无告警，静默）
+    if let Some(w) = doc.meta.extra.get("warnings") {
+        eprintln!("[pdf_route] docforge：{w}");
     }
 
-    // 按页序组装：文字页直接出；连续扫描页并成一个渲染区间
-    let mut out = Vec::with_capacity(page_count as usize);
-    let mut p = 1u32;
-    while p <= page_count {
-        if !raster_pages.contains(&p) {
-            let lines = lines_by_page.remove(&p).unwrap_or_default();
-            out.push(PdfPage::Text(lines));
-            p += 1;
-            continue;
+    let mut out = Vec::with_capacity(doc.pages.len());
+    for page in &doc.pages {
+        let mut lines = Vec::new();
+        for b in &page.blocks {
+            // 空文本块跳过（等价旧 text_line_to_ocr 的空文本过滤）
+            if b.content.trim().is_empty() {
+                continue;
+            }
+            let (score, r#box) = match b.source {
+                // OCR 行：score=confidence；quad 直通（旋转保真）；
+                // quad None（理论不发生，防御）退 bbox 左上原点四点；
+                // 两者皆缺给全零框（不产出比产出错框更稳）
+                BlockSource::Ocr => (
+                    b.confidence.unwrap_or(0.0),
+                    match (b.quad, b.bbox) {
+                        (Some(q), _) => q,
+                        (None, Some(r)) => [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]],
+                        (None, None) => [[0.0; 2]; 4],
+                    },
+                ),
+                // 文字层（Native 等来源 pdf 不产生，防御性同 TextLayer）：
+                // score=1.0（文字就在文件里，不存在"识别置信度"）；box 从
+                // bbox(pt, y 向上) 构造，顺序沿旧契约"左上→右上→右下→左下"
+                //（"上" = PDF y 更大侧）
+                _ => (
+                    1.0,
+                    match b.bbox {
+                        Some(r) => [[r.x0, r.y1], [r.x1, r.y1], [r.x1, r.y0], [r.x0, r.y0]],
+                        None => [[0.0; 2]; 4],
+                    },
+                ),
+            };
+            lines.push(OcrLine {
+                text: b.content.clone(),
+                score,
+                r#box,
+            });
         }
-        let first = p;
-        while p <= page_count && raster_pages.contains(&p) {
-            p += 1;
-        }
-        let last = p - 1;
-        for img in crate::load_pdf_pages(path, first, last)? {
-            out.push(PdfPage::Raster(img));
-        }
+        out.push(PdfPage::Text(lines));
     }
     Ok(out)
-}
-
-/// pdf-inspector 的 [`pdf_inspector::TextLine`] → [`OcrLine`]。
-///
-/// 文本取行文本；框 = 成员 item 框（x 左缘 / y 底缘 / width / height）的并集，
-/// 坐标系见模块注释。只有文本非空的 item 参与并集（图像占位/空链路不污染行框）。
-/// 置信度按文字层定义恒为 1.0（文字就在文件里，不存在"识别置信度"）。
-fn text_line_to_ocr(line: &pdf_inspector::extractor::TextLine) -> Option<OcrLine> {
-    let text = line.text();
-    if text.trim().is_empty() {
-        return None;
-    }
-    let mut x0 = f32::MAX;
-    let mut x1 = f32::NEG_INFINITY;
-    let mut y0 = f32::MAX;
-    let mut y1 = f32::NEG_INFINITY;
-    for it in &line.items {
-        if it.text.trim().is_empty()
-            || matches!(it.item_type, ItemType::Image)
-        {
-            continue;
-        }
-        x0 = x0.min(it.x);
-        x1 = x1.max(it.x + it.width);
-        y0 = y0.min(it.y);
-        y1 = y1.max(it.y + it.height);
-    }
-    if x0 > x1 {
-        return None;
-    }
-    Some(OcrLine {
-        text,
-        score: 1.0,
-        // 左上→右上→右下→左下（"上"= PDF 空间 y 大的一侧）
-        r#box: [[x0, y1], [x1, y1], [x1, y0], [x0, y0]],
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +213,7 @@ pub mod sample {
     }
 
     /// 生成混合样例：第 1 页文字层，第 2 页纯图像（模拟扫描页，无文字算子）。
-    /// pdf-inspector 应判 Mixed，pages_needing_ocr = [2]。
+    /// docforge 分类应判 Mixed，第 2 页走渲染 + 注入引擎识别。
     pub fn generate_mixed_pdf(path: &Path) -> Result<String, OcrError> {
         let (mut doc, font_used) = doc_with_cjk_font()?;
         doc.add_page(text_page(SAMPLE_PAGES[0])?);
@@ -349,13 +386,13 @@ mod tests {
         let pdf = dir.join("sample.pdf");
         let font = sample::generate_text_pdf(&pdf).expect("样例生成失败");
 
-        let pages = route_pdf(&pdf).expect("路由失败");
+        // global() 懒构建：纯文字页不触发识别，无模型下载
+        let opts = RouteOptions::new(crate::OcrEngine::global());
+        let pages = route_pdf(&pdf, &opts).expect("路由失败");
         assert_eq!(pages.len(), 2, "两页全是文字层，全部走 Text（字体：{font}）");
 
         for (i, page) in pages.iter().enumerate() {
-            let PdfPage::Text(lines) = page else {
-                panic!("第 {} 页应为文字层，却路由到渲染", i + 1);
-            };
+            let PdfPage::Text(lines) = page;
             assert!(!lines.is_empty(), "第 {} 页提取结果为空", i + 1);
             // 本页期望行逐一断言：按字符相似度 ≥98% 找到对应提取行
             for exp in sample::SAMPLE_PAGES[i] {
@@ -382,40 +419,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 混合样例端到端：文字页直提，扫描页 docforge 内渲染 + 注入引擎识别
+    /// （真推理：命中 ~/.oar 模型缓存，与 lib 既有真推理测试同前提）。
     #[test]
-    fn route_pdf_mixed_routes_scan_page_to_raster() {
+    fn route_pdf_mixed_routes_scan_page_lines_through_engine() {
         let dir = probe_dir("mixed");
         let pdf = dir.join("mixed.pdf");
         sample::generate_mixed_pdf(&pdf).expect("混合样例生成失败");
 
-        let pages = route_pdf(&pdf).expect("路由失败");
+        let opts = RouteOptions::new(crate::OcrEngine::global());
+        let pages = route_pdf(&pdf, &opts).expect("路由失败");
         assert_eq!(pages.len(), 2);
-        let PdfPage::Text(lines) = &pages[0] else {
-            panic!("第 1 页是文字层，应走 Text");
-        };
+        let PdfPage::Text(text_lines) = &pages[0];
         assert!(
-            lines.iter().any(|l| l.text.contains("深秋的校园")),
+            text_lines.iter().any(|l| l.text.contains("深秋的校园")),
             "第 1 页应提取到中文行：{:?}",
-            lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+            text_lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
-        let PdfPage::Raster(img) = &pages[1] else {
-            panic!("第 2 页是纯图像，应走 Raster");
-        };
-        // A4 @200dpi ≈ 1654×2339
-        let (w, h) = img.dimensions();
-        assert!(
-            (1500..1800).contains(&w) && (2200..2500).contains(&h),
-            "第 2 页渲染尺寸异常：{}×{}",
-            w,
-            h
-        );
-        assert_eq!(img.len(), w as usize * h as usize * 4);
+        // 文字层行 score 恒 1.0
+        assert!(text_lines.iter().all(|l| (l.score - 1.0).abs() < 1e-6));
+
+        // 第 2 页扫描页：行同样以 Text 变体出现（渲染+OCR 在 docforge 内完成），
+        // 识别结果带真实置信度（合成黑块可能识别不出任何行，允许为空）
+        let PdfPage::Text(scan_lines) = &pages[1];
+        for l in scan_lines {
+            assert!(l.score > 0.0 && l.score < 1.0, "OCR 行应为真实置信度：{l:?}");
+            // OCR 页坐标 = 渲染像素（A4@200dpi ≈ 1654×2339）左上原点，非负
+            for pt in l.r#box {
+                assert!(pt[0] >= 0.0 && pt[1] >= 0.0, "OCR 坐标应为非负像素：{:?}", l.r#box);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn route_pdf_missing_file_reports_missing() {
-        let err = route_pdf(Path::new("/nonexistent/rumi/definitely-missing.pdf")).unwrap_err();
+        let opts = RouteOptions::new(crate::OcrEngine::global());
+        let err = route_pdf(Path::new("/nonexistent/rumi/definitely-missing.pdf"), &opts).unwrap_err();
         assert!(err.to_string().contains("文件不存在"), "实际错误：{err}");
     }
 
@@ -436,7 +476,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 归一化编辑距离相似度（与 examples/pdf_text_probe.rs 同一算法）。
+    /// RumiOcrAdapter 转发正确性（mock，不跑真模型）：OcrLine 字段
+    /// {text, score, box} → RecognizedLine {text, score, quad} 直通，
+    /// 引擎名固定 "rumi-oar"（docforge 诊断/日志用）。
+    #[test]
+    fn adapter_maps_line_fields_without_model() {
+        let adapter = RumiOcrAdapter {
+            engine: crate::OcrEngine::global(),
+        };
+        assert_eq!(DocforgeOcrEngine::name(&adapter), "rumi-oar");
+
+        let mapped = to_recognized_line(OcrLine {
+            text: "斜行 ABC".into(),
+            score: 0.87,
+            r#box: [[1.0, 2.0], [3.0, 2.5], [2.5, 8.0], [0.5, 7.0]],
+        });
+        assert_eq!(mapped.text, "斜行 ABC");
+        assert!((mapped.score - 0.87).abs() < 1e-6);
+        assert_eq!(
+            mapped.quad,
+            [[1.0, 2.0], [3.0, 2.5], [2.5, 8.0], [0.5, 7.0]],
+            "box 四点应原样进 quad（旋转保真）"
+        );
+    }
+
+    /// 归一化编辑距离相似度（与旧 pdf_text_probe 同一算法）。
     fn similarity(a: &str, b: &str) -> f64 {
         let a: Vec<char> = a.chars().collect();
         let b: Vec<char> = b.chars().collect();

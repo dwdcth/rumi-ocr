@@ -138,35 +138,26 @@ impl Recognizer {
             }
             OcrInput::Path(p) => {
                 let path = Path::new(&p);
-                // PDF：智能路由（pdf_route）——文字层页直接提取行并入（跳过引擎），
-                // 扫描页渲染成图后走现有识别；页序保持原 PDF 顺序。
-                // 后处理（忽略规则 / 排版合并）仍由统一的 apply_post 处理。
-                // 扩展名判断不区分大小写（.PDF 同样路由）。
+                // PDF：智能路由（pdf_route，docforge 端到端）；页序保持原 PDF
+                // 顺序。扩展名判断不区分大小写（.PDF 同样路由）。
                 if path
                     .extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
                 {
-                    let pages = rumi_ocr::pdf_route::route_pdf(path).map_err(|e| e.to_string())?;
-                    // 扫描页图像收集起来一次引擎锁批量识别（顺序 = 页序）
-                    let raster: Vec<_> = pages
-                        .iter()
-                        .filter_map(|p| match p {
-                            PdfPage::Raster(img) => Some(img.clone()),
-                            PdfPage::Text(_) => None,
-                        })
-                        .collect();
-                    let mut recognized: Vec<Vec<OcrLine>> = Vec::new();
-                    if !raster.is_empty() {
-                        recognized = native_engine()
-                            .recognize_many(&raster)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    let mut it = recognized.into_iter();
+                    // docforge 页级路由端到端：文字层页直提，扫描页 docforge 内
+                    // 渲染 + 注入本进程同一 native 引擎识别（避免模型双重加载）；
+                    // 全部页的行统一进 PdfPage::Text，页序保持原 PDF 顺序。
+                    // 后处理（忽略规则 / 排版合并）仍由统一的 apply_post 处理。
+                    let opts =
+                        rumi_ocr::pdf_route::RouteOptions::new(native_engine());
+                    let pages = rumi_ocr::pdf_route::route_pdf(path, &opts)
+                        .map_err(|e| e.to_string())?;
                     let mut lines = Vec::new();
                     for page in &pages {
                         match page {
-                            PdfPage::Text(text_lines) => lines.extend(text_lines.iter().cloned()),
-                            PdfPage::Raster(_) => lines.extend(it.next().unwrap_or_default()),
+                            PdfPage::Text(text_lines) => {
+                                lines.extend(text_lines.iter().cloned())
+                            }
                         }
                     }
                     Ok(lines)
@@ -494,7 +485,7 @@ mod tests {
     #[test]
     fn recognizer_pdf_text_layer_skips_engine() {
         // 纯文字层 PDF 走 route_pdf：行直接来自文字层（score=1.0），
-        // 全程不触碰 ONNX 引擎（无扫描页 → recognize_many 不会被调用）。
+        // 全程不触碰 ONNX 引擎（无扫描页 → 注入 docforge 的引擎不会被调用）。
         let dir = std::env::temp_dir().join(format!("rumi-disp-pdf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("config.toml");

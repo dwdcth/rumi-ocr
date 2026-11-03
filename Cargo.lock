@@ -2262,6 +2262,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "docforge"
+version = "0.1.0"
+source = "git+https://github.com/dwdcth/docforge#584949284e88fd1141a810bf8e27ce7af8e57895"
+dependencies = [
+ "image",
+ "pdf-inspector",
+ "serde",
+]
+
+[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6489,11 +6499,11 @@ name = "rumi-ocr"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "docforge",
  "image",
  "imageproc",
  "oar-ocr",
  "oxidize-pdf",
- "pdf-inspector",
  "qrcodegen",
  "regex",
  "rqrr",

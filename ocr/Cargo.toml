@@ -26,8 +26,11 @@ regex = "1"
 # 二维码生成（P2 #13）：Nayuki 出品、零依赖、只产布尔矩阵，
 # PNG 编码复用上面的 image。原为 dev-deps（测试 scan_qr），现转正
 qrcodegen = "1"
-# PDF 智能路由：文字层分类/提取（F 代理）
-pdf-inspector = "1"
+# 文档解析（PDF 页级路由：文字层直提 vs 渲染+OCR，引擎注入式）。
+# git 依赖为分发渠道（上游暂不发布 crates.io）；跟 main 滚动，
+# 更新用 cargo update -p docforge。pdf feature 自带 pdf-inspector（传递依赖）
+# 与 image 0.25（与本 crate 同实例）。
+docforge = { git = "https://github.com/dwdcth/docforge", default-features = false, features = ["pdf"] }
 # 双层可搜索 PDF 导出（G 代理）
 oxidize-pdf = "5"
 
