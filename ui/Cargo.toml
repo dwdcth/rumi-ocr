@@ -14,6 +14,14 @@ dioxus = { version = "0.7", features = ["desktop"] }
 rumi-capture = { path = "../capture" }
 # OCR 引擎（全局单例，后台线程调用；见 ../ocr）
 rumi-ocr = { path = "../ocr" }
+# 翻译核心（ct2rs 编译在此 crate；translate-spec-ui.md §6）
+rumi-translate = { path = "../translate" }
+# 与 server 同款：ort-sys 走 pkg-config 动态链系统 libonnxruntime。ui 链接
+# translate（静态 protobuf-lite，经 ct2rs→sentencepiece-sys）后，静态 ort-sys
+# 内嵌的第二份 protobuf 会与之 duplicate symbol / 运行期互劫持——动态 ORT +
+# 工作区 --exclude-libs,ALL（见 .cargo/config.toml）后两份各归各位。
+# 系统依赖：pacman -S onnxruntime（≥1.17）。
+ort-sys = { version = "=2.0.0-rc.13", features = ["pkg-config"] }
 # 插件 worker（M2）：引擎切换到 plugin:<name> 时经 PluginProcess 识图（runBytes）
 plugins-worker = { path = "../plugins-worker" }
 # 结果图 base64 data-URL 内嵌显示

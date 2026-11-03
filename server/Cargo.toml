@@ -25,6 +25,17 @@ base64 = "0.22"
 rumi-ocr = { path = "../ocr" }
 # plugin:<名> 引擎（BlockingPluginProcess 走 Umi 插件协议）
 plugins-worker = { path = "../plugins-worker" }
+# /api/translate*（离线 CT2 + 在线 providers + 模型下载）
+rumi-translate = { path = "../translate" }
+# 仅为本 crate 的依赖图启用 ort-sys 的 pkg-config 策略（特性统一作用于本图内
+# 的 rumi-ocr → oar-ocr → ort → ort-sys）：系统 libonnxruntime（动态）优先于
+# 预编译静态库。为什么必须：静态 ort-sys 内嵌 protobuf 3.14，而 rumi-translate
+# → ct2rs → sentencepiece-sys 静态内嵌 protobuf-lite 3.21——两份 protobuf 同链
+# 时符号互相污染，运行到模型加载必 FATAL（互相报 "compiled against version X,
+# installed version Y"），非链接器开关可救。系统动态 ORT 后，可执行文件里只剩
+# ct2 一份静态 protobuf，两者各自完整。探测失败（无 libonnxruntime.pc）会回退
+# 静态下载，行为同旧。系统依赖：pacman -S onnxruntime（≥1.17 即可）。
+ort-sys = { version = "=2.0.0-rc.13", features = ["pkg-config"] }
 
 [dependencies.tokio]
 version = "1"

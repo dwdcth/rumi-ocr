@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["capture", "cli", "ui", "plugins-worker", "ocr", "server"]
+members = ["capture", "cli", "ui", "plugins-worker", "ocr", "server", "translate"]
 
 [workspace.package]
 version = "0.1.0"

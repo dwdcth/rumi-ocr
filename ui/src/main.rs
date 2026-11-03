@@ -44,6 +44,7 @@ mod ocr_flow;
 mod picker;
 mod plugins_ui;
 mod settings;
+mod translate_ui;
 mod tray;
 
 use dioxus::desktop::{
@@ -59,11 +60,13 @@ use rumi_capture::{Caps, Capturer};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// tab 索引（rsx 里用 usize 比较，避免枚举比较的手写 PartialEq 噪音）。
-/// RUMI_START_TAB 调试变量沿用此编号：1=插件 2=设置 3=批量。
+/// RUMI_START_TAB 调试变量沿用此编号：1=插件 2=设置 3=批量 4=翻译。
 const TAB_MAIN: usize = 0;
 const TAB_PLUGINS: usize = 1;
 const TAB_SETTINGS: usize = 2;
 const TAB_BATCH: usize = 3;
+/// 翻译页（translate-spec-ui.md §1）
+const TAB_TRANSLATE: usize = 4;
 
 /// 窗口默认 / 最小尺寸（逻辑像素；最小尺寸见 P0 #4）
 const DEFAULT_WIN: (f64, f64) = (1000.0, 760.0);
@@ -557,6 +560,8 @@ pub enum NavIconName {
     Recognize,
     /// 批量：叠层文档
     Batch,
+    /// 翻译：文 + A 两字符（翻译的惯用图形；规格 §1 key=translate）
+    Translate,
     /// 插件：积木
     Plugins,
     /// 设置：齿轮
@@ -576,6 +581,15 @@ fn icon_paths(name: NavIconName) -> &'static [&'static str] {
         NavIconName::Batch => &[
             "M9.5 4.5H17a2 2 0 0 1 2 2V15",
             "M7 8.5h6a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2z",
+        ],
+        NavIconName::Translate => &[
+            // 左上「文」：顶横 + 竖点 + 撇捺弧
+            "M3.5 5.5h7",
+            "M7 3.2v2.3",
+            "M4.3 10c1.4-2.1 3.6-3.4 6.2-3.7",
+            // 右下「A」：两腿 + 横杠
+            "M12.8 20.6l3.3-9.2 3.3 9.2",
+            "M14.1 17.2h4",
         ],
         NavIconName::Plugins => &[
             "M9.6 3.5h4.8a1.6 1.6 0 0 1 1.6 1.6v4.8a1.6 1.6 0 0 1-1.6 1.6H9.6a1.6 1.6 0 0 1-1.6-1.6V5.1a1.6 1.6 0 0 1 1.6-1.6z",
@@ -612,7 +626,7 @@ pub fn NavIcon(name: NavIconName, size: u32) -> Element {
     }
 }
 
-/// 左侧导航栏：品牌 + 四项（识别/批量/插件/设置）+ 底部说明位
+/// 左侧导航栏：品牌 + 五项（识别/批量/翻译/插件/设置）+ 底部说明位
 #[component]
 fn Sidebar(mut tab: Signal<usize>, lang: Signal<String>) -> Element {
     let lang_v = lang();
@@ -628,6 +642,9 @@ fn Sidebar(mut tab: Signal<usize>, lang: Signal<String>) -> Element {
                 active: tab_v == TAB_MAIN, on_click: move |_| tab.set(TAB_MAIN) }
             NavItem { label: t(i18n::k::NAV_BATCH).to_string(), icon: NavIconName::Batch,
                 active: tab_v == TAB_BATCH, on_click: move |_| tab.set(TAB_BATCH) }
+            // 翻译（规格 D §1）：批量项后插入
+            NavItem { label: t(translate_ui::tr::NAV).to_string(), icon: NavIconName::Translate,
+                active: tab_v == TAB_TRANSLATE, on_click: move |_| tab.set(TAB_TRANSLATE) }
             NavItem { label: t(i18n::k::NAV_PLUGINS).to_string(), icon: NavIconName::Plugins,
                 active: tab_v == TAB_PLUGINS, on_click: move |_| tab.set(TAB_PLUGINS) }
             NavItem { label: t(i18n::k::NAV_SETTINGS).to_string(), icon: NavIconName::Settings,
@@ -749,6 +766,10 @@ fn App() -> Element {
     let theme = use_signal(|| settings::get().theme);
     // P2 #15：UI 语言信号（settings.lang 初始值），保存设置即时生效
     let lang = use_signal(|| settings::get().lang);
+    // 翻译引擎单例精度：启动时按设置注入（须在首次 shared() 之前，见 engine::configure_shared）
+    if settings::get().translate.compute == "float32" {
+        rumi_translate::engine::configure_shared(rumi_translate::Compute::Float32);
+    }
     let mut tab = use_signal(|| {
         // 调试/巡场用：RUMI_START_TAB=1/2/3 直接打开指定页（发布版无副作用）
         std::env::var("RUMI_START_TAB")
@@ -787,6 +808,30 @@ fn App() -> Element {
     // 窗口最大化态（TitleBar 按钮图形用）：由 wry Resized 事件读 is_maximized 同步
     // ——最大化是合成器异步确认的，不在点击处理器里乐观回写（咨询结论）
     let mut win_maximized = use_signal(|| false);
+
+    // ── 翻译联动（translate-spec-ui.md §2/§3.8）────────────────────────────
+    // OCR 页「翻译」按钮写入的跨页预填：App 持有，分别传给 MainTab 与
+    // TranslatePage（现有 Signal 组织方式 = 顶层声明 + props 传递，Signal Copy）
+    let mut translate_prefill = use_signal(translate_ui::TranslatePrefill::default);
+    // settings.translate.auto_ocr=true 时：识别完成自动带入翻译页并翻译。
+    // 完成路径本体在 ocr_flow::finish_recognize（本工人不改 ocr_flow），就近在
+    // App 侧挂 history 信号钩子：finish_recognize 是 history 的唯一插入方
+    //（历史清空/单条删除只减不增、历史回填不写 history），以「最新条目时间戳
+    // 变大」判定一次新识别完成——避开 texts 编辑/排版重排/回填的误触发。
+    let mut last_hist_at = use_signal(|| 0u64);
+    use_effect(move || {
+        let newest = history.read().first().map(|it| it.at).unwrap_or(0);
+        if newest > last_hist_at() {
+            last_hist_at.set(newest);
+            if settings::get().translate.auto_ocr {
+                let text = texts.read().join("\n");
+                if !text.trim().is_empty() {
+                    translate_prefill.set(translate_ui::TranslatePrefill { text, run: true });
+                    tab.set(TAB_TRANSLATE);
+                }
+            }
+        }
+    });
 
     let ctx = CaptureCtx {
         shot,
@@ -1010,7 +1055,7 @@ fn App() -> Element {
                 Sidebar { tab, lang }
                 div { class: "content",
                 if tab_v == TAB_MAIN {
-                    MainTab { ctx, engine_text, caps: caps_v, tab, lang }
+                    MainTab { ctx, engine_text, caps: caps_v, tab, lang, translate_prefill }
                 }
                 if tab_v == TAB_PLUGINS {
                     plugins_ui::PluginsPage { page_status, engine_text }
@@ -1020,6 +1065,10 @@ fn App() -> Element {
                 }
                 if tab_v == TAB_BATCH {
                     batch::BatchPage { busy, lang }
+                }
+                // 翻译页（规格 D §1）：渲染 translate_ui::TranslatePage
+                if tab_v == TAB_TRANSLATE {
+                    translate_ui::TranslatePage { tab, lang, prefill: translate_prefill }
                 }
                 div { class: "footer",
                     span { "{i18n::filln(i18n::tt(i18n::k::FOOTER_BACKEND), &[&backend, &caps_display, &session])}" }
@@ -1085,6 +1134,8 @@ fn MainTab(
     caps: Option<Caps>,
     mut tab: Signal<usize>,
     lang: Signal<String>,
+    // 跨页翻译预填（translate-spec-ui.md §3.7）：写 prefill + 切翻译页
+    mut translate_prefill: Signal<translate_ui::TranslatePrefill>,
 ) -> Element {
     let CaptureCtx {
         shot,
@@ -1468,6 +1519,16 @@ fn MainTab(
                                         Err(e) => status.set(format!("{}{e}", i18n::tt(i18n::k::ERR_MARK))),
                                     },
                                     "{t(i18n::k::BTN_COPY_ALL)}" }
+                                // 翻译（规格 D §3.7）：全部结果行 join("\n") 写
+                                // prefill{run:true} → 切翻译页，翻译页消费后自动翻译
+                                button { class: "btn-sm",
+                                    disabled: busy_flag || captured_texts.is_empty(),
+                                    onclick: move |_| {
+                                        let text = texts().join("\n");
+                                        translate_prefill.set(translate_ui::TranslatePrefill { text, run: true });
+                                        tab.set(TAB_TRANSLATE);
+                                    },
+                                    "{t(translate_ui::tr::OCR_BUTTON)}" }
                             }
                         }
                         if captured_texts.is_empty() {
@@ -2015,6 +2076,23 @@ fn SettingsPage(
     let mut close_sel = use_signal(move || {
         if s.close_to_tray { "tray".to_string() } else { "quit".to_string() }
     });
+    // ── 翻译小节（translate-spec-ui.md §4）──────────────────────────────────
+    // checkbox/select 变更即存（同主题/关闭行为口径）；文本框失焦存（onblur
+    // 一次写盘，避免每个键击落盘）。tr_now 为渲染时快照，供引擎可用性判定。
+    let tr_now = s.translate.clone();
+    let mut tr_engine = use_signal(move || s.translate.engine.clone());
+    let mut tr_compute = use_signal(move || s.translate.compute.clone());
+    let mut tr_polish = use_signal(move || s.translate.polish);
+    let mut tr_auto_ocr = use_signal(move || s.translate.auto_ocr);
+    let mut tr_deepl_key = use_signal(move || s.translate.deepl_api_key.clone());
+    let mut tr_deepl_pro = use_signal(move || s.translate.deepl_pro);
+    let mut tr_deeplx_url = use_signal(move || s.translate.deeplx_url.clone());
+    let mut tr_openai_base = use_signal(move || s.translate.openai_base_url.clone());
+    let mut tr_openai_key = use_signal(move || s.translate.openai_api_key.clone());
+    let mut tr_openai_model = use_signal(move || s.translate.openai_model.clone());
+    let mut tr_mirror_argos = use_signal(move || s.translate.mirror_argos.clone());
+    let mut tr_mirror_hf = use_signal(move || s.translate.mirror_hf.clone());
+    let mut tr_mirror_github = use_signal(move || s.translate.mirror_github.clone());
     // 运行日志：查看开关 + 尾部内容镜像
     let mut log_show = use_signal(|| false);
     let mut log_text = use_signal(String::new);
@@ -2025,6 +2103,23 @@ fn SettingsPage(
     let notify_v = notify_sel();
     let sound_v = sound_sel();
     let ignore_v = ignore_text();
+    // 翻译小节的渲染值 + 引擎可用性（翻译/设置两页共用 translate_ui 纯函数）
+    let tr_engine_v = tr_engine();
+    let tr_polish_v = tr_polish();
+    let tr_auto_ocr_v = tr_auto_ocr();
+    let tr_deepl_pro_v = tr_deepl_pro();
+    let tr_en_deepl = translate_ui::engine_enabled(&tr_now, "deepl");
+    let tr_en_deeplx = translate_ui::engine_enabled(&tr_now, "deeplx");
+    let tr_en_openai = translate_ui::engine_enabled(&tr_now, "openai");
+    let tr_lbl = |k: &str| translate_ui::engine_label(k, &tr_now, &lang_v);
+    let (tr_lbl_offline, tr_lbl_google, tr_lbl_ms, tr_lbl_deepl, tr_lbl_deeplx, tr_lbl_openai) = (
+        tr_lbl("offline"),
+        tr_lbl("google"),
+        tr_lbl("microsoft"),
+        tr_lbl("deepl"),
+        tr_lbl("deeplx"),
+        tr_lbl("openai"),
+    );
 
     // 引擎状态卡（P0 #3）：native 显示引擎生命周期，plugin 显示 worker 运行态
     struct EngineCardView {
@@ -2380,6 +2475,201 @@ fn SettingsPage(
                         "{t(i18n::k::SET_EFFECT)}" }
                 }
             }
+
+            // ── 翻译（translate-spec-ui.md §4）：默认引擎/计算精度/润色/自动翻译
+            // / DeepL / DeepLX / OpenAI 兼容 / 下载镜像。词条 key 走规格指定的
+            // settings.translate.* 前缀；禁用规则与翻译页共用 translate_ui 纯函数。
+            div { class: "card", style: "margin-top: var(--sp2);",
+                div { class: "schema-head", "{t(translate_ui::tr::SET_SECTION)}" }
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_ENGINE)}" }
+                    div { class: "field",
+                        select { class: "ctl",
+                            onchange: move |e| {
+                                let v = e.value();
+                                tr_engine.set(v.clone());
+                                let _ = settings::update(move |st| { st.translate.engine = v; Ok(()) });
+                            },
+                            option { value: "offline", selected: tr_engine_v == "offline", "{tr_lbl_offline}" }
+                            option { value: "google", selected: tr_engine_v == "google", "{tr_lbl_google}" }
+                            option { value: "microsoft", selected: tr_engine_v == "microsoft", "{tr_lbl_ms}" }
+                            option { value: "deepl", selected: tr_engine_v == "deepl", disabled: !tr_en_deepl, "{tr_lbl_deepl}" }
+                            option { value: "deeplx", selected: tr_engine_v == "deeplx", disabled: !tr_en_deeplx, "{tr_lbl_deeplx}" }
+                            option { value: "openai", selected: tr_engine_v == "openai", disabled: !tr_en_openai, "{tr_lbl_openai}" }
+                        }
+                    }
+                }
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_COMPUTE)}" }
+                    div { class: "field",
+                        select { class: "ctl",
+                            onchange: move |e| {
+                                let v = e.value();
+                                tr_compute.set(v.clone());
+                                let _ = settings::update(move |st| { st.translate.compute = v; Ok(()) });
+                            },
+                            option { value: "int8", selected: tr_compute() == "int8", "{t(translate_ui::tr::SET_COMPUTE_INT8)}" }
+                            option { value: "float32", selected: tr_compute() == "float32", "{t(translate_ui::tr::SET_COMPUTE_FLOAT32)}" }
+                        }
+                    }
+                }
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_POLISH)}" }
+                    div { class: "field",
+                        label { class: "opt chk", style: "gap: 8px; padding: 4px 0; flex: none;",
+                            input {
+                                r#type: "checkbox",
+                                checked: tr_polish_v,
+                                onchange: move |e| {
+                                    let on = e.checked();
+                                    tr_polish.set(on);
+                                    let _ = settings::update(move |st| { st.translate.polish = on; Ok(()) });
+                                },
+                            }
+                            span { class: "hint", "{t(translate_ui::tr::SET_POLISH)}" }
+                        }
+                    }
+                }
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_AUTO_OCR)}" }
+                    div { class: "field",
+                        label { class: "opt chk", style: "gap: 8px; padding: 4px 0; flex: none;",
+                            input {
+                                r#type: "checkbox",
+                                checked: tr_auto_ocr_v,
+                                onchange: move |e| {
+                                    let on = e.checked();
+                                    tr_auto_ocr.set(on);
+                                    let _ = settings::update(move |st| { st.translate.auto_ocr = on; Ok(()) });
+                                },
+                            }
+                            span { class: "hint", "{t(translate_ui::tr::SET_AUTO_OCR)}" }
+                        }
+                    }
+                }
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_DEEPL_KEY)}" }
+                    div { class: "field",
+                        input {
+                            class: "ctl", r#type: "password",
+                            value: "{tr_deepl_key()}",
+                            oninput: move |e| tr_deepl_key.set(e.value()),
+                            onblur: move |_| {
+                                let v = tr_deepl_key();
+                                let _ = settings::update(move |st| { st.translate.deepl_api_key = v; Ok(()) });
+                            },
+                        }
+                        label { class: "opt chk", style: "gap: 8px; padding: 4px 0; flex: none;",
+                            input {
+                                r#type: "checkbox",
+                                checked: tr_deepl_pro_v,
+                                onchange: move |e| {
+                                    let on = e.checked();
+                                    tr_deepl_pro.set(on);
+                                    let _ = settings::update(move |st| { st.translate.deepl_pro = on; Ok(()) });
+                                },
+                            }
+                            span { class: "hint", "{t(translate_ui::tr::SET_DEEPL_PRO)}" }
+                        }
+                    }
+                }
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_DEEPLX_URL)}" }
+                    div { class: "field",
+                        input {
+                            class: "ctl",
+                            value: "{tr_deeplx_url()}",
+                            oninput: move |e| tr_deeplx_url.set(e.value()),
+                            onblur: move |_| {
+                                let v = tr_deeplx_url();
+                                let _ = settings::update(move |st| { st.translate.deeplx_url = v; Ok(()) });
+                            },
+                        }
+                    }
+                }
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_OPENAI_BASE)}" }
+                    div { class: "field",
+                        input {
+                            class: "ctl",
+                            value: "{tr_openai_base()}",
+                            oninput: move |e| tr_openai_base.set(e.value()),
+                            onblur: move |_| {
+                                let v = tr_openai_base();
+                                let _ = settings::update(move |st| { st.translate.openai_base_url = v; Ok(()) });
+                            },
+                        }
+                    }
+                }
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_OPENAI_KEY)}" }
+                    div { class: "field",
+                        input {
+                            class: "ctl", r#type: "password",
+                            value: "{tr_openai_key()}",
+                            oninput: move |e| tr_openai_key.set(e.value()),
+                            onblur: move |_| {
+                                let v = tr_openai_key();
+                                let _ = settings::update(move |st| { st.translate.openai_api_key = v; Ok(()) });
+                            },
+                        }
+                    }
+                }
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_OPENAI_MODEL)}" }
+                    div { class: "field",
+                        input {
+                            class: "ctl",
+                            value: "{tr_openai_model()}",
+                            oninput: move |e| tr_openai_model.set(e.value()),
+                            onblur: move |_| {
+                                let v = tr_openai_model();
+                                let _ = settings::update(move |st| { st.translate.openai_model = v; Ok(()) });
+                            },
+                        }
+                    }
+                }
+                // 下载镜像（三行；空 = 内置默认，placeholder 提示）
+                div { class: "formrow",
+                    label { title: "{t(translate_ui::tr::SET_MIRROR_PH)}", "{t(translate_ui::tr::SET_MIRROR)}" }
+                    div { class: "field",
+                        input {
+                            class: "ctl",
+                            value: "{tr_mirror_argos()}",
+                            placeholder: "{t(translate_ui::tr::SET_MIRROR_PH)}",
+                            title: "{t(translate_ui::tr::SET_MIRROR_ARGOS)}",
+                            oninput: move |e| tr_mirror_argos.set(e.value()),
+                            onblur: move |_| {
+                                let v = tr_mirror_argos();
+                                let _ = settings::update(move |st| { st.translate.mirror_argos = v; Ok(()) });
+                            },
+                        }
+                        input {
+                            class: "ctl",
+                            value: "{tr_mirror_hf()}",
+                            placeholder: "{t(translate_ui::tr::SET_MIRROR_PH)}",
+                            title: "{t(translate_ui::tr::SET_MIRROR_HF)}",
+                            oninput: move |e| tr_mirror_hf.set(e.value()),
+                            onblur: move |_| {
+                                let v = tr_mirror_hf();
+                                let _ = settings::update(move |st| { st.translate.mirror_hf = v; Ok(()) });
+                            },
+                        }
+                        input {
+                            class: "ctl",
+                            value: "{tr_mirror_github()}",
+                            placeholder: "{t(translate_ui::tr::SET_MIRROR_PH)}",
+                            title: "{t(translate_ui::tr::SET_MIRROR_GITHUB)}",
+                            oninput: move |e| tr_mirror_github.set(e.value()),
+                            onblur: move |_| {
+                                let v = tr_mirror_github();
+                                let _ = settings::update(move |st| { st.translate.mirror_github = v; Ok(()) });
+                            },
+                        }
+                        span { class: "hint", "{t(translate_ui::tr::SET_MIRROR_PH)}" }
+                    }
+                }
+            }
         }
     }
 }
@@ -2486,7 +2776,7 @@ mod tests {
 
     /// O 波 #3：checkbox 对齐修复的静态断言——css() 必须带 .chk 组合规则；
     /// 源码里每一处 checkbox 都必须挂在含 "chk" 的 label 组合下；并锚定当前
-    /// checkbox 总数（识别页公式 + 设置页 3 开关 + 批量页二维码 = 5），
+    /// checkbox 总数（识别页公式 + 设置页 3 开关 + 翻译 3 开关 + 批量页二维码 = 8），
     /// 防止后续新增 checkbox 漏套样式再次错位。
     #[test]
     fn chk_css_rules_present_and_all_checkboxes_covered() {
@@ -2516,13 +2806,13 @@ mod tests {
                 from = at + "r#type: \"checkbox\"".len();
             }
             if file == "src/main.rs" {
-                assert_eq!(scanned, 4, "main.rs 应有 4 处 checkbox（公式 + 设置页 3 开关）");
+                assert_eq!(scanned, 7, "main.rs 应有 4 处 checkbox（公式 + 设置页 3 开关 + 翻译 3 开关）");
             } else {
                 assert_eq!(scanned, 1, "batch.rs 应有 1 处 checkbox（顺带扫二维码）");
             }
         }
         let total = main_src.matches("r#type: \"checkbox\"").count()
             + batch_src.matches("r#type: \"checkbox\"").count();
-        assert_eq!(total, 5, "checkbox 总数锚定：新增时须同步套 .chk 并更新本测试");
+        assert_eq!(total, 8, "checkbox 总数锚定：新增时须同步套 .chk 并更新本测试");
     }
 }

@@ -10,6 +10,7 @@
 //!
 //! CLI 级验证：`cargo test -p rumi-ui settings`（roundtrip + 默认值容错）。
 
+use rumi_translate::download::Mirrors;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -104,6 +105,10 @@ pub struct Settings {
     /// 自动走内置冻结帧选择器）| "native"（强制原生选区）| "builtin"（强制内置
     /// 冻结帧拖选，Wayland 用户也可选它统一交互）。每次捕获时读取，保存即生效。
     pub picker_mode: String,
+    /// 翻译（translate-spec-ui.md §4）：引擎/方向记忆/在线服务凭据/下载镜像。
+    /// 旧 config.toml 无 [translate] 段 → 整段落 [`TranslateSettings::default`]。
+    #[serde(default)]
+    pub translate: TranslateSettings,
 }
 
 impl Default for Settings {
@@ -126,8 +131,78 @@ impl Default for Settings {
             frameless: DEFAULT_FRAMELESS,
             close_to_tray: DEFAULT_CLOSE_TO_TRAY,
             picker_mode: DEFAULT_PICKER_MODE.into(),
+            translate: TranslateSettings::default(),
         }
     }
+}
+
+/// 翻译设置（translate-spec-ui.md §4）。容器级 `#[serde(default)]`：
+/// 旧 config.toml 无 [translate] 段时整段落默认值，逐字段兼容。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TranslateSettings {
+    /// 翻译引擎："offline" | "google" | "microsoft" | "deepl" | "deeplx" | "openai"
+    pub engine: String,
+    /// 离线计算精度："int8"（快，默认）| "float32"（稳）。
+    /// 注：translate crate 的进程级共享离线引擎（engine::shared）当前固定 Int8，
+    /// 本字段先持久化，后续接入 float32 时无需再改配置结构。
+    pub compute: String,
+    /// 译文为中文时做保守标点润色（半角→全角，数字上下文豁免；postfix::polish_zh）
+    pub polish: bool,
+    /// OCR 完成后自动跳翻译页并翻译（translate-spec-ui.md §3.8）
+    pub auto_ocr: bool,
+    /// DeepL API key（空 = 引擎下拉里 DeepL 不可选）
+    pub deepl_api_key: String,
+    /// DeepL 专业版（false = 免费版端点 api-free.deepl.com）
+    pub deepl_pro: bool,
+    /// 自建 DeepLX 服务地址（默认本机 1188；非空即可选）
+    pub deeplx_url: String,
+    /// OpenAI 兼容服务 base_url（空 = 不可选）
+    pub openai_base_url: String,
+    pub openai_api_key: String,
+    pub openai_model: String,
+    /// 翻译页记忆的源/目标语言（两位码，lang::UI_LANGS 子集）
+    pub last_from: String,
+    pub last_to: String,
+    // 下载镜像（空串 = 保留内置默认顺序，见 download::Mirrors::default）
+    /// Argos 源 base（默认 https://argos-net.com/v1）
+    pub mirror_argos: String,
+    /// HF 镜像 host（非空 = 只用该 host；默认 huggingface.co → hf-mirror.com）
+    pub mirror_hf: String,
+    /// GitHub 镜像前缀（非空 = 只用该前缀；默认直连 + ghfast.top/gh-proxy.com/ghproxy.net）
+    pub mirror_github: String,
+}
+
+impl Default for TranslateSettings {
+    fn default() -> Self {
+        Self {
+            engine: "offline".into(),
+            compute: "int8".into(),
+            polish: true,
+            auto_ocr: false,
+            deepl_api_key: String::new(),
+            deepl_pro: false,
+            deeplx_url: "http://127.0.0.1:1188/translate".into(),
+            openai_base_url: String::new(),
+            openai_api_key: String::new(),
+            openai_model: "gpt-4o-mini".into(),
+            last_from: "en".into(),
+            last_to: "zh".into(),
+            mirror_argos: String::new(),
+            mirror_hf: String::new(),
+            mirror_github: String::new(),
+        }
+    }
+}
+
+/// 镜像设置 → 下载器 Mirrors（translate-spec-ui.md §4，纯函数可测）：
+/// 空串 = 保留内置默认顺序；非空 = 只用该一项（argos/github 去尾部斜杠）。
+pub(crate) fn mirrors_from_settings(s: &TranslateSettings) -> rumi_translate::download::Mirrors {
+    let mut m = Mirrors::default();
+    if !s.mirror_argos.is_empty() { m.argos_base = s.mirror_argos.trim_end_matches('/').into(); }
+    if !s.mirror_hf.is_empty() { m.hf_hosts = vec![s.mirror_hf.clone()]; }
+    if !s.mirror_github.is_empty() { m.github_prefixes = vec![s.mirror_github.trim_end_matches('/').into()]; }
+    m
 }
 
 impl Settings {
@@ -602,5 +677,67 @@ mod tests {
         assert_eq!(parse_picker_mode("garbage"), PickerMode::Auto);
         assert_eq!(parse_picker_mode(""), PickerMode::Auto);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 翻译设置（规格 translate-spec-ui.md §4）：旧配置无 [translate] 段 →
+    /// 整段落默认值（engine=offline / polish=true / last=en→zh / deeplx 默认本机）；
+    /// 写入 → 读回逐字段一致。
+    #[test]
+    fn translate_section_defaults_and_roundtrip() {
+        let dir = test_dir("rumi-cfg-translate");
+        let path = dir.join("config.toml");
+        // 旧配置文件：只有部分字段、无 translate 段 → serde container default 兜底
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "hotkey = \"alt+q\"\nhttp_port = 1224\n").unwrap();
+        let (s, warn) = load_from(&path);
+        assert!(warn.is_none());
+        assert_eq!(s.translate, TranslateSettings::default());
+        assert_eq!(s.translate.engine, "offline");
+        assert_eq!(s.translate.compute, "int8");
+        assert!(s.translate.polish && !s.translate.auto_ocr);
+        assert_eq!(s.translate.last_from, "en");
+        assert_eq!(s.translate.last_to, "zh");
+        assert_eq!(s.translate.deeplx_url, "http://127.0.0.1:1188/translate");
+        assert_eq!(s.translate.openai_model, "gpt-4o-mini");
+        assert!(s.translate.deepl_api_key.is_empty());
+        assert!(s.translate.mirror_argos.is_empty());
+
+        // 写入 → 读回逐字段一致
+        let mut s2 = Settings::default();
+        s2.translate.engine = "deepl".into();
+        s2.translate.deepl_api_key = "k-1".into();
+        s2.translate.deepl_pro = true;
+        s2.translate.mirror_hf = "hf-mirror.example".into();
+        save_to(&path, &s2).unwrap();
+        let (s3, w3) = load_from(&path);
+        assert!(w3.is_none());
+        assert_eq!(s3.translate.engine, "deepl");
+        assert_eq!(s3.translate.deepl_api_key, "k-1");
+        assert!(s3.translate.deepl_pro);
+        assert_eq!(s3.translate.mirror_hf, "hf-mirror.example");
+        // 未动过的字段保持默认
+        assert_eq!(s3.translate.last_from, "en");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 镜像 → Mirrors 构造（规格 §4 纯函数）：空串保留内置默认；
+    /// 非空覆盖为单项，argos/github 去尾部斜杠。
+    #[test]
+    fn mirrors_from_settings_overrides_only_filled() {
+        // 全空 → 与内置默认完全一致
+        let m = mirrors_from_settings(&TranslateSettings::default());
+        assert_eq!(m.argos_base, Mirrors::default().argos_base);
+        assert_eq!(m.hf_hosts, Mirrors::default().hf_hosts);
+        assert_eq!(m.github_prefixes, Mirrors::default().github_prefixes);
+
+        // 非空 → 单项覆盖（去尾部斜杠）
+        let mut s = TranslateSettings::default();
+        s.mirror_argos = "https://mirror.example/v1/".into();
+        s.mirror_hf = "hf-mirror.example".into();
+        s.mirror_github = "https://gh.example/".into();
+        let m = mirrors_from_settings(&s);
+        assert_eq!(m.argos_base, "https://mirror.example/v1");
+        assert_eq!(m.hf_hosts, vec!["hf-mirror.example".to_string()]);
+        assert_eq!(m.github_prefixes, vec!["https://gh.example".to_string()]);
     }
 }

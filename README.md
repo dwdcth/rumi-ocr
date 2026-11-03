@@ -28,10 +28,17 @@ Rust 复刻自 [Umi-OCR](https://github.com/hiroi-sora/Umi-OCR)，兼容 Umi 插
 - **划选复制 / 忽略区域 / 忽略规则**：预览图拖选裁剪复制；红框防水印（识别前像素置白）；
   正则行过滤——三重实用工具
 - **二维码**：批量页扫码工具卡
+- **翻译（离线 + 在线）**：截图/批量识别结果一键翻译；
+  [离线引擎](docs/translate-design.md)用 [ctranslate2-rs](https://github.com/jkawamoto/ctranslate2-rs)
+  （oneDNN v3.14，Intel/AMD CPU 均优化，int8），默认语言包为 Argos 官方包
+  （[argos-net.com](https://argos-net.com/v1/) 直链自动下载，~70MB/方向，也支持导入
+  `.argosmodel` 本地包，HF 镜像兜底）；在线引擎支持 Google / Microsoft（免费）、
+  DeepL / DeepLX / OpenAI 兼容服务；下载源镜像可在设置页配置（内置国内默认）
 - **系统托盘 + 全局热键**：默认 `Alt+Q` 区域截图 OCR；双击托盘图标呼出主窗口
 - **Umi 插件兼容**：[Umi-OCR 插件](https://github.com/hiroi-sora/Umi-OCR_plugins)解压到
   `plugins/` 即用（系统 Python，不内置解释器）
-- **HTTP API**：Umi 兼容子集，`127.0.0.1:1224`
+- **HTTP API**：Umi 兼容子集，`127.0.0.1:1224`；另含翻译扩展端点
+  `POST /api/translate`、`GET /api/translate/models`、`POST /api/translate/models/install`
 - **多语言界面**：简体中文 / English，词条外置 JSON，易于补充翻译
 - **深浅双主题** + 无边框自定义标题栏（最大化 / 最小化 / 关闭行为可配置）
 - **运行日志**：文件落盘 + 设置页查看 / 复制 / 导出，排障不求人
@@ -61,7 +68,15 @@ cargo test -p rumi-ui -p rumi-ocr   # 测试（基线 57+1 / 30+2）
 cargo run -p rumi-cli -- ocr --full --copy    # 截图→识别→stdout/剪贴板 一条龙
 cargo run -p rumi-ocr-cli -- file a.png       # 图片 / --pdf doc.pdf / --qr qr.png
 cargo run -p rumi-server                      # HTTP API（前台）
+cargo run -p rumi-translate -- --install en_zh   # 下载离线语言包（Argos 官方直链）
+cargo run -p rumi-translate -- "The default port is 8080."   # 离线翻译（默认 en→zh）
+cargo run -p rumi-translate -- --engine google --to zh "text" # 在线翻译
 ```
+
+依赖补充：翻译离线引擎首次构建需 CMake（编译 oneDNN/CTranslate2，10-20 分钟）；
+链接 translate 的目标（ui/server）在 Linux 上动态链系统 `libonnxruntime`
+（Arch 系 `pacman -S onnxruntime`，≥1.17），详见 `server/Cargo.toml` 注释与
+`.cargo/config.toml`。
 
 ## 📖 使用
 

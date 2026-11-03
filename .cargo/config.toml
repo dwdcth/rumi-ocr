@@ -1,0 +1,14 @@
+# 工作区链接配置（2026-11-03，工人 E 引入；完整因果见 server/Cargo.toml 里
+# ort-sys 一段的注释）。一句话版：本工作区把静态原生库（ct2/sentencepiece 的
+# protobuf-lite、oneDNN 等）与系统动态库（libonnxruntime）链进同一个可执行文件；
+# 静态库的符号默认会导出到可执行文件的动态符号表，动态库的内部调用因此被
+# ELF 全局符号插入（interposition）劫持到静态库的**不同版本实现**上——
+# 实测 libonnxruntime 的 protobuf 调用被劫持到 exe 内 sentencepiece 的
+# protobuf-lite 3.21 后模型解析直接 SIGSEGV。`--exclude-libs,ALL` 把静态库
+# 符号全部收敛为本地（不再导出），动态库内部调用回到自身实现，两边各用
+# 各的 protobuf，互不越界。
+#
+# 仅 Linux（GNU/LLVM 链接器支持该开关）。
+
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,--exclude-libs,ALL"]
