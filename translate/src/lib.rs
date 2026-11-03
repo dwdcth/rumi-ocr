@@ -10,6 +10,10 @@ pub mod online;
 pub mod postfix;
 pub mod registry;
 pub mod segment;
+// 纯 Rust 分词器仅默认分支编译；spm-sys 回退分支由 ct2rs 自带的
+// C++ sentencepiece 承担（engine.rs 按 feature 分支选型）
+#[cfg(not(feature = "spm-sys"))]
+pub mod tokenizer;
 
 use std::path::PathBuf;
 

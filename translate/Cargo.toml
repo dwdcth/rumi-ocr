@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MulanPSL-2.0"
 
+# 链接加固：--exclude-libs,ALL 经 build.rs 下发（防 RUSTFLAGS 环境变量静默
+# 覆盖 config.toml 的 rustflags，见 build.rs 注释）
+build = "build.rs"
+
 [lib]
 name = "rumi_translate"
 path = "src/lib.rs"
@@ -12,10 +16,24 @@ path = "src/lib.rs"
 name = "rumi-translate-cli"
 path = "src/bin/rumi_translate_cli.rs"
 
+[features]
+# 过渡开关：启用则回退 ct2rs 自带 C++ sentencepiece（含 protobuf-lite，会重新引入
+# 双 protobuf 风险，仅排查分词问题时用）；默认纯 Rust 路线。稳定 1-2 个版本后删除。
+spm-sys = ["ct2rs/sentencepiece"]
+default = []
+
 [dependencies]
-# 推理引擎：oneDNN 后端（vendored oneDNN v3.14.1，Intel+AMD Zen 优化）+ sentencepiece 分词。
-# 关闭默认 ruy：int8 GEMM 需要 oneDNN。openmp-runtime-comp=GNU OpenMP 运行时。
-ct2rs = { version = "0.9", default-features = false, features = ["dnnl", "openmp-runtime-comp", "sentencepiece"] }
+# 推理引擎：oneDNN 后端（vendored oneDNN v3.14.1，Intel+AMD Zen 优化）+ 分词由
+# 下面的纯 Rust sentencepiece-rs 承担。关闭默认 ruy：int8 GEMM 需要 oneDNN。
+# openmp-runtime-comp=GNU OpenMP 运行时。
+ct2rs = { version = "0.9", default-features = false, features = ["dnnl", "openmp-runtime-comp"] }
+# 分词：纯 Rust 直载 .spm（对拍 744/744 全等，见 docs/spm-parity-report.md）。
+# 锁死精确版本：上游为 2026-05 新 crate（单人维护），升级必须重跑
+# tests/spm_parity_tests.rs golden 回归；上游烂尾则 fork（用户已拍板自维护）。
+sentencepiece-rs = "=0.2.2"
+# ct2rs Tokenizer trait 签名用 anyhow::Result，实现该 trait 必须直接依赖
+# （ct2rs 不再导出；semver 同为 1.x，编译期解析到同一 crate）
+anyhow = "1"
 # HTTP（在线翻译 + 模型下载）。tls=rustls 不引 openssl；Proxy::try_from_system 尊重代理环境变量
 ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
 serde = { version = "1", features = ["derive"] }

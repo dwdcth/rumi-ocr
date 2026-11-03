@@ -135,7 +135,13 @@ pub struct InstalledInfo {
 /// last_used 用内部可变性：条目经 Arc 共享，刷新时间戳不能外改整个 Arc。
 /// nllb：NLLB 家族模型（manifest kind=="nllb" 或 key=="nllb_600m"）——
 /// 推理需每段带 Flores-200 目标码前缀，与 Marian 的批翻译调用不同。
+/// 分词器双轨：默认纯 Rust [`crate::tokenizer::RumiSpmTokenizer`]（对拍全等、
+/// 零 protobuf-lite）；spm-sys 回退 ct2rs auto（其 sentencepiece 探测需
+/// `spm-sys` feature 放行，见 Cargo.toml）。
 struct Loaded {
+    #[cfg(not(feature = "spm-sys"))]
+    translator: ct2rs::Translator<crate::tokenizer::RumiSpmTokenizer>,
+    #[cfg(feature = "spm-sys")]
     translator: ct2rs::Translator<ct2rs::tokenizers::auto::Tokenizer>,
     loaded_at: Instant,
     last_used: Mutex<Instant>,
@@ -266,7 +272,18 @@ impl OfflineEngine {
             },
             ..Default::default()
         };
-        // Translator::new 自动探测模型目录的 source.spm/target.spm（auto 分词器）
+        // 默认：纯 Rust 分词器随 Translator 一起构造（with_tokenizer，分词失败
+        // 同样按 Load 报错）；spm-sys：Translator::new 自动探测
+        // source.spm/target.spm（ct2rs auto 分词器）
+        #[cfg(not(feature = "spm-sys"))]
+        let translator = ct2rs::Translator::with_tokenizer(
+            &model_dir,
+            crate::tokenizer::RumiSpmTokenizer::open(&model_dir)
+                .map_err(|e| EngineError::Load(e.to_string()))?,
+            &cfg,
+        )
+        .map_err(|e| EngineError::Load(e.to_string()))?;
+        #[cfg(feature = "spm-sys")]
         let translator =
             ct2rs::Translator::new(&model_dir, &cfg).map_err(|e| EngineError::Load(e.to_string()))?;
         let now = Instant::now();

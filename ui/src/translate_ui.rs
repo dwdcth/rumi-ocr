@@ -378,8 +378,26 @@ fn start_import(
 /// 完成后刷新清单。删除期间 busy_key/deleting 同时置位（与下载/导入互斥，
 /// busy_key 命中的行禁删），行内显示「删除中…」；失败 → 行内红字
 /// 「删除失败：{p}」（ModelErrKind::Delete 选模板）。
+/// 该行实际安装的目录 key：registry key 本身在装 → 用之；否则若「已安装」来自
+/// 方向匹配的导入包（目录名≠registry key，如手工导入的 .argosmodel）→ 用导入包
+/// 的真实 key。都没有 → 返回 registry key（remove 幂等，删不存在的目录不报错）。
+/// NLLB 行（from/to="*"）天然走第一分支。
+fn installed_key_for(
+    installed: &[rumi_translate::engine::InstalledInfo],
+    spec: &registry::ModelSpec,
+) -> String {
+    if installed.iter().any(|i| i.key == spec.key) {
+        return spec.key.to_string();
+    }
+    installed
+        .iter()
+        .find(|i| i.from == spec.from && i.to == spec.to)
+        .map(|i| i.key.clone())
+        .unwrap_or_else(|| spec.key.to_string())
+}
+
 fn start_delete(
-    key: &'static str,
+    key: String,
     mut busy_key: Signal<Option<String>>,
     mut deleting: Signal<Option<String>>,
     mut model_err: Signal<Option<(String, String, ModelErrKind)>>,
@@ -388,14 +406,17 @@ fn start_delete(
     if busy_key().is_some() {
         return; // 一次只允许一个下载/导入/删除（下载中的行也因此禁删）
     }
-    busy_key.set(Some(key.to_string()));
-    deleting.set(Some(key.to_string()));
+    busy_key.set(Some(key.clone()));
+    deleting.set(Some(key.clone()));
     model_err.set(None);
     let dir = rumi_translate::models_dir();
+    // 后台闭包 move 走 key，错误回报用这个副本
+    let key_err = key.clone();
     let rx = crate::ocr_flow::run_blocking(move || {
-        // unload 返回 false（本就未加载）不影响删除；remove 幂等
-        let _ = rumi_translate::engine::shared().unload_key(key);
-        rumi_translate::download::remove(key, &dir)
+        // unload 返回 false（本就未加载）不影响删除；remove 幂等。
+        // key 可能是导入包目录名（见 installed_key_for）
+        let _ = rumi_translate::engine::shared().unload_key(&key);
+        rumi_translate::download::remove(&key, &dir)
     });
     spawn(async move {
         match rx.await {
@@ -407,13 +428,13 @@ fn start_delete(
             Ok(Err(e)) => {
                 busy_key.set(None);
                 deleting.set(None);
-                model_err.set(Some((key.to_string(), e, ModelErrKind::Delete)));
+                model_err.set(Some((key_err.clone(), e, ModelErrKind::Delete)));
             }
             Err(_) => {
                 busy_key.set(None);
                 deleting.set(None);
                 model_err.set(Some((
-                    key.to_string(),
+                    key_err,
                     i18n::tt(tr::MODELS_THREAD_LOST).to_string(),
                     ModelErrKind::Delete,
                 )));
@@ -1041,7 +1062,8 @@ pub fn TranslatePage(
                                         button { class: "btn-sm", style: "color: var(--danger);",
                                             disabled: any_busy,
                                             onclick: move |_| start_delete(
-                                                v.spec.key, busy_key, deleting, model_err, installed,
+                                                installed_key_for(&installed(), v.spec),
+                                                busy_key, deleting, model_err, installed,
                                             ),
                                             "{t(tr::MODELS_DELETE)}" }
                                     }
@@ -1255,6 +1277,27 @@ mod tests {
     fn catalog_rows_keeps_unknown_codes_as_is() {
         let rows = catalog_rows(&[ce("en_eo", "en", "eo", "1.2")], &[]);
         assert_eq!(rows[0].label, format!("{}→{}", lang::display("en"), "eo"));
+    }
+
+    /// 删除按钮的 key 解析：registry key 在装 → 用之；「已安装」来自方向匹配的
+    /// 导入包 → 用导入包真实 key；都没装 → 回退 registry key（remove 幂等）
+    #[test]
+    fn installed_key_for_prefers_registry_then_direction_match() {
+        use rumi_translate::engine::InstalledInfo;
+        let spec = registry::by_key("zh_en").unwrap();
+        // registry key 在装（含多余导入包）：直取 spec.key
+        let list = vec![
+            InstalledInfo { key: "zh_en".into(), from: "zh".into(), to: "en".into(), bytes: 1 },
+            InstalledInfo { key: "my_pkg".into(), from: "zh".into(), to: "en".into(), bytes: 2 },
+        ];
+        assert_eq!(installed_key_for(&list, spec), "zh_en");
+        // 仅导入包在装（手工 .argosmodel 同方向）：取导入包 key
+        let list = vec![
+            InstalledInfo { key: "my_pkg".into(), from: "zh".into(), to: "en".into(), bytes: 2 },
+        ];
+        assert_eq!(installed_key_for(&list, spec), "my_pkg");
+        // 都没装：回退 spec.key（幂等删除不报错）
+        assert_eq!(installed_key_for(&[], spec), "zh_en");
     }
 
     /// §8：多条目保持目录顺序；动态字段（busy/prog/err）初始为空——它们依赖
