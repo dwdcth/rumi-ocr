@@ -60,7 +60,26 @@ pub(crate) fn export_bilingual_pdf(
     translated: &[(String, String)],
     out: &Path,
 ) -> Result<(usize, usize), String> {
-    let pages = appendix::to_appendix_pages(units, translated);
+    let mut pages = appendix::to_appendix_pages(units, translated);
+    // 跨页重复（页眉/页脚类，unit.running）条目去重：翻译侧已合并翻一次，
+    // 附录只收首现页——避免页眉在附录里逐页重复灌满（docforge 附录 API
+    // 的 AppendixEntry 不带 running 标志，此处按 unit_id 反查 units）
+    let running_ids: std::collections::HashSet<&str> = units
+        .iter()
+        .filter(|u| u.running)
+        .map(|u| u.id.as_str())
+        .collect();
+    if !running_ids.is_empty() {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for page in &mut pages {
+            page.entries.retain(|e| {
+                !running_ids.contains(e.unit_id.as_str())
+                    || seen.insert(e.unit_id.clone())
+            });
+        }
+        // 去重后可能出现的空页组剔除（该页全部条目都是重复页眉）
+        pages.retain(|p| !p.entries.is_empty());
+    }
     if pages.is_empty() {
         return Err("无可写入的双语对照条目（译文全部未命中或为空白）".to_string());
     }
