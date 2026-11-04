@@ -211,3 +211,55 @@ async fn install_unknown_key_returns_400() {
     handle.shutdown().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------- POST /api/translate/doc（文档翻译端点） ----------
+
+/// from==to 直通的正向端到端：txt → .md，零模型零网络。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn translate_doc_passthrough_txt_to_md() {
+    let (addr, handle, dir) = start("tr-doc-ok").await;
+    let input = dir.join("in.txt");
+    std::fs::write(&input, "Hello world paragraph.").unwrap();
+    let output = dir.join("out.bilingual.md");
+    let body = serde_json::json!({
+        "input": input.display().to_string(),
+        "output": output.display().to_string(),
+        "from": "en", "to": "en",
+    });
+    let (code, body) = http(addr, "POST", "/api/translate/doc", Some(&body.to_string()));
+    assert_eq!(code, 200, "直通翻译应 200：{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["units"], 1);
+    assert!(output.is_file(), "输出 .md 应生成");
+    assert!(std::fs::read_to_string(&output).unwrap().contains("Hello world paragraph."));
+
+    handle.shutdown().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 坏路径：文件不存在 400；未知策略 400。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn translate_doc_bad_paths() {
+    let (addr, handle, dir) = start("tr-doc-bad").await;
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/api/translate/doc",
+        Some(r#"{"input":"/nonexistent/x.txt","output":"/tmp/x.md"}"#),
+    );
+    assert_eq!(code, 400, "缺文件应 400：{body}");
+
+    let input = dir.join("in.txt");
+    std::fs::write(&input, "text").unwrap();
+    let body = serde_json::json!({
+        "input": input.display().to_string(),
+        "output": dir.join("o.md").display().to_string(),
+        "strategy": "bogus",
+    });
+    let (code, body) = http(addr, "POST", "/api/translate/doc", Some(&body.to_string()));
+    assert_eq!(code, 400, "未知策略应 400：{body}");
+
+    handle.shutdown().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}

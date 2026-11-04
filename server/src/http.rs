@@ -30,6 +30,7 @@
 //!   翻译端点无兼容包袱，规格要求状态码区分错误性质）
 //! - `GET /api/translate/models`：内置模型清单 + 安装状态 + 导入包
 //! - `POST /api/translate/models/install`：body `{"key":"en_zh"}` 同步装完才返回
+//! - `POST /api/translate/doc`：文档翻译（input/output 路径 + 引擎/策略，同步完成）
 //!   （大文件分钟级，客户端请自设超时）
 
 use axum::body::Bytes;
@@ -62,6 +63,7 @@ pub fn build_router(rec: Arc<Recognizer>) -> Router {
         .route("/api", get(status))
         .route("/api/ocr", post(api_ocr))
         .route("/api/translate", post(api_translate))
+        .route("/api/translate/doc", post(api_translate_doc))
         .route("/api/translate/models", get(api_translate_models))
         .route(
             "/api/translate/models/install",
@@ -332,6 +334,124 @@ async fn api_translate(body: Bytes) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("翻译任务失败：{e}"),
         ),
+    }
+}
+
+/// `POST /api/translate/doc`：文档翻译（解析→翻译→双语成品）。
+///
+/// body：`{"input":"/path/in", "output":"/path/out.md", "from":"en", "to":"zh",
+/// "strategy":"inline"(可选, inline|only|appendix|page), "polish":bool(可选)}`
+/// ＋ 与 /api/translate 同款的可选引擎参数（engine/deepl_api_key/...）。
+/// 输出格式按 output 扩展名分派（.md/.docx/.epub/.pdf/...）。
+/// 同步阻塞到完成（大文档分钟级，客户端自设超时——与 models/install 同款口径）。
+async fn api_translate_doc(body: Bytes) -> Response {
+    #[derive(serde::Deserialize)]
+    struct DocBody {
+        input: String,
+        output: String,
+        from: Option<String>,
+        to: Option<String>,
+        strategy: Option<String>,
+        polish: Option<bool>,
+        // 引擎参数（与 TranslateBody 同名字段对齐，经 parse_engine 复用）
+        engine: Option<String>,
+        deepl_api_key: Option<String>,
+        deepl_pro: Option<bool>,
+        deeplx_url: Option<String>,
+        openai_base_url: Option<String>,
+        openai_api_key: Option<String>,
+        openai_model: Option<String>,
+    }
+    let b: DocBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return translate_error(StatusCode::BAD_REQUEST, format!("请求体不是合法 JSON：{e}")),
+    };
+    let engine_name = b.engine.clone().unwrap_or_else(|| "offline".to_string());
+    // 引擎参数桥接：DocBody 字段借成 TranslateBody 形状喂 parse_engine
+    let bridge = TranslateBody {
+        text: None,
+        texts: None,
+        from: None,
+        to: None,
+        engine: Some(engine_name.clone()),
+        polish: None,
+        deepl_api_key: b.deepl_api_key.clone(),
+        deepl_pro: b.deepl_pro,
+        deeplx_url: b.deeplx_url.clone(),
+        openai_base_url: b.openai_base_url.clone(),
+        openai_api_key: b.openai_api_key.clone(),
+        openai_model: b.openai_model.clone(),
+    };
+    let Some(engine) = parse_engine(&engine_name, &bridge) else {
+        return translate_error(
+            StatusCode::BAD_REQUEST,
+            format!("未知引擎：{engine_name}（可选 offline / google / microsoft / deepl / deeplx / openai）"),
+        );
+    };
+    let strategy = match b.strategy.as_deref() {
+        None | Some("inline") => rumi_translate::docmt::BiStrategy::Inline,
+        Some("only") => rumi_translate::docmt::BiStrategy::Only,
+        Some("appendix") => rumi_translate::docmt::BiStrategy::Appendix,
+        Some("page") | Some("pagealt") => rumi_translate::docmt::BiStrategy::PageAlt,
+        Some(other) => {
+            return translate_error(
+                StatusCode::BAD_REQUEST,
+                format!("未知策略：{other}（可选 inline / only / appendix / page）"),
+            );
+        }
+    };
+    let from = b.from.unwrap_or_else(|| "en".to_string());
+    let to = b.to.unwrap_or_else(|| "zh".to_string());
+    let polish = b.polish.unwrap_or(true);
+    let input = std::path::PathBuf::from(&b.input);
+    let output = std::path::PathBuf::from(&b.output);
+    let offline = engine_name == "offline";
+    match tokio::task::spawn_blocking(move || {
+        rumi_translate::docmt::translate_document(
+            &input,
+            &output,
+            &rumi_translate::docmt::DocTranslateOptions {
+                engine,
+                from,
+                to,
+                strategy,
+                polish,
+                min_chars: 2,
+                use_cache: true,
+                glossary: rumi_translate::glossary::Glossary::default(),
+                on_progress: None,
+            },
+        )
+    })
+    .await
+    {
+        Ok(Ok(stats)) => Json(json!({
+            "ok": true,
+            "units": stats.units,
+            "chars": stats.chars,
+            "cache_hits": stats.cache_hits,
+            "running_merged": stats.running_merged,
+            "glossary_hits": stats.glossary_hits,
+            "elapsed_ms": stats.elapsed_ms as u64,
+            "note": stats.note,
+            "output": b.output,
+        }))
+        .into_response(),
+        Ok(Err(msg)) => {
+            // 文件不存在/格式不支持等确定性错误 → 400；引擎类失败按在线/离线分 502/400
+            let status = if msg.starts_with("文件不存在")
+                || msg.contains("不支持的输出格式")
+                || msg.contains("需要同格式输入")
+                || msg.contains("无可翻译文本单元")
+                || offline
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            translate_error(status, msg)
+        }
+        Err(_) => translate_error(StatusCode::INTERNAL_SERVER_ERROR, "文档翻译线程意外退出"),
     }
 }
 
