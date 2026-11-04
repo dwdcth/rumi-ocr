@@ -87,6 +87,9 @@ pub struct DocStats {
     /// 缓存命中单元数（use_cache=false 或 from==to 直通时恒 0）。
     /// UI/CLI「缓存命中 n/N」展示待后续，字段先记。
     pub cache_hits: usize,
+    /// 跨页重复（页眉/页脚类，docforge running-detect 标记）单元被合并
+    /// 复用的次数——同文本只翻一次，后续页复用译文（锚点不缺位）。
+    pub running_merged: usize,
 }
 
 /// 进度回调节流：每 16 单元回调一次（末批不足也回调），UI 不必逐单元重绘。
@@ -139,6 +142,13 @@ pub fn translate_document(
         None
     };
     let mut cache_hits = 0usize;
+    // 跨页重复（页眉/页脚类）单元的文本 → 译文 memo（docforge running-detect
+    // 标记，d24c61f0 起）：同文本只送引擎一次，后续页复用——每页锚点都有
+    // 译文（回写/附录不缺位），页眉不再翻 N 遍灌满附录。与文本 hash 缓存
+    // 天然叠加（第二遍运行时缓存已全命中）。
+    let mut running_memo: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut running_merged = 0usize;
     let mut translated: Vec<(String, String)> = Vec::with_capacity(total);
     let mut chars = 0usize;
     for (done, unit) in units.iter().enumerate() {
@@ -147,6 +157,9 @@ pub fn translate_document(
         // 直接原样回填——译文=原文，回写锚点不受影响（也不进缓存）
         let text = if !unit.has_translatable_text() {
             unit.text.clone()
+        } else if unit.running && running_memo.contains_key(&unit.text) {
+            running_merged += 1;
+            running_memo.get(&unit.text).unwrap().clone()
         } else if let Some(hit) = cache.as_ref().and_then(|c| {
             c.get(&unit.text, &opts.from, &opts.to, &opts.engine, opts.polish)
         }) {
@@ -171,6 +184,10 @@ pub fn translate_document(
                 if done % UNITS_PER_BATCH == 0 {
                     c.save();
                 }
+            }
+            // 首个出现的 running 单元翻完记入 memo（后续同文本页复用）
+            if unit.running {
+                running_memo.insert(unit.text.clone(), t.clone());
             }
             t
         };
@@ -316,6 +333,7 @@ pub fn translate_document(
         elapsed_ms: t0.elapsed().as_millis(),
         note,
         cache_hits,
+        running_merged,
     })
 }
 
