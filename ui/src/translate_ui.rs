@@ -16,11 +16,18 @@
 //!   轮询、也不在回调里碰 Signal；全部 sender 关闭（下载线程结束）后流自然收尾；
 //! - rfd 文件对话框一律 std 线程调（Linux GTK 后端同步对话框死锁主线程，
 //!   开发经验 §三），选文件与导入包在同一个后台线程里完成；
-//! - 文档翻译（规格 J/K §5）：「翻译文档…」按钮 → std 线程 rfd 选文件 + 保存
-//!   对话框（默认名 <原名>.bilingual.md，同线程）→ 同线程调
+//! - 文档翻译（规格 J/K §5 + 批量三件套 ①②③）：「翻译文档…」按钮 → std 线程
+//!   rfd pick_files 多选（同过滤器）→ 同线程调
 //!   `rumi_translate::docmt::translate_document`（Inline 策略、min_chars=2）；
-//!   单元进度经 mpsc 无界通道泵成 doc_prog 信号（文案「已翻译 n/N 单元」）；
-//!   与文本「翻译」共用 running 信号互斥；默认输出名推导与过滤器表抽纯函数直测；
+//!   **单选（N=1）沿用现状**（选完弹保存对话框、完成统计含输出名），**多选
+//!   （N>1）批量**：无逐文件保存对话框，输出名 default_doc_out 逐个推导、
+//!   逐个串行翻译、单个失败继续下一个，状态行汇总"N/M 个文档完成，失败：
+//!   [文件名…]"；单元进度经 mpsc 无界通道泵成 doc_prog 信号（三参回调：
+//!   章节名 Some 时前缀"第三章 · n/N"，None 时原样 n/N）；与文本「翻译」
+//!   共用 running 信号互斥；默认输出名推导与过滤器表抽纯函数直测；
+//! - 源语言自动检测（三件套 ②）：源语言下拉顶部"自动检测"（value="auto"）
+//!   ——文档翻译整链在 docmt 层逐单元检测；文本「翻译」不支持自动检测
+//!   （按钮禁用 + start_translate 早退兜底）；auto 无固定方向不参与⇄交换；
 //! - OCR 联动：识别页「翻译」按钮写 [`TranslatePrefill`]`{text, run:true}` 并切
 //!   tab，本页 use_effect 消费（读后清空），run=true 自动触发一次翻译。
 //!
@@ -52,6 +59,8 @@ pub(crate) mod tr {
     pub const RUN: &str = "translate.run";
     pub const RUNNING: &str = "translate.running";
     pub const FROM: &str = "translate.from";
+    /// 源语言下拉顶部「自动检测」（三件套 ②；仅源侧，目标侧无此选项）。
+    pub const FROM_AUTO: &str = "translate.from_auto";
     pub const TO: &str = "translate.to";
     pub const SWAP: &str = "translate.swap";
     /// 语言下拉「更多语言」分组的 optgroup 标题。
@@ -89,6 +98,13 @@ pub(crate) mod tr {
     pub const DOC_BUTTON: &str = "translate.doc_button";
     pub const DOC_RUNNING: &str = "translate.doc_running";
     pub const DOC_PROGRESS: &str = "translate.doc_progress";
+    /// 带章节前缀的进度行（三件套 ①：on_progress 第三参 Some 时的模板；
+    /// None 时回退 [`tr::DOC_PROGRESS`] 原样）。
+    pub const DOC_PROGRESS_CH: &str = "translate.doc_progress_ch";
+    /// 批量文档翻译汇总（三件套 ③）："N/M 个文档完成" + 失败名单尾缀模板
+    /// （leading 逗号在模板里，en 语序可不同）。
+    pub const DOC_BATCH_DONE: &str = "translate.doc_batch_done";
+    pub const DOC_BATCH_FAILED: &str = "translate.doc_batch_failed";
     pub const DOC_DONE: &str = "translate.doc_done";
     /// 布局退化说明（DocStats.note 的展示模板）。
     pub const DOC_NOTE: &str = "translate.doc_note";
@@ -275,6 +291,12 @@ fn start_translate(
     let st = settings::get().translate;
     let from = from_sel();
     let to = to_sel();
+    if from == "auto" {
+        // 源语言自动检测只做了文档翻译链（docmt 层逐单元）；文本翻译无检测
+        // 通道（translate crate 不依赖 whatlang），按钮已禁用——OCR 联动
+        // prefill 的 run=true 路径不经按钮，这里早退兜底，宁可不翻不瞎翻
+        return;
+    }
     // 错误路径判「语言包未安装」高亮方向用（from/to 即将 move 进线程闭包）
     let (from_err, to_err) = (from.clone(), to.clone());
     let engine = engine_from_settings(&st);
@@ -312,13 +334,41 @@ fn start_translate(
     });
 }
 
-/// start_doc_translate 后台线程的结算（规格 K §5）：Cancelled = 用户在选文件/
-/// 保存对话框任一取消（静默复位）；Done = 成功（统计 + 输出全路径，状态行只
-/// 展示文件名）；Failed = translate_document 报错原文（红字展示）。
+/// start_doc_translate 后台线程的结算（规格 K §5 + 批量三件套 ③）：
+/// Cancelled = 用户在选文件/保存对话框任一取消（静默复位）；
+/// Done = 单选（N=1）成功（统计 + 输出全路径，状态行只展示文件名——现状形态）；
+/// BatchDone = 多选（N>1）批量结算：成功数 / 总数 / 失败文件名表（单个失败
+/// 继续下一个，汇总进状态行）；
+/// Failed = 单选失败（translate_document 报错原文，红字展示）。
 enum DocOutcome {
     Cancelled,
     Done(rumi_translate::docmt::DocStats, std::path::PathBuf),
+    BatchDone {
+        ok: usize,
+        total: usize,
+        failed: Vec<String>,
+    },
     Failed(String),
+}
+
+/// 批量文档翻译汇总文案（三件套 ③ 状态行）："N/M 个文档完成" + 有失败时
+/// 追加"，失败：[文件名…]"（纯函数直测；词条模板由调用方按当前 UI 语言取好
+/// 传入——spawn 闭包里用 tt，测试里用 ts，插值逻辑本体不依赖语言全局量）。
+fn doc_batch_summary(
+    done_tmpl: &str,
+    failed_tmpl: &str,
+    ok: usize,
+    total: usize,
+    failed: &[String],
+) -> String {
+    let mut s = done_tmpl
+        .replace("{p1}", &ok.to_string())
+        .replace("{p2}", &total.to_string());
+    if !failed.is_empty() {
+        // 失败名单：文件名 ", " 连接、方括号包裹（模板带 leading 逗号）
+        s += &failed_tmpl.replace("{p}", &failed.join(", "));
+    }
+    s
 }
 
 /// 文档翻译的 OCR 引擎装配（扫描 PDF 进文档翻译）：rumi 全局引擎包成
@@ -329,23 +379,29 @@ fn doc_ocr_engine() -> std::sync::Arc<rumi_ocr::RumiOcrAdapter> {
     std::sync::Arc::new(rumi_ocr::RumiOcrAdapter::new(rumi_ocr::OcrEngine::global()))
 }
 
-/// 翻译整个文档（规格 K §5）：rfd 选文件与保存对话框必须在 std 线程（Linux
-/// GTK 同步对话框死锁主线程，开发经验 §三；模式照抄 start_import），两对话框
-/// 与 translate_document 重活合并进同一后台线程（选中→保存→翻译一气呵成）；
+/// 翻译整个文档（规格 K §5 + 批量三件套 ③）：rfd 对话框必须在 std 线程（Linux
+/// GTK 同步对话框死锁主线程，开发经验 §三；模式照抄 start_import），对话框
+/// 与 translate_document 重活合并进同一后台线程（选中→翻译一气呵成）；
+/// - 选文件：`pick_files` 多选（同过滤器）。**单选（N=1）沿用现状**：选完弹
+///   保存对话框（默认名 <原名>.bilingual.md，输出可选 md/docx/epub），成功走
+///   Done、失败走 Failed（统计/红字形态与旧版逐字节一致）；**多选（N>1）批量**：
+///   无逐文件保存对话框，输出名 default_doc_out 逐个推导，逐个串行翻译
+///  （同当前设置：布局/引擎/语言/OCR 注入），单个失败继续下一个；
 /// - 互斥：与「翻译」按钮共用 running 信号（同一时刻只允许一个翻译动作）；
 /// - 选项：strategy=Inline、min_chars=2 为规格 §5 固定值；引擎/polish 取点击
-///   时设置快照，from/to 取当前下拉值；
+///   时设置快照，from/to 取当前下拉值（from="auto" 时逐单元检测在 docmt 层）；
 /// - 进度：on_progress 回调在翻译线程上产生 → futures mpsc 无界通道（非阻塞
-///   send；Signal !Send 绝不在工作线程碰）→ UI 端泵成 doc_prog 信号（文案
-///   「已翻译 n/N 单元」；doc 用单元口径，不与模型下载 prog 的字节口径混用）；
-/// - 结算：完成状态行「单元 N · 耗时 X s → 文件名」；失败/线程丢失红字；
-///   完成态保留到下次发起（发起时统一清空重置）。
+///   send；Signal !Send 绝不在工作线程碰）→ UI 端泵成 doc_prog 信号（三参：
+///   n/N + 当前文件最近完成单元章节名；批量时进度行显示当前文件口径）；
+/// - 结算：单选完成状态行「单元 N · 耗时 X s → 文件名」；多选状态行
+///   「N/M 个文档完成，失败：[文件名…]」；失败/线程丢失红字；完成态保留到
+///   下次发起（发起时统一清空重置）。
 fn start_doc_translate(
     from_sel: Signal<String>,
     to_sel: Signal<String>,
     mut running: Signal<bool>,
     mut doc_running: Signal<bool>,
-    mut doc_prog: Signal<Option<(usize, usize)>>,
+    mut doc_prog: Signal<Option<(usize, usize, Option<String>)>>,
     mut doc_status: Signal<String>,
     mut doc_err: Signal<Option<String>>,
 ) {
@@ -356,35 +412,21 @@ fn start_doc_translate(
     let from = from_sel();
     let to = to_sel();
     let engine = engine_from_settings(&st);
-    let (ptx, mut prx) = futures::channel::mpsc::unbounded::<(usize, usize)>();
+    let (ptx, mut prx) = futures::channel::mpsc::unbounded::<(usize, usize, Option<String>)>();
     let rx = crate::ocr_flow::run_blocking(move || {
-        // 对话框 1：选输入文件（过滤器名 i18n + 规格 §5 扩展名表）
-        let Some(input) = rfd::FileDialog::new()
+        // 对话框：选输入文件（多选，过滤器名 i18n + 规格 §5 扩展名表）
+        let Some(inputs) = rfd::FileDialog::new()
             .add_filter(i18n::tt(tr::DOC_FILTER), doc_filter_extensions())
-            .pick_file()
+            .pick_files()
+            .filter(|v| !v.is_empty()) // 空选（全清后确认）按取消处理
         else {
-            return DocOutcome::Cancelled; // 用户取消
-        };
-        // 对话框 2：保存路径（默认名 <原名>.bilingual.md、存输入同目录，同线程）
-        let out_name = default_doc_out(&input)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "translation.bilingual.md".to_string());
-        let mut save = rfd::FileDialog::new().set_file_name(&out_name)
-            // 输出格式按扩展名分派（docmt::translate_document）：
-            // .md=双语 Markdown；.docx/.epub=保原样式回写（输入需同格式）
-            .add_filter("Markdown (*.md)", &["md"])
-            .add_filter("Word (*.docx)", &["docx"])
-            .add_filter("EPUB (*.epub)", &["epub"]);
-        if let Some(dir) = input.parent() {
-            save = save.set_directory(dir);
-        }
-        let Some(out) = save.save_file() else {
             return DocOutcome::Cancelled; // 用户取消
         };
         // 进度回调在翻译线程上被调：unbounded_send 非阻塞、UnboundedSender
         // 满足 Send+Sync，克隆一份进回调；原句柄留在闭包内保证流生命周期
         let sink = ptx.clone();
+        // 选项一次构造全批共用（同当前设置快照；on_progress 三参=① 规格，
+        // 章节名 Some 才装箱发送，无章节文档零分配）
         let opts = rumi_translate::docmt::DocTranslateOptions {
             engine,
             from,
@@ -400,16 +442,56 @@ fn start_doc_translate(
             // （pdf 后端 Auto 逐页判定，扫描页渲染后走同一引擎，避免模型双载；
             // 纯文字层 PDF 不触发模型下载）
             ocr_engine: Some(doc_ocr_engine()),
-            on_progress: Some(std::sync::Arc::new(move |done, total| {
-                let _ = sink.unbounded_send((done, total));
+            on_progress: Some(std::sync::Arc::new(move |done, total, chapter| {
+                let _ = sink.unbounded_send((done, total, chapter.map(str::to_string)));
             })),
         };
-        let res = rumi_translate::docmt::translate_document(&input, &out, &opts);
-        drop(ptx); // 关闭进度流：UI 端泵收尾退出
-        match res {
-            Ok(stats) => DocOutcome::Done(stats, out),
-            Err(e) => DocOutcome::Failed(e),
+        // 单选（N=1）：现状形态——保存对话框（默认名/格式三选）+ Done/Failed
+        if inputs.len() == 1 {
+            let input = &inputs[0];
+            // 保存路径（默认名 <原名>.bilingual.md、存输入同目录，同线程）
+            let out_name = default_doc_out(input)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "translation.bilingual.md".to_string());
+            let mut save = rfd::FileDialog::new().set_file_name(&out_name)
+                // 输出格式按扩展名分派（docmt::translate_document）：
+                // .md=双语 Markdown；.docx/.epub=保原样式回写（输入需同格式）
+                .add_filter("Markdown (*.md)", &["md"])
+                .add_filter("Word (*.docx)", &["docx"])
+                .add_filter("EPUB (*.epub)", &["epub"]);
+            if let Some(dir) = input.parent() {
+                save = save.set_directory(dir);
+            }
+            let Some(out) = save.save_file() else {
+                return DocOutcome::Cancelled; // 用户取消
+            };
+            let res = rumi_translate::docmt::translate_document(input, &out, &opts);
+            drop(ptx); // 关闭进度流：UI 端泵收尾退出
+            return match res {
+                Ok(stats) => DocOutcome::Done(stats, out),
+                Err(e) => DocOutcome::Failed(e),
+            };
         }
+        // 多选（N>1）批量：输出名 default_doc_out 逐个（.bilingual.md），逐个
+        // 串行翻译，单个失败继续下一个（失败记文件名，汇总进状态行）
+        let total = inputs.len();
+        let mut ok = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for input in &inputs {
+            let out = default_doc_out(input);
+            match rumi_translate::docmt::translate_document(input, &out, &opts) {
+                Ok(_) => ok += 1,
+                Err(_) => failed.push(
+                    input
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| input.display().to_string()),
+                ),
+            }
+        }
+        drop(ptx); // 关闭进度流：UI 端泵收尾退出
+        DocOutcome::BatchDone { ok, total, failed }
     });
     running.set(true);
     doc_running.set(true);
@@ -418,8 +500,8 @@ fn start_doc_translate(
     doc_err.set(None);
     spawn(async move {
         // 泵进度：翻译线程回调 → 信号（首个回调前界面显示「文档翻译中…」）
-        while let Some((done, total)) = prx.next().await {
-            doc_prog.set(Some((done, total)));
+        while let Some((done, total, chapter)) = prx.next().await {
+            doc_prog.set(Some((done, total, chapter)));
         }
         match rx.await {
             Ok(DocOutcome::Done(stats, out)) => {
@@ -442,6 +524,16 @@ fn start_doc_translate(
                         i18n::tt(tr::DOC_NOTE).replace("{p}", &note)
                     ));
                 }
+            }
+            Ok(DocOutcome::BatchDone { ok, total, failed }) => {
+                // 批量汇总（三件套 ③）："N/M 个文档完成" + 失败名单
+                doc_status.set(doc_batch_summary(
+                    i18n::tt(tr::DOC_BATCH_DONE),
+                    i18n::tt(tr::DOC_BATCH_FAILED),
+                    ok,
+                    total,
+                    &failed,
+                ));
             }
             Ok(DocOutcome::Failed(e)) => {
                 doc_err.set(Some(i18n::tt(tr::DOC_FAILED).replace("{p}", &e)));
@@ -823,7 +915,13 @@ pub fn TranslatePage(
     let t = |k: &'static str| i18n::ts(&lang_v, k);
 
     let st0 = settings::get().translate;
-    let init_from = normalized_or(&st0.last_from, "en");
+    // 源语言初值："auto"（自动检测，三件套 ②）合法可选、原样保留；其余走
+    // normalized_or 兜底（目标侧无 auto——自动检测只对源语言有意义）
+    let init_from = if st0.last_from.trim().eq_ignore_ascii_case("auto") {
+        "auto".to_string()
+    } else {
+        normalized_or(&st0.last_from, "en")
+    };
     let init_to = normalized_or(&st0.last_to, "zh");
     let mut from_sel = use_signal(move || init_from.clone());
     let mut to_sel = use_signal(move || init_to.clone());
@@ -856,7 +954,8 @@ pub fn TranslatePage(
     // 与状态区归属）。进度/状态/错误独立成组——模型下载的 prog 是字节口径，
     // 不与单元口径混用同一信号
     let doc_running = use_signal(|| false);
-    let doc_prog = use_signal(|| Option::<(usize, usize)>::None);
+    // (已翻译单元数, 总数, 当前文件最近完成单元章节名)——三参回调（三件套 ①）
+    let doc_prog = use_signal(|| Option::<(usize, usize, Option<String>)>::None);
     let doc_status = use_signal(String::new);
     let doc_err = use_signal(|| Option::<String>::None);
     // 双语布局（就地切换，初值取设置；切换即存回，与设置页同源）
@@ -927,8 +1026,14 @@ pub fn TranslatePage(
     let doc_prog_v = doc_prog();
     let doc_status_v = doc_status();
     let doc_err_v = doc_err();
+    // 进度行（三件套 ①）：章节名 Some → 带前缀模板「第三章 · 45/120」，
+    // None → 原样「已翻译 45/120 单元」（doc_progress）；首个回调前「文档翻译中…」
     let doc_prog_text = match doc_prog_v {
-        Some((done, total)) => i18n::ts(&lang_v, tr::DOC_PROGRESS)
+        Some((done, total, Some(ch))) => i18n::ts(&lang_v, tr::DOC_PROGRESS_CH)
+            .replace("{p}", &ch)
+            .replace("{p1}", &done.to_string())
+            .replace("{p2}", &total.to_string()),
+        Some((done, total, None)) => i18n::ts(&lang_v, tr::DOC_PROGRESS)
             .replace("{p1}", &done.to_string())
             .replace("{p2}", &total.to_string()),
         None => i18n::ts(&lang_v, tr::DOC_RUNNING).to_string(),
@@ -1065,6 +1170,9 @@ pub fn TranslatePage(
                                 from_sel.set(v.clone());
                                 let _ = settings::update(move |st| { st.translate.last_from = v; Ok(()) });
                             },
+                            // 自动检测（三件套 ②，仅源侧）：文档翻译逐单元检测；
+                            // 文本「翻译」不支持（按钮禁用 + 早退兜底）
+                            option { value: "auto", selected: from_v == "auto", "{t(tr::FROM_AUTO)}" }
                             for &l in lang::UI_LANGS.iter() {
                                 option { value: "{l}", selected: from_v == l, "{lang::display(l)}" }
                             }
@@ -1078,6 +1186,11 @@ pub fn TranslatePage(
                     button { class: "btn-sm", title: "{t(tr::SWAP)}",
                         onclick: move |_| {
                             let (f0, t0) = (from_sel(), to_sel());
+                            // auto 源语言无固定方向（三件套 ②）：不参与⇄交换
+                            //（保守空操作——换过去的"auto 目标"没有语义）
+                            if f0 == "auto" {
+                                return;
+                            }
                             let (s0, r0) = (src(), result());
                             from_sel.set(t0.clone());
                             to_sel.set(f0.clone());
@@ -1156,7 +1269,9 @@ pub fn TranslatePage(
                         ),
                         if doc_running_v { "{t(tr::DOC_RUNNING)}" } else { "{t(tr::DOC_BUTTON)}" } }
                     button { class: "primary",
-                        disabled: running_v || src_v.trim().is_empty(),
+                        // from=auto 时文本「翻译」不可用（自动检测只做了文档链，
+                        // 见 start_translate 早退注释）——按钮禁用给直接反馈
+                        disabled: running_v || from_v == "auto" || src_v.trim().is_empty(),
                         onclick: move |_| {
                             start_translate(
                                 from_sel, to_sel, src, result, result_err, highlight, elapsed, running,
@@ -1648,13 +1763,48 @@ mod tests {
                 tr::DOC_BUTTON,
                 tr::DOC_RUNNING,
                 tr::DOC_PROGRESS,
+                tr::DOC_PROGRESS_CH,
+                tr::DOC_BATCH_DONE,
+                tr::DOC_BATCH_FAILED,
                 tr::DOC_DONE,
                 tr::DOC_FAILED,
                 tr::DOC_FILTER,
+                tr::FROM_AUTO,
             ] {
                 assert_ne!(i18n::ts(lang, key), key, "{lang} 缺词：{key}");
             }
         }
+    }
+
+    /// 批量汇总文案（三件套 ③ 纯函数）：全成功 = "N/M 个文档完成"；
+    /// 有失败追加模板尾缀（含 leading 逗号）+ 文件名 ", " 连接；全失败 =
+    /// "0/M …"；模板按当前语言取词（测试用 ts 直取两语验证）。
+    #[test]
+    fn doc_batch_summary_composes_done_and_failed_list() {
+        let done = i18n::ts("zh_CN", tr::DOC_BATCH_DONE);
+        let failed = i18n::ts("zh_CN", tr::DOC_BATCH_FAILED);
+        // 全成功：无尾缀
+        assert_eq!(doc_batch_summary(done, failed, 3, 3, &[]), "3/3 个文档完成");
+        // 部分失败：追加失败名单（方括号 + ", " 连接）
+        let f = vec!["a.pdf".to_string(), "b epub.epub".to_string()];
+        assert_eq!(
+            doc_batch_summary(done, failed, 1, 3, &f),
+            "1/3 个文档完成，失败：[a.pdf, b epub.epub]"
+        );
+        // 全失败：ok=0 照常汇总
+        let f1 = vec!["x.txt".to_string()];
+        assert_eq!(
+            doc_batch_summary(done, failed, 0, 2, &f1),
+            "0/2 个文档完成，失败：[x.txt]"
+        );
+        // en 模板同构（词条齐全 + 插值形态一致）
+        let done_en = i18n::ts("en_US", tr::DOC_BATCH_DONE);
+        let failed_en = i18n::ts("en_US", tr::DOC_BATCH_FAILED);
+        assert_eq!(doc_batch_summary(done_en, failed_en, 2, 2, &[]), "2/2 documents done");
+        assert_eq!(
+            doc_batch_summary(done_en, failed_en, 1, 2, &f1),
+            "1/2 documents done, failed: [x.txt]"
+        );
     }
 
     /// OCR 注入装配（扫描 PDF 进文档翻译）纯函数：global() 懒构建——装配

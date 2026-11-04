@@ -268,8 +268,12 @@ fn doc_cmd(input: &str, args: &Args) {
         // 扫描 PDF OCR 注入 v1 不做（translate crate 不依赖 rumi-ocr，CLI
         // 短命进程不装配适配器）——扫描页 PDF 维持既有报错文案
         ocr_engine: None,
-        on_progress: Some(std::sync::Arc::new(|done, total| {
-            eprintln!("已翻译 {done}/{total} 单元");
+        on_progress: Some(std::sync::Arc::new(|done, total, chapter| {
+            // 第三参=最近完成单元章节名（None=无章节文档）：有则尾缀展示
+            match chapter {
+                Some(ch) => eprintln!("已翻译 {done}/{total} 单元 · {ch}"),
+                None => eprintln!("已翻译 {done}/{total} 单元"),
+            }
         })),
     };
     match docmt::translate_document(&input_path, &out, &opts) {

@@ -56,10 +56,71 @@ impl From<BiStrategy> for docforge::emit::BiStrategy {
     }
 }
 
+/// whatlang 的 ISO 639-3 码 → rumi 内部码（auto 源语言检测专用，见
+/// [`DocTranslateOptions::from`]）。必须显式建表而不能只靠
+/// [`crate::lang::normalize`] 兜底——normalize 对未收录三字码走「前两位
+/// 截取」：eng→en、ita→it 恰好对，cmn→cm、por→po、jpn→jp 这类就错
+/// （lang::ALIASES 已收 eng/jpn 等部分码，但 whatlang 的 Mandarin 码是
+/// "cmn" 不在任何别名表里，漏一个错一个）。常见 13 语（UI_LANGS 常用组）
+/// 逐字列出；未收录语言由 [`iso639_3_to_rumi`] 走 normalize 兜底。
+const ISO639_3_TO_RUMI: &[(&str, &str)] = &[
+    ("cmn", "zh"), // 中文普通话：whatlang 的 Mandarin 码是 cmn；宏码 zho 同映射
+    ("zho", "zh"),
+    ("eng", "en"),
+    ("jpn", "ja"),
+    ("kor", "ko"),
+    ("fra", "fr"),
+    ("deu", "de"),
+    ("spa", "es"),
+    ("rus", "ru"),
+    ("por", "pt"),
+    ("ita", "it"),
+    ("vie", "vi"),
+    ("ara", "ar"),
+    ("tha", "th"),
+];
+
+/// ISO 639-3 → rumi 内部码：映射表（[`ISO639_3_TO_RUMI`]）命中直取；未收录
+/// 走 [`crate::lang::normalize`] 兜底（截不出两位字母码的原样小写返回，交由
+/// 引擎按未知语言处理）。纯函数可测（auto 检测方向的正确性单测打在这）。
+pub fn iso639_3_to_rumi(lang6393: &str) -> String {
+    let key = lang6393.trim().to_ascii_lowercase();
+    match ISO639_3_TO_RUMI.iter().find(|(k, _)| *k == key.as_str()) {
+        Some((_, v)) => (*v).to_string(),
+        None => crate::lang::normalize(&key),
+    }
+}
+
+/// 按键分组并保持首现顺序（auto 源语言的分组批）：返回 (键, 同键下标升序表)。
+/// 纯函数可测——「不同源语言不能同批」是离线 CT2 批调用的硬约束
+///（engine::translate_texts 单 from，混合源语言的批会按错误方向整批翻译）。
+pub fn group_indices(keys: &[String]) -> Vec<(String, Vec<usize>)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        if !groups.contains_key(k) {
+            order.push(k.clone());
+        }
+        groups.entry(k.clone()).or_default().push(i);
+    }
+    order
+        .into_iter()
+        .map(|k| {
+            let idx = groups.remove(&k).unwrap_or_default();
+            (k, idx)
+        })
+        .collect()
+}
+
 /// 文档翻译选项。
 pub struct DocTranslateOptions {
     pub engine: crate::Engine,
-    /// 内部码；单元级不自动检测（unit.lang 留 v2）。
+    /// 内部码；"auto" = 逐单元自动检测——docforge 块级 whatlang 检测的
+    /// `unit.lang`（ISO 639-3 码，见 [`parse_document`] 的 policy 说明）经
+    /// [`iso639_3_to_rumi`] 转内部码作该单元实际 from；检测不出的单元
+    /// 译文=原文（诚实：检测不出不瞎翻）。缓存键用单元实际 from（每单元
+    /// 不同 from 天然不串键）。
     pub from: String,
     pub to: String,
     pub strategy: BiStrategy,
@@ -67,9 +128,11 @@ pub struct DocTranslateOptions {
     pub polish: bool,
     /// 最小字符数（docforge 同款默认 2：滤单字符噪声）。
     pub min_chars: usize,
-    /// 进度回调 (已翻译单元数, 总单元数)；调用方取消语义 v1 不做
-    /// （返回 false 中止留 v2）。
-    pub on_progress: Option<std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>>,
+    /// 进度回调 (已翻译单元数, 总单元数, 最近完成单元的章节名)：第三参取
+    /// `unit.chapter`（批执行时为批内最后完成单元的 chapter；无章节文档
+    /// 恒 None——UI 可据此决定是否加"第三章 · "前缀）。调用方取消语义
+    /// 不做（返回 false 中止留 v2）。
+    pub on_progress: Option<std::sync::Arc<dyn Fn(usize, usize, Option<&str>) + Send + Sync>>,
     /// 翻译缓存（默认 true）：文本级命中跳过引擎；进度照常推进。
     /// from==to 的直通路径不经过缓存（无引擎成本，无缓存意义）。
     pub use_cache: bool,
@@ -133,6 +196,13 @@ const UNITS_PER_BATCH: usize = 16;
 /// 命中跳过引擎但进度照常推进），批内新译文写缓存并在每批边界与收尾各
 /// 落盘一次——断点续翻（中断重跑已翻单元全命中）+ 同文本只翻一次
 /// （页眉页脚重复文本一石二鸟）。
+///
+/// from=="auto"（逐单元自动检测）：解析时开 docforge 块级语言检测（见
+/// [`parse_document`]），每个单元的实际 from = `unit.lang` 经
+/// [`iso639_3_to_rumi`] 映射；检测不出（`unit.lang` None）的单元译文=原文
+/// 不进批；pending 按**实际源语言分组批**（[`group_indices`]，组内再按
+/// 16 条攒批）——engine::translate_texts 单 from，不同源语言不能同批。
+/// 每批完成回调一次 on_progress（第三参=批内最后完成单元的章节名）。
 pub fn translate_document(
     input: &Path,
     out: &Path,
@@ -144,7 +214,13 @@ pub fn translate_document(
     if !input.is_file() {
         return Err(format!("文件不存在：{}", input.display()));
     }
-    let doc = parse_document(input, opts.ocr_engine.clone())?;
+    // auto 源语言检测开关：from 字面 "auto"（大小写/空白宽容）触发逐单元
+    // 检测。**不能**经 lang::normalize 判定——normalize("auto") 走「前两位
+    // 截取」得 "au"，恒不等于 "auto"。
+    let auto_from = opts.from.trim().eq_ignore_ascii_case("auto");
+    // 块级语言检测只在 auto 时开（逐块 whatlang 有成本；固定 from 行为与
+    // 旧版完全一致）
+    let doc = parse_document(input, opts.ocr_engine.clone(), auto_from)?;
     let units = docforge::emit::to_translation_units_with(&doc, opts.min_chars);
     if units.is_empty() {
         return Err("文档无可翻译文本单元（空文件或全为非文本块）".to_string());
@@ -153,6 +229,7 @@ pub fn translate_document(
     // 缓存装配：use_cache 开且非 from==to 直通才加载——直通走 facade 短路
     // 零引擎成本，进缓存无意义（不读不写，也不碰用户缓存目录）。路径用
     // RUMI_TRANSLATE_CACHE 覆盖缺省数据目录（测试隔离的钩子，见下）。
+    // auto 模式 from=="auto" 不会等于 to，缓存照常加载（键=单元实际 from）。
     let passthrough = crate::lang::normalize(&opts.from) == crate::lang::normalize(&opts.to);
     let mut cache = if opts.use_cache && !passthrough {
         Some(DocCache::load_at(
@@ -202,6 +279,10 @@ pub fn translate_document(
     // 判定链顺序与回填结果——统计口径（cache_hits/glossary_hits/running_merged）
     // 与输出不变。
     let mut texts_out: Vec<String> = Vec::with_capacity(total);
+    // 每单元实际源语言（auto 检测的载体，阶段二分组批/缓存键/引擎调用都用
+    // 它）：固定 from 恒 opts.from（现状）；auto 时 unit.lang 经 639-3 映射，
+    // None = 检测不出。与 texts_out 同长同序。
+    let mut unit_froms: Vec<Option<String>> = Vec::with_capacity(total);
     let mut pending: Vec<usize> = Vec::new();
     // running 单元的批内去重（文本 → 首个 pending 槽位）：旧逐条流靠"首现
     // 翻完记 memo"让后续页眉复用同一译文；两阶段流里 memo 要等批执行才填，
@@ -213,10 +294,22 @@ pub fn translate_document(
     let mut batch_refs: Vec<(usize, usize)> = Vec::new();
     for (idx, unit) in units.iter().enumerate() {
         chars += unit.text.chars().count();
+        // 单元实际源语言：auto 时取块级检测结果（whatlang ISO 639-3 码）转
+        // rumi 码；检测不出（样本 < 20 字符或 whatlang 未命中）为 None
+        let from_u: Option<String> = if auto_from {
+            unit.lang.as_deref().map(iso639_3_to_rumi)
+        } else {
+            Some(opts.from.clone())
+        };
+        unit_froms.push(from_u.clone());
         let text = if !unit.has_translatable_text() {
             // 防幻觉过滤（docforge@b5bf9a87 谓词）：220V / -10 to 50 C 这类纯
             // 数字/单位/短代码文本送引擎只会得到幻觉（实测 "220V 电话"），
             // 直接原样回填——译文=原文，回写锚点不受影响（也不进缓存）
+            unit.text.clone()
+        } else if from_u.is_none() {
+            // auto 且检测不出：译文=原文。放在缓存之前——缓存键没有可用的
+            // from；诚实语义：检测不出不瞎翻，宁可不译也不按错误方向翻
             unit.text.clone()
         } else if let Some(dst) = glossary.exact_match(&unit.text) {
             // 术语表精确命中（glossary 规格 §3，插在防幻觉之后、缓存之前
@@ -230,17 +323,27 @@ pub fn translate_document(
             // 去重承担，见上）——分支保留以对齐判定链顺序铁律
             running_merged += 1;
             running_memo.get(&unit.text).unwrap().clone()
-        } else if let Some(hit) = cache
-            .as_ref()
-            .and_then(|c| c.get(&unit.text, &opts.from, &opts.to, &engine, opts.polish))
-        {
+        } else if let Some(hit) = cache.as_ref().and_then(|c| {
+            c.get(
+                &unit.text,
+                from_u.as_deref().unwrap_or(&opts.from),
+                &opts.to,
+                &engine,
+                opts.polish,
+            )
+        }) {
             // 文本级命中（同文本跨单元/跨文档/页眉页脚只翻一次）；进度照常推进
-            // ——进度是"处理进度"不是"翻译成本"
+            // ——进度是"处理进度"不是"翻译成本"。缓存键用单元实际 from
+            //（auto 每单元可能不同，天然不串键）
             cache_hits += 1;
             hit
-        } else if passthrough {
+        } else if crate::lang::normalize(from_u.as_deref().unwrap_or(&opts.from))
+            == crate::lang::normalize(&opts.to)
+        {
             // from==to 直通（旧流发生在 crate::translate/facade 内部，位于
-            // 缓存之后）：预扫直接定稿——pending 全空、引擎零接触
+            // 缓存之后）：预扫直接定稿——pending 全空、引擎零接触。单元粒度
+            // 判定：固定 from 时与旧全局判定完全等价；auto 时混合文档的
+            // "检测语言==目标语言"单元同样零引擎成本原样
             unit.text.clone()
         } else if unit.running {
             if let Some(&slot) = pending_slots.get(unit.text.as_str()) {
@@ -266,81 +369,100 @@ pub fn translate_document(
     // （一次 CT2 批）；在线引擎保持逐条 crate::translate（provider 自有批量/
     // 限流语义，不掺和离线批）。
     if !pending.is_empty() {
-        // 离线批量入口不做方向归一（facade 的 normalize 在其内部做），显式
-        // 传入归一码；缓存键仍用原始码，语义不变
-        let from = crate::lang::normalize(&opts.from);
+        // 分组批：auto 模式 pending 里各单元的实际源语言可能不同——
+        // engine::translate_texts 单 from，不同源语言不能同批。按实际 from
+        // 分组（[`group_indices`] 保首现序）、组内再按 16 条攒批；固定 from
+        // 时全 pending 同键一组，分组退化为既有的单序攒批（行为不变）。
+        let keys: Vec<String> = pending
+            .iter()
+            .map(|&i| unit_froms[i].clone().unwrap_or_default())
+            .collect();
         let to = crate::lang::normalize(&opts.to);
         let prescanned = total - pending.len();
-        for (ci, chunk) in pending.chunks(UNITS_PER_BATCH).enumerate() {
-            let batch: Vec<String> = chunk.iter().map(|&i| units[i].text.clone()).collect();
-            let outs = match &engine {
-                crate::Engine::Offline => {
-                    // 整批 Err（CT2 批调用不区分单条）——错误定位到批内首
-                    // pending 单元，粗粒度可接受（与现状"任一单元失败整体
-                    // Err"一致）
-                    crate::engine::shared()
-                        .translate_texts(&batch, &from, &to)
-                        .map(|mut outs| {
-                            // 与 facade 同款收尾：zh 润色 + ▁ 清理（引擎出口
-                            // 已 strip，此处幂等重复无害）
-                            if opts.polish && to == "zh" {
-                                for t in outs.iter_mut() {
-                                    *t = crate::postfix::polish_zh(t);
+        // 分组打乱了下标顺序，进度"已处理数"用计数器推进（等价于旧
+        // prescanned + (ci+1)*UNITS_PER_BATCH 的单序口径）
+        let mut processed = prescanned;
+        for (from_g, idxs) in group_indices(&keys) {
+            // 离线批量入口不做方向归一（facade 的 normalize 在其内部做），显式
+            // 传入归一码；缓存键用单元实际 from（原始码），语义不变
+            let from_norm = crate::lang::normalize(&from_g);
+            for chunk in idxs.chunks(UNITS_PER_BATCH) {
+                let batch: Vec<String> = chunk.iter().map(|&i| units[i].text.clone()).collect();
+                let outs = match &engine {
+                    crate::Engine::Offline => {
+                        // 整批 Err（CT2 批调用不区分单条）——错误定位到批内首
+                        // pending 单元，粗粒度可接受（与现状"任一单元失败整体
+                        // Err"一致）
+                        crate::engine::shared()
+                            .translate_texts(&batch, &from_norm, &to)
+                            .map(|mut outs| {
+                                // 与 facade 同款收尾：zh 润色 + ▁ 清理（引擎出口
+                                // 已 strip，此处幂等重复无害）
+                                if opts.polish && to == "zh" {
+                                    for t in outs.iter_mut() {
+                                        *t = crate::postfix::polish_zh(t);
+                                    }
                                 }
-                            }
-                            for t in outs.iter_mut() {
-                                *t = crate::strip_sp_marker(t);
-                            }
-                            outs
-                        })
-                        .map_err(|e| format!("单元 {} 翻译失败：{}", units[chunk[0]].id, e))?
-                }
-                _ => {
-                    // 在线逐条：错误定位逐单元（与旧循环逐字一致）
-                    let mut outs = Vec::with_capacity(chunk.len());
-                    for &i in chunk {
-                        let t = crate::translate(
-                            std::slice::from_ref(&units[i].text),
-                            &opts.from,
+                                for t in outs.iter_mut() {
+                                    *t = crate::strip_sp_marker(t);
+                                }
+                                outs
+                            })
+                            .map_err(|e| {
+                                format!("单元 {} 翻译失败：{}", units[chunk[0]].id, e)
+                            })?
+                    }
+                    _ => {
+                        // 在线逐条：错误定位逐单元（与旧循环逐字一致）；from
+                        // 用单元实际值（固定模式 == opts.from，行为不变）
+                        let mut outs = Vec::with_capacity(chunk.len());
+                        for &i in chunk {
+                            let t = crate::translate(
+                                std::slice::from_ref(&units[i].text),
+                                unit_froms[i].as_deref().unwrap_or(&from_g),
+                                &opts.to,
+                                &engine,
+                                opts.polish,
+                            )
+                            .map_err(|e| format!("单元 {} 翻译失败：{}", units[i].id, e))?
+                            .pop()
+                            .unwrap_or_default();
+                            outs.push(t);
+                        }
+                        outs
+                    }
+                };
+                for (slot_in_chunk, &i) in chunk.iter().enumerate() {
+                    texts_out[i] = outs[slot_in_chunk].clone();
+                    if let Some(c) = cache.as_mut() {
+                        c.insert(
+                            &units[i].text,
+                            unit_froms[i].as_deref().unwrap_or(&from_g),
                             &opts.to,
                             &engine,
                             opts.polish,
-                        )
-                        .map_err(|e| format!("单元 {} 翻译失败：{}", units[i].id, e))?
-                        .pop()
-                        .unwrap_or_default();
-                        outs.push(t);
+                            &texts_out[i],
+                        );
                     }
-                    outs
+                    // running 首现翻完记入 memo（后续同文本页复用；批内重复已在
+                    // 预扫挂槽位，不重复进批）
+                    if units[i].running {
+                        running_memo.insert(units[i].text.clone(), texts_out[i].clone());
+                    }
                 }
-            };
-            for (slot_in_chunk, &i) in chunk.iter().enumerate() {
-                texts_out[i] = outs[slot_in_chunk].clone();
-                if let Some(c) = cache.as_mut() {
-                    c.insert(
-                        &units[i].text,
-                        &opts.from,
-                        &opts.to,
-                        &engine,
-                        opts.polish,
-                        &texts_out[i],
-                    );
+                // 断点续翻：每批边界落盘一次（崩溃最多丢一批）
+                if let Some(c) = cache.as_ref() {
+                    c.save();
                 }
-                // running 首现翻完记入 memo（后续同文本页复用；批内重复已在
-                // 预扫挂槽位，不重复进批）
-                if units[i].running {
-                    running_memo.insert(units[i].text.clone(), texts_out[i].clone());
+                // 进度回调：每批完成一次（done 含预扫已分流单元——进度是"处理
+                // 进度"不是"翻译成本"，粒度从逐条变 16 条一跳，节流语义不变）；
+                // 第三参=批内最后完成单元的章节名（① 规格指定口径）
+                processed += chunk.len();
+                let done = processed.min(total);
+                let last = chunk[chunk.len() - 1];
+                if let Some(cb) = &opts.on_progress {
+                    cb(done, total, units[last].chapter.as_deref());
                 }
-            }
-            // 断点续翻：每批边界落盘一次（崩溃最多丢一批）
-            if let Some(c) = cache.as_ref() {
-                c.save();
-            }
-            // 进度回调：每批完成一次（done 含预扫已分流单元——进度是"处理
-            // 进度"不是"翻译成本"，粒度从逐条变 16 条一跳，节流语义不变）
-            let done = (prescanned + (ci + 1) * UNITS_PER_BATCH).min(total);
-            if let Some(cb) = &opts.on_progress {
-                cb(done, total);
             }
         }
         // 批内重复 running 文本回填首现槽位译文（预扫挂起的引用）
@@ -348,9 +470,11 @@ pub fn translate_document(
             texts_out[dup_idx] = texts_out[pending[slot]].clone();
         }
     } else if let Some(cb) = &opts.on_progress {
-        // 全命中（含 from==to 直通）：预扫全分流、pending 空、引擎零接触；
-        // 旧逐条流收尾处也会回调一次 (total, total)
-        cb(total, total);
+        // 全命中（含 from==to 直通 / auto 全检测不出）：预扫全分流、pending
+        // 空、引擎零接触；旧逐条流收尾处也会回调一次 (total, total)。
+        // 第三参=文档最后单元的章节名（"最近完成单元"在收尾点的自然口径）
+        let last_chapter = units.last().and_then(|u| u.chapter.as_deref());
+        cb(total, total, last_chapter);
     }
     let translated: Vec<(String, String)> = units
         .iter()
@@ -530,9 +654,24 @@ fn page_alternating_markdown(doc: &docforge::Document, translated: &[(String, St
 /// 识别注入，非 pdf 格式不消费）。写出以固定契约：纯文字层 PDF 正常直提；
 /// 扫描页无引擎时预检报错（Auto 不产空页而是 Err，见
 /// [`translate_parse_error`]），有引擎则渲染识别后进同一翻译管线。
+///
+/// lang-detect 装配核查结论（auto 源语言检测的前置调查，2026-11-04）：
+/// - **文档级**（整篇判一语 → `DocMeta.extra["language"]`）：处理能力随
+///   `plugins::text::register_defaults` 注册（docforge@e1fe673 的
+///   plugins/text.rs 底部 `lang_detect::register`，feature=lang-detect 开启），
+///   与 `docforge::parse()` 便捷函数的装配同源——本函数的 Registry **不缺**
+///   该注册；
+/// - **块级**（逐块填 `Block.lang` → `to_translation_units` 复制进
+///   `unit.lang`）：不是 Registry 注册，而是 `BackendPolicy`
+///   `lang_detect_per_block` 开关（docforge 引擎组装后置遍历
+///   `detect_block_langs`）；连 `docforge::parse()` 默认装配都没开
+///   （BackendPolicy::default 恒 false）。因此本函数按 `detect_lang` 显式
+///   开启——只有 auto 源语言才传 true（固定 from 不花逐块 whatlang 的
+///   成本，行为与旧版逐字节一致）。
 fn parse_document(
     input: &Path,
     ocr: Option<std::sync::Arc<dyn docforge::ocr::OcrEngine>>,
+    detect_lang: bool,
 ) -> Result<docforge::Document, String> {
     let path = input
         .to_str()
@@ -549,7 +688,12 @@ fn parse_document(
             ..Default::default()
         },
     );
+    let policy = docforge::policy::BackendPolicy {
+        lang_detect_per_block: detect_lang,
+        ..Default::default()
+    };
     docforge::DocumentEngine::new(registry)
+        .with_policy(policy)
         .parse(path)
         .map_err(translate_parse_error)
 }

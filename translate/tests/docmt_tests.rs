@@ -175,7 +175,7 @@ fn full_pipeline_from_eq_to_passes_through() {
     let input = dir.path().join("doc.txt");
     std::fs::write(&input, "这是一段测试正文。\n\n这是另一段正文。\n").unwrap();
     let out = dir.path().join("doc.bilingual.md");
-    let calls: Arc<Mutex<Vec<(usize, usize)>>> = Arc::default();
+    let calls: Arc<Mutex<Vec<(usize, usize, Option<String>)>>> = Arc::default();
     let sink = calls.clone();
     let opts = DocTranslateOptions {
         engine: Engine::Offline, // from==to 短路，shared() 不会被触达
@@ -184,8 +184,10 @@ fn full_pipeline_from_eq_to_passes_through() {
         strategy: BiStrategy::Inline,
         polish: false,
         min_chars: 2,
-        on_progress: Some(Arc::new(move |done, total| {
-            sink.lock().unwrap().push((done, total));
+        on_progress: Some(Arc::new(move |done, total, chapter| {
+            sink.lock()
+                .unwrap()
+                .push((done, total, chapter.map(str::to_string)));
         })),
         use_cache: false,
         glossary: Glossary::default(),
@@ -204,7 +206,8 @@ fn full_pipeline_from_eq_to_passes_through() {
         "这是一段测试正文。\n这是一段测试正文。\n\n这是另一段正文。\n这是另一段正文。"
     );
     // 2 单元 < 16：进度只在末批完成点回调一次，且到达 (total, total)
-    assert_eq!(*calls.lock().unwrap(), vec![(2, 2)]);
+    // （无章节文档：第三参恒 None）
+    assert_eq!(*calls.lock().unwrap(), vec![(2, 2, None)]);
 }
 
 /// 真模型 E2E：en_zh 已装时，最小 txt（docforge 文本插件可解析）→
@@ -498,7 +501,7 @@ fn prescan_drains_all_units_without_engine_touch() {
     let input = dir.path().join("doc.txt");
     std::fs::write(&input, "thread pool\n\n这是一段普通正文。\n\n220V\n").unwrap();
     let out = dir.path().join("doc.bilingual.md");
-    let calls: Arc<Mutex<Vec<(usize, usize)>>> = Arc::default();
+    let calls: Arc<Mutex<Vec<(usize, usize, Option<String>)>>> = Arc::default();
     let sink = calls.clone();
     let opts = DocTranslateOptions {
         engine: Engine::Google, // 哨兵：pending 非空即打网失败
@@ -507,8 +510,10 @@ fn prescan_drains_all_units_without_engine_touch() {
         strategy: BiStrategy::Inline,
         polish: false,
         min_chars: 2,
-        on_progress: Some(Arc::new(move |done, total| {
-            sink.lock().unwrap().push((done, total));
+        on_progress: Some(Arc::new(move |done, total, chapter| {
+            sink.lock()
+                .unwrap()
+                .push((done, total, chapter.map(str::to_string)));
         })),
         use_cache: false,
         glossary: Glossary::parse("thread pool = 线程池"),
@@ -518,8 +523,9 @@ fn prescan_drains_all_units_without_engine_touch() {
     assert_eq!(stats.units, 3);
     assert_eq!(stats.glossary_hits, 1, "仅术语单元精确命中");
     assert_eq!(stats.cache_hits, 0, "直通路径不经过缓存");
-    // 预扫全分流：pending 空 → 无批回调，仅收尾一次 (total, total)
-    assert_eq!(*calls.lock().unwrap(), vec![(3, 3)]);
+    // 预扫全分流：pending 空 → 无批回调，仅收尾一次 (total, total)（txt 无
+    // 标题 → 章节名 None）
+    assert_eq!(*calls.lock().unwrap(), vec![(3, 3, None)]);
     let md = std::fs::read_to_string(&out).unwrap();
     assert!(md.contains("thread pool\n线程池"), "术语单元回填固定译法：\n{md}");
     assert!(
@@ -527,6 +533,122 @@ fn prescan_drains_all_units_without_engine_touch() {
         "直通单元应原样：\n{md}"
     );
     assert!(md.contains("220V\n220V"), "防幻觉单元应原样（不进批）：\n{md}");
+}
+
+// ---------- auto 源语言检测（639-3 映射表 / 分组批 / 逐单元实际 from） ----------
+
+/// 639-3 → rumi 映射表（iso639_3_to_rumi 纯函数）：whatlang 码表逐个核对；
+/// 映射表存在的意义 = normalize「前两位截取」对 cmn→cm、por→po 会错，表内
+/// 必须直取；大小写宽容；未收录码走 normalize 兜底（截不出两位字母码的原样
+/// 小写返回）。
+#[test]
+fn iso639_3_to_rumi_maps_whatlang_codes() {
+    use rumi_translate::docmt::iso639_3_to_rumi as m;
+    // 常见 13 语 + 普通话两码（cmn 直取、zho 宏码同映射）
+    assert_eq!(m("cmn"), "zh", "whatlang 的 Mandarin 码是 cmn——normalize 会截成 cm");
+    assert_eq!(m("zho"), "zh");
+    assert_eq!(m("eng"), "en");
+    assert_eq!(m("jpn"), "ja", "normalize 前两位截取会得 jp——表内必须直取");
+    assert_eq!(m("kor"), "ko");
+    assert_eq!(m("fra"), "fr");
+    assert_eq!(m("deu"), "de");
+    assert_eq!(m("spa"), "es");
+    assert_eq!(m("rus"), "ru");
+    assert_eq!(m("por"), "pt", "normalize 前两位截取会得 po——表内必须直取");
+    assert_eq!(m("ita"), "it");
+    assert_eq!(m("vie"), "vi");
+    assert_eq!(m("ara"), "ar");
+    assert_eq!(m("tha"), "th");
+    // 大小写/空白宽容（docforge 写入的码恒小写，这里只防手搓构造点）
+    assert_eq!(m("ENG"), "en");
+    assert_eq!(m(" cmn "), "zh");
+    // 未收录码：normalize 兜底——前两位是字母则截取（既有语义），截不出原样小写
+    assert_eq!(m("azj"), "az");
+    assert_eq!(m("xx1"), "xx", "前两位字母 → 截取（normalize 既有语义）");
+    assert_eq!(m("1x"), "1x", "首位非字母 → 原样");
+}
+
+/// 分组批（group_indices 纯函数）：同键下标归组升序、组间保持首现顺序；
+/// 全同键退化为单组（固定 from 时的既有单序攒批）；空输入空输出。
+#[test]
+fn group_indices_keeps_first_seen_order() {
+    use rumi_translate::docmt::group_indices;
+    let keys: Vec<String> = ["en", "zh", "en", "ja", "zh"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let groups = group_indices(&keys);
+    assert_eq!(groups.len(), 3, "三种键三组");
+    assert_eq!(groups[0], ("en".to_string(), vec![0, 2]), "首组 = 首现键");
+    assert_eq!(groups[1], ("zh".to_string(), vec![1, 4]));
+    assert_eq!(groups[2], ("ja".to_string(), vec![3]));
+    // 全同键：单组保序（固定 from 路径的退化形态）
+    let single = group_indices(&["zh".to_string(), "zh".to_string(), "zh".to_string()]);
+    assert_eq!(single, vec![("zh".to_string(), vec![0, 1, 2])]);
+    assert!(group_indices(&[]).is_empty());
+}
+
+/// auto 全链路（零模型零网络）：英文 .md（含标题）from="auto" to="en"——
+/// 块级检测（parse_document 开 lang_detect_per_block）得 eng→映射 "en"，
+/// 与目标语言相同的单元走单元粒度直通原样；过短块（"Ok." < 20 字符）检测
+/// 不出（unit.lang None）→ 译文=原文。两类单元全部预扫定稿、pending 空、
+/// 引擎零接触（Google 仅作哨兵：pending 非空即打网失败）。进度回调走收尾
+/// 一次性 (total, total)，第三参携带标题章节名（① 三参回调的链路验证）。
+#[test]
+fn auto_from_detects_and_passthrough_when_target_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("doc.md");
+    std::fs::write(
+        &input,
+        "# Introduction to Rust Programming\n\n\
+         Rust is a systems programming language focused on safety, speed and concurrency.\n\n\
+         Ok.\n",
+    )
+    .unwrap();
+    let out = dir.path().join("doc.bilingual.md");
+    let calls: Arc<Mutex<Vec<(usize, usize, Option<String>)>>> = Arc::default();
+    let sink = calls.clone();
+    let opts = DocTranslateOptions {
+        engine: Engine::Google, // 哨兵：pending 非空即打网失败
+        from: "auto".into(),
+        to: "en".into(), // 与检测语言一致：全部单元直通
+        strategy: BiStrategy::Inline,
+        polish: false,
+        min_chars: 2,
+        on_progress: Some(Arc::new(move |done, total, chapter| {
+            sink.lock()
+                .unwrap()
+                .push((done, total, chapter.map(str::to_string)));
+        })),
+        use_cache: false,
+        glossary: Glossary::default(),
+        ocr_engine: None,
+    };
+    let stats = docmt::translate_document(&input, &out, &opts).unwrap();
+    assert_eq!(stats.units, 3, "标题 + 段落 + 短块都进单元");
+    assert_eq!(stats.cache_hits, 0, "直通路径不经过缓存");
+    // Inline：三个单元全部"译文=原文"（直通 / 检测不出）；Heading 译文
+    // 保持同级标题（docforge translation_md）
+    let md = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        md.contains(
+            "# Introduction to Rust Programming\n# Introduction to Rust Programming"
+        ),
+        "标题单元应原样直通（译文保持同级标题）：\n{md}"
+    );
+    assert!(
+        md.contains("Rust is a systems programming language focused on safety, speed and concurrency.\n\
+                     Rust is a systems programming language focused on safety, speed and concurrency."),
+        "长英文段应原样直通（检测 eng→en==to）：\n{md}"
+    );
+    assert!(md.contains("Ok.\nOk."), "过短块检测不出应原样（译文=原文）：\n{md}");
+    // 预扫全分流：仅收尾回调一次 (3, 3)，章节名 = 标题文本（其后单元的
+    // unit.chapter；docforge emit：Heading 块自身也携带本标题）
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![(3, 3, Some("Introduction to Rust Programming".to_string()))],
+        "收尾回调应携带章节名（三参回调链路）"
+    );
 }
 
 // ---------- 术语表（glossary 规格 §6）：from==to 直通 + 精确命中 ----------
