@@ -265,6 +265,9 @@ fn doc_cmd(input: &str, args: &Args) {
         use_cache: true,
         // 术语表 v1 走设置页（UI）维护；CLI 不带 glossary 参数（空表=不干预）
         glossary: rumi_translate::glossary::Glossary::default(),
+        // 扫描 PDF OCR 注入 v1 不做（translate crate 不依赖 rumi-ocr，CLI
+        // 短命进程不装配适配器）——扫描页 PDF 维持既有报错文案
+        ocr_engine: None,
         on_progress: Some(std::sync::Arc::new(|done, total| {
             eprintln!("已翻译 {done}/{total} 单元");
         })),

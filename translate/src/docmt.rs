@@ -1,9 +1,11 @@
 //! 文档翻译：docforge 解析 → 翻译单元 → 引擎翻译 → 双语 Markdown 回写。
 //!
 //! v1 链路（doc-translate-spec §2）：任意 docforge 支持格式进、双语 Markdown
-//! 出；docx/epub 回写上游到位后只加出口不改链路。解析不注入 OCR 引擎——
-//! 扫描页 PDF 由 pdf 后端预检报错，本层转译为面向用户的行动指引（见
-//! [`translate_parse_error`]）。
+//! 出；docx/epub 回写上游到位后只加出口不改链路。解析默认不注入 OCR 引擎
+//! ——扫描页 PDF 由 pdf 后端预检报错，本层转译为面向用户的行动指引（见
+//! [`translate_parse_error`]）；`DocTranslateOptions.ocr_engine` 注入引擎后
+//! 扫描页走 OCR→翻译同一管线（类型是 docforge 的 trait 对象，本 crate 不
+//! 依赖 rumi-ocr，由上层装配适配器）。
 
 use std::path::Path;
 
@@ -76,6 +78,13 @@ pub struct DocTranslateOptions {
     /// [`translate_document`] 判定链）；OpenAI 兼容引擎另把整表注入
     /// system prompt。默认空表，全链路照旧。
     pub glossary: crate::glossary::Glossary,
+    /// 扫描页 PDF 的 OCR 引擎注入：Some 时填给 pdf 后端 `PdfOptions.engine`
+    /// （Auto 逐页判定——文字层页直提、扫描页渲染后走该引擎；非 pdf 格式
+    /// 不消费）。None 维持 v1 语义：扫描页预检报错，转译为行动指引（见
+    /// [`translate_parse_error`]）。类型是 docforge 的 trait 对象，本 crate
+    /// 不依赖 rumi-ocr：上层（ui）用 `rumi_ocr::RumiOcrAdapter` 包装全局
+    /// 引擎再注入，避免模型双重加载。
+    pub ocr_engine: Option<std::sync::Arc<dyn docforge::ocr::OcrEngine>>,
 }
 
 /// 文档翻译统计。
@@ -135,7 +144,7 @@ pub fn translate_document(
     if !input.is_file() {
         return Err(format!("文件不存在：{}", input.display()));
     }
-    let doc = parse_document(input)?;
+    let doc = parse_document(input, opts.ocr_engine.clone())?;
     let units = docforge::emit::to_translation_units_with(&doc, opts.min_chars);
     if units.is_empty() {
         return Err("文档无可翻译文本单元（空文件或全为非文本块）".to_string());
@@ -516,11 +525,15 @@ fn page_alternating_markdown(doc: &docforge::Document, translated: &[(String, St
 }
 
 /// docforge 解析（文档翻译场景装配）：文本族内置 + docx/epub/pdf（feature
-/// 随本 crate 依赖声明启用）。pdf 显式 `PdfOptions{mode: Auto, engine: None}`
-/// ——与 docforge 默认装配同款（发布版不内置引擎），写出以固定 v1 契约：
-/// 纯文字层 PDF 正常直提；扫描页由 pdf 后端预检报错（无引擎时 Auto 不产
-/// 空页而是 Err，见 [`translate_parse_error`]）。
-fn parse_document(input: &Path) -> Result<docforge::Document, String> {
+/// 随本 crate 依赖声明启用）。pdf 显式 `PdfOptions{mode: Auto}`，engine 取
+/// `ocr`（None 与 docforge 默认装配同款——发布版不内置引擎；Some 为扫描页
+/// 识别注入，非 pdf 格式不消费）。写出以固定契约：纯文字层 PDF 正常直提；
+/// 扫描页无引擎时预检报错（Auto 不产空页而是 Err，见
+/// [`translate_parse_error`]），有引擎则渲染识别后进同一翻译管线。
+fn parse_document(
+    input: &Path,
+    ocr: Option<std::sync::Arc<dyn docforge::ocr::OcrEngine>>,
+) -> Result<docforge::Document, String> {
     let path = input
         .to_str()
         .ok_or_else(|| format!("路径非 UTF-8，无法解析：{}", input.display()))?;
@@ -532,7 +545,7 @@ fn parse_document(input: &Path) -> Result<docforge::Document, String> {
         &mut registry,
         docforge::backends::pdf::PdfOptions {
             mode: docforge::backends::pdf::OcrMode::Auto,
-            engine: None,
+            engine: ocr,
             ..Default::default()
         },
     );
@@ -541,8 +554,9 @@ fn parse_document(input: &Path) -> Result<docforge::Document, String> {
         .map_err(translate_parse_error)
 }
 
-/// docforge 解析错误 → 面向用户的中文文案。扫描页无引擎是 v1 已知边界：
-/// pdf 后端预检（先于任何页产出）报 "第 N 页需 OCR 引擎：…"，转译为行动指引。
+/// docforge 解析错误 → 面向用户的中文文案。扫描页无引擎（ocr_engine=None
+/// 的默认装配）时 pdf 后端预检（先于任何页产出）报 "第 N 页需 OCR 引擎：…"，
+/// 转译为行动指引；注入引擎后该文案不再出现（扫描页正常识别进翻译）。
 fn translate_parse_error(e: docforge::DocError) -> String {
     if e.message.contains("需 OCR 引擎") {
         "含扫描页且未注入 OCR 引擎（v1 暂不支持扫描 PDF 翻译，请转图片批量 OCR）".to_string()

@@ -26,6 +26,7 @@ fn opts(from: &str, to: &str) -> DocTranslateOptions {
         on_progress: None,
         use_cache: false,
         glossary: Glossary::default(),
+        ocr_engine: None,
     }
 }
 

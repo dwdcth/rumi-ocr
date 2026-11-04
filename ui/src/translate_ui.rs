@@ -321,6 +321,14 @@ enum DocOutcome {
     Failed(String),
 }
 
+/// 文档翻译的 OCR 引擎装配（扫描 PDF 进文档翻译）：rumi 全局引擎包成
+/// docforge trait 对象（translate crate 不依赖 rumi-ocr，注入由本层组装）。
+/// 独立纯函数——start_doc_translate 的装配藏在对话框闭包里不便直测，
+/// 这里单测装配语义（global() 懒构建，装配不触发模型下载）。
+fn doc_ocr_engine() -> std::sync::Arc<rumi_ocr::RumiOcrAdapter> {
+    std::sync::Arc::new(rumi_ocr::RumiOcrAdapter::new(rumi_ocr::OcrEngine::global()))
+}
+
 /// 翻译整个文档（规格 K §5）：rfd 选文件与保存对话框必须在 std 线程（Linux
 /// GTK 同步对话框死锁主线程，开发经验 §三；模式照抄 start_import），两对话框
 /// 与 translate_document 重活合并进同一后台线程（选中→保存→翻译一气呵成）；
@@ -388,6 +396,10 @@ fn start_doc_translate(
             use_cache: true,
             // 术语表：设置页文本域解析（精确命中固定译法 + OpenAI prompt 注入）
             glossary: rumi_translate::glossary::Glossary::parse(&st.glossary),
+            // 扫描 PDF 进文档翻译：全局引擎包成 docforge trait 对象注入
+            // （pdf 后端 Auto 逐页判定，扫描页渲染后走同一引擎，避免模型双载；
+            // 纯文字层 PDF 不触发模型下载）
+            ocr_engine: Some(doc_ocr_engine()),
             on_progress: Some(std::sync::Arc::new(move |done, total| {
                 let _ = sink.unbounded_send((done, total));
             })),
@@ -1643,6 +1655,19 @@ mod tests {
                 assert_ne!(i18n::ts(lang, key), key, "{lang} 缺词：{key}");
             }
         }
+    }
+
+    /// OCR 注入装配（扫描 PDF 进文档翻译）纯函数：global() 懒构建——装配
+    /// 不触发模型下载（纯文字层 PDF 零识别成本的前提）；每次调用返回独立
+    /// Arc（docforge `PdfOptions.engine` 按次持有，两次装配互不共享）。
+    #[test]
+    fn doc_ocr_engine_assembly_lazy_and_independent() {
+        let a = doc_ocr_engine();
+        assert_eq!(std::sync::Arc::strong_count(&a), 1, "新装配的 Arc 应无其他持有者");
+        let b = doc_ocr_engine();
+        assert_eq!(std::sync::Arc::strong_count(&a), 1, "两次装配互不共享");
+        drop(a);
+        drop(b);
     }
 }
 

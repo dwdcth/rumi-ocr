@@ -419,6 +419,8 @@ async fn api_translate_doc(body: Bytes) -> Response {
                 min_chars: 2,
                 use_cache: true,
                 glossary: rumi_translate::glossary::Glossary::default(),
+                // 扫描 PDF OCR 注入 server v1 不做（不装配 rumi-ocr）——扫描页 PDF 维持既有报错文案
+                ocr_engine: None,
                 on_progress: None,
             },
         )

@@ -31,6 +31,11 @@ pub mod qr;
 pub mod pdf_route;
 pub mod dual_pdf;
 
+// 扫描 PDF 进文档翻译的引擎适配器（pdf_route 内部装配同款）：translate
+// crate 不依赖 rumi-ocr，上层（ui）经此把全局引擎包成 docforge trait 对象
+// 注入 docmt 选项——`RumiOcrAdapter::new(OcrEngine::global())`
+pub use pdf_route::RumiOcrAdapter;
+
 /// 单行识别结果（统一中间格式，M2 的插件输出将来也转这个）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OcrLine {

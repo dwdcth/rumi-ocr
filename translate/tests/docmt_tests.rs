@@ -136,6 +136,7 @@ fn missing_file_errors_before_parse() {
         on_progress: None,
         use_cache: false,
         glossary: Glossary::default(),
+        ocr_engine: None,
     };
     let err = docmt::translate_document(&input, &out, &opts).unwrap_err();
     assert!(err.contains("文件不存在"), "实际：{err}");
@@ -160,6 +161,7 @@ fn empty_units_errors() {
         on_progress: None,
         use_cache: false,
         glossary: Glossary::default(),
+        ocr_engine: None,
     };
     let err = docmt::translate_document(&input, &out, &opts).unwrap_err();
     assert!(err.contains("文档无可翻译文本单元"), "实际：{err}");
@@ -187,6 +189,7 @@ fn full_pipeline_from_eq_to_passes_through() {
         })),
         use_cache: false,
         glossary: Glossary::default(),
+        ocr_engine: None,
     };
     let stats = docmt::translate_document(&input, &out, &opts).unwrap();
     assert_eq!(stats.units, 2);
@@ -236,6 +239,7 @@ fn e2e_doc_translate_txt_en_zh() {
             on_progress: None,
             use_cache: false,
             glossary: Glossary::default(),
+            ocr_engine: None,
         },
     )
     .unwrap();
@@ -311,6 +315,7 @@ fn docx_writeback_dispatch_roundtrip() {
             on_progress: None,
             use_cache: false,
             glossary: Glossary::default(),
+            ocr_engine: None,
         },
     )
     .unwrap();
@@ -345,6 +350,7 @@ fn unsupported_output_extension_errors() {
             on_progress: None,
             use_cache: false,
             glossary: Glossary::default(),
+            ocr_engine: None,
         },
     )
     .unwrap_err();
@@ -373,6 +379,7 @@ fn txt_writeback_dispatch_roundtrip() {
             on_progress: None,
             use_cache: false,
             glossary: Glossary::default(),
+            ocr_engine: None,
         },
     )
     .unwrap();
@@ -403,6 +410,7 @@ fn page_alt_falls_back_with_note_for_pageless_format() {
             on_progress: None,
             use_cache: false,
             glossary: Glossary::default(),
+            ocr_engine: None,
         },
     )
     .unwrap();
@@ -454,6 +462,7 @@ fn cache_hit_e2e_second_run_all_hits() {
         on_progress: None,
         use_cache: true,
         glossary: Glossary::default(),
+        ocr_engine: None,
     };
     let out1 = dir.path().join("first.md");
     let first = docmt::translate_document(&input, &out1, &opts).unwrap();
@@ -503,6 +512,7 @@ fn prescan_drains_all_units_without_engine_touch() {
         })),
         use_cache: false,
         glossary: Glossary::parse("thread pool = 线程池"),
+        ocr_engine: None,
     };
     let stats = docmt::translate_document(&input, &out, &opts).unwrap();
     assert_eq!(stats.units, 3);
@@ -541,6 +551,7 @@ fn glossary_exact_hit_beats_from_eq_to_passthrough() {
         on_progress: None,
         use_cache: false,
         glossary: Glossary::parse("thread pool = 线程池"),
+        ocr_engine: None,
     };
     let stats = docmt::translate_document(&input, &out, &opts).unwrap();
     assert_eq!(stats.units, 2);
@@ -556,4 +567,66 @@ fn glossary_exact_hit_beats_from_eq_to_passthrough() {
         md.contains("另一段普通正文。\n另一段普通正文。"),
         "非术语单元应原样直通：\n{md}"
     );
+}
+
+// ---------- 扫描 PDF 与 OCR 注入（ocr_engine，v2 起） ----------
+
+/// 伪造扫描页 JPEG：只有 SOF 头（oxidize-pdf 的 from_jpeg_data 只解析头取
+/// 宽高，不校验熵数据）。1920×1080 ≥ pdf-inspector 模板图门槛（50 万像素，
+/// detector.rs TEMPLATE_IMAGE_THRESHOLD）→ 该页判为扫描页。
+fn fake_scan_jpeg() -> Vec<u8> {
+    vec![
+        0xFF, 0xD8, // SOI
+        0xFF, 0xC0, // SOF0
+        0x00, 0x0B, // 段长 11
+        0x08, // 精度 8 bit
+        0x04, 0x38, // 高 1080
+        0x07, 0x80, // 宽 1920
+        0x01, // 分量数 1（DeviceGray）
+        0xFF, 0xD9, // EOI
+    ]
+}
+
+/// 生成单页"扫描"PDF：整页大图 + 零文字算子（docforge 分类判扫描页）。
+/// translate 测试无 image 依赖，图数据不参与分类（pdf-inspector 只读
+/// XObject 的宽高声明），伪 JPEG 头即可。
+fn build_scan_pdf(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("scan.pdf");
+    let mut doc = oxidize_pdf::Document::new();
+    let mut page = oxidize_pdf::Page::a4();
+    let img = oxidize_pdf::Image::from_jpeg_data(fake_scan_jpeg()).expect("伪 JPEG 头应可解析");
+    page.add_image("scan", img);
+    page.draw_image("scan", 40.0, 40.0, 515.0, 762.0)
+        .expect("整页图绘制失败");
+    doc.add_page(page);
+    doc.save(&path).expect("样例保存失败");
+    path
+}
+
+/// ocr_engine: None 维持 v1 既有语义：扫描页 PDF 预检报错，错误转译为
+/// 行动指引文案（字段默认值不改任何既有行为——None 即旧装配）。样例页
+/// 无文字层，若分类/预检失效会变成"无可翻译单元"之类错误，断言即捕获。
+#[test]
+fn scan_pdf_without_ocr_engine_keeps_v1_error_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = build_scan_pdf(dir.path());
+    let out = dir.path().join("out.bilingual.md");
+    let opts = DocTranslateOptions {
+        engine: Engine::Offline,
+        from: "en".into(),
+        to: "zh".into(),
+        strategy: BiStrategy::Inline,
+        polish: false,
+        min_chars: 2,
+        on_progress: None,
+        use_cache: false,
+        glossary: Glossary::default(),
+        ocr_engine: None,
+    };
+    let err = docmt::translate_document(&input, &out, &opts).unwrap_err();
+    assert!(
+        err.contains("含扫描页且未注入 OCR 引擎"),
+        "扫描页无引擎应转译为行动指引：{err}"
+    );
+    assert!(!out.exists(), "失败不应产出文件");
 }

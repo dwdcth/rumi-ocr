@@ -57,8 +57,21 @@ pub enum PdfPage {
 /// rumi 引擎 → docforge OcrEngine 适配器（零拷贝：image 0.25 同实例，
 /// `&RgbaImage` 直通不复制）。engine 为 `&'static`（见 [`RouteOptions`] 注），
 /// 才能满足 `PdfOptions.engine = Arc<dyn OcrEngine>` 的 'static 对象约束。
-struct RumiOcrAdapter {
+///
+/// 公开于 crate 根（lib.rs re-export）：translate crate 不依赖 rumi-ocr
+/// （保持轻依赖），扫描 PDF 进文档翻译的引擎注入由同时依赖两者的上层
+/// （ui）装配——`RumiOcrAdapter::new(OcrEngine::global())` 包成 trait
+/// 对象填进 docmt 的 `DocTranslateOptions.ocr_engine`。
+pub struct RumiOcrAdapter {
     engine: &'static crate::OcrEngine,
+}
+
+impl RumiOcrAdapter {
+    /// 包装全局引擎。global() 懒构建：纯文字层 PDF 不触发模型下载
+    /// （与 [`crate::OcrEngine::global`] 同一语义）。
+    pub fn new(engine: &'static crate::OcrEngine) -> Self {
+        Self { engine }
+    }
 }
 
 impl DocforgeOcrEngine for RumiOcrAdapter {
