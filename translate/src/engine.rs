@@ -12,6 +12,8 @@
 //!   即 intra_threads（0 = CT2 自行决定）。
 //! - CT2 对空序列会报错，翻译前必须滤掉空白段；行结构按 `segment::segment_lines`
 //!   严格还原（行数与输入一致）。
+//! - translate_texts 把多条文本的非空段合成一次 CT2 批（大文档攒批提速，
+//!   CT2 吞吐在 batch）；单条 translate 即长度为 1 的批，同一内核。
 
 use crate::{registry, Compute};
 use std::collections::HashMap;
@@ -165,25 +167,71 @@ impl OfflineEngine {
 
     /// 翻译一段文本。from == to 直接原样返回；不加载模型时返回
     /// [`EngineError::ModelNotInstalled`] / [`EngineError::NoBuiltinModel`]。
+    /// 内部 = 长度为 1 的批量（[`OfflineEngine::translate_texts`] 同一内核：
+    /// 分句 → CT2 批 → 行切回 → strip），单条行为与旧实现逐字一致。
     pub fn translate(&self, text: &str, from: &str, to: &str) -> Result<String, EngineError> {
         if from == to {
             return Ok(text.to_string());
         }
+        let mut out = self.translate_texts(&[text.to_string()], from, to)?;
+        Ok(out.pop().unwrap_or_default())
+    }
+
+    /// 批量翻译多条文本（大文档攒批入口）：每条独立走 segment_lines 分句，
+    /// 全部非空段合成一个大 CT2 批（translate_batch / NLLB 的
+    /// translate_batch_with_target_prefix 同款），结果按各条的段数切回，
+    /// 每条独立行重排 + strip_sp_marker。单条内部行为与 translate() 完全
+    /// 一致（同一模型只加载一次）。
+    pub fn translate_texts(
+        &self,
+        texts: &[String],
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, EngineError> {
+        if from == to {
+            return Ok(texts.to_vec());
+        }
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 每条独立分句（外层=文本，中层=行，内层=段；空白行以空段占位保留
+        // 行结构），全部非空段合成一次 CT2 批——CT2 的吞吐单位是 batch，
+        // 逐条 batch(1) 是大文档翻译的主要吞吐浪费点
+        let structures: Vec<Vec<Vec<String>>> = texts
+            .iter()
+            .map(|t| crate::segment::segment_lines(t))
+            .collect();
+        let refs: Vec<&[Vec<String>]> = structures.iter().map(|s| s.as_slice()).collect();
+        self.translate_segments(&refs, texts, from, to)
+    }
+
+    /// 批量内核（translate / translate_texts 共用）：收集全部非空段 → 一次
+    /// CT2 批（NLLB 家族带同款 Flores-200 target prefix）→ 按行结构切回重排
+    /// （[`split_batch_results`] 纯函数）。from == to 与空输入在调用方
+    /// （translate / translate_texts）已短路；零内容文本原样直通见纯函数。
+    fn translate_segments(
+        &self,
+        structures: &[&[Vec<String>]],
+        originals: &[String],
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, EngineError> {
         let loaded = self.load(from, to)?;
-        let lines = crate::segment::segment_lines(text);
-        // 收集全部非空段（CT2 对空序列报错；空白行不入批，重排时空行原样保留）
+        // 收集全部非空段（CT2 对空序列报错；空白段不入批，切回时空白原样保留）
         let mut sources: Vec<String> = Vec::new();
-        for line in &lines {
-            for seg in line {
-                if !seg.trim().is_empty() {
-                    sources.push(seg.clone());
+        for structure in structures {
+            for line in structure.iter() {
+                for seg in line {
+                    if !seg.trim().is_empty() {
+                        sources.push(seg.clone());
+                    }
                 }
             }
         }
         if sources.is_empty() {
-            // 整篇空白：没有可翻译内容，原样返回
+            // 整批空白：没有可翻译内容，逐条原样返回
             self.touch(&loaded);
-            return Ok(text.to_string());
+            return Ok(originals.to_vec());
         }
         let results = if loaded.nllb {
             // NLLB 家族：每段带同一目标语言码（Flores-200）前缀——模型本体
@@ -201,27 +249,9 @@ impl OfflineEngine {
                 .translate_batch(&sources, &Default::default(), None)
                 .map_err(|e| EngineError::Infer(e.to_string()))?
         };
-        // 行内段以空串 join（段边界不留分隔符——中文无空格；拉丁语系用单空格），
-        // 行间以 \n join，行数与输入严格一致
-        let seg_sep = if to == "zh" { "" } else { " " };
-        let mut results = results.into_iter();
-        let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
-        for line in &lines {
-            let mut parts: Vec<String> = Vec::with_capacity(line.len());
-            for seg in line {
-                if seg.trim().is_empty() {
-                    parts.push(String::new());
-                } else {
-                    parts.push(results.next().map(|(t, _)| t).unwrap_or_default());
-                }
-            }
-            out_lines.push(parts.join(seg_sep));
-        }
+        let out = split_batch_results(structures, originals, &results, to);
         self.touch(&loaded);
-        // 引擎出口统一清理 SentencePiece ▁(U+2581) 标记（ct2rs 反解不处理句首等
-        // 位置，任何方向译文都可能带出）——CLI/server 直调本方法也能受益；
-        // facade 层的 strip 与此幂等重复无害
-        Ok(crate::strip_sp_marker(&out_lines.join("\n")))
+        Ok(out)
     }
 
     /// 按需加载（内部持锁）。锁只护 map：模型加载是重活，在锁外进行，
@@ -591,6 +621,49 @@ fn is_idle(loaded_at: Instant, last_used: Instant, idle: Duration, now: Instant)
     now.duration_since(loaded_at) > idle && now.duration_since(last_used) > idle
 }
 
+/// 批结果按各文本的行结构切分重排（纯逻辑，无 CT2/模型耦合，单测直测）：
+/// `structures[i]` 是第 i 条文本的 segment_lines 行结构（外层=行，内层=段，
+/// 空白行/空白段以空串占位）；`originals` 与外层对齐，供零内容文本原样
+/// 直通；`results` 是整批 CT2 译文（与各文本全部非空段按序一一对应）。
+/// 返回与外层一一对应的成品文本：非空段按序消费批结果（不足段数以空串
+/// 兜底——CT2 正常不缺项，与旧单条路径 unwrap_or_default 同语义）、空白段
+/// 还原空串、行内段以 seg_sep join（to=="zh" 无分隔符——中文无空格；拉丁
+/// 语系用单空格）、行间 \n join、行数与输入严格一致；出口统一清理
+/// SentencePiece ▁(U+2581) 标记（ct2rs 反解不处理句首等位置，任何方向译文
+/// 都可能带出；直通文本未过模型，原样返回不 strip——空白原文的首尾空白
+/// 不该被行结构 join 吃掉，与旧单条路径一致）。
+fn split_batch_results(
+    structures: &[&[Vec<String>]],
+    originals: &[String],
+    results: &[(String, Option<f32>)],
+    to: &str,
+) -> Vec<String> {
+    let seg_sep = if to == "zh" { "" } else { " " };
+    let mut next = results.iter();
+    let mut out = Vec::with_capacity(structures.len());
+    for (structure, original) in structures.iter().zip(originals) {
+        // 零内容文本（全段空白）：原样直通，不消费批结果
+        if !structure.iter().flatten().any(|seg| !seg.trim().is_empty()) {
+            out.push(original.clone());
+            continue;
+        }
+        let mut out_lines: Vec<String> = Vec::with_capacity(structure.len());
+        for line in structure.iter() {
+            let mut parts: Vec<String> = Vec::with_capacity(line.len());
+            for seg in line {
+                if seg.trim().is_empty() {
+                    parts.push(String::new());
+                } else {
+                    parts.push(next.next().map(|(t, _)| t.clone()).unwrap_or_default());
+                }
+            }
+            out_lines.push(parts.join(seg_sep));
+        }
+        out.push(crate::strip_sp_marker(&out_lines.join("\n")));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,6 +886,116 @@ mod tests {
         let eng = OfflineEngine::new(dir.path().to_path_buf(), Compute::Int8);
         assert_eq!(eng.translate("hello world", "en", "en").unwrap(), "hello world");
         assert_eq!(eng.translate("", "zh", "zh").unwrap(), "");
+    }
+
+    // ---------- translate_texts 批量内核：切分纯函数（均匀/不均/空文本混入） ----------
+
+    /// 单行构造器：段列表 → 行结构的一行。
+    fn line(segs: &[&str]) -> Vec<String> {
+        segs.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn batch_result(text: &str) -> (String, Option<f32>) {
+        (text.to_string(), None)
+    }
+
+    /// 均匀：各条段数一致，批结果按序等分切回，一条不多拿。
+    #[test]
+    fn split_batch_results_uniform() {
+        let t0 = vec![line(&["A."])];
+        let t1 = vec![line(&["B."])];
+        let t2 = vec![line(&["C."])];
+        let structures = vec![&t0[..], &t1[..], &t2[..]];
+        let originals = ["A.".to_string(), "B.".to_string(), "C.".to_string()];
+        let results = [batch_result("a"), batch_result("b"), batch_result("c")];
+        assert_eq!(
+            split_batch_results(&structures, &originals, &results, "en"),
+            ["a", "b", "c"]
+        );
+    }
+
+    /// 不均：各条段数不同（2/1），批结果按各条非空段数顺序切分，行内段
+    /// 以单空格 join（非 zh 目标）。
+    #[test]
+    fn split_batch_results_uneven() {
+        let t0 = vec![line(&["First.", "Second."])];
+        let t1 = vec![line(&["Third."])];
+        let structures = vec![&t0[..], &t1[..]];
+        let originals = ["First. Second.".to_string(), "Third.".to_string()];
+        let results = [batch_result("x"), batch_result("y"), batch_result("z")];
+        assert_eq!(
+            split_batch_results(&structures, &originals, &results, "en"),
+            ["x y", "z"]
+        );
+    }
+
+    /// 空文本混入：零内容文本原样直通（原文逐字保真，含空白），不消费
+    /// 批结果；全空批不吃任何批结果。
+    #[test]
+    fn split_batch_results_empty_and_blank_mixed() {
+        // 空串 + 空白原文 + 正常文本：前两条直通，第三条吃唯一批结果
+        let s0 = vec![line(&[""])];
+        let s1 = vec![line(&["   "])];
+        let s2 = vec![line(&["D."])];
+        let structures = vec![&s0[..], &s1[..], &s2[..]];
+        let originals = ["".to_string(), "   ".to_string(), "D.".to_string()];
+        let results = [batch_result("d")];
+        assert_eq!(
+            split_batch_results(&structures, &originals, &results, "en"),
+            ["", "   ", "d"]
+        );
+        // 全空批：results 为空，全部原样直通
+        let structures2 = vec![&s0[..], &s1[..]];
+        let originals2 = ["".to_string(), "   ".to_string()];
+        assert_eq!(split_batch_results(&structures2, &originals2, &[], "en"), ["", "   "]);
+    }
+
+    /// zh 目标：行内段无分隔符 join + ▁ 清理；多行文本空白行还原（行数与
+    /// 输入严格一致）。
+    #[test]
+    fn split_batch_results_zh_seg_sep_and_blank_lines() {
+        // zh：两段同行无分隔符直连；结果带 ▁ → strip 还原空格
+        let s0 = vec![line(&["你。", "好。"])];
+        let structures = vec![&s0[..]];
+        let originals = ["你。好。".to_string()];
+        let results = [batch_result("▁你。"), batch_result("好。")];
+        assert_eq!(
+            split_batch_results(&structures, &originals, &results, "zh"),
+            ["你。好。"]
+        );
+        // 多行：空白行还原空行，行间 \n join
+        let s1 = vec![line(&["A."]), line(&[""]), line(&["B."])];
+        let structures2 = vec![&s1[..]];
+        let originals2 = ["A.\n\nB.".to_string()];
+        let results2 = [batch_result("a"), batch_result("b")];
+        assert_eq!(
+            split_batch_results(&structures2, &originals2, &results2, "en"),
+            ["a\n\nb"]
+        );
+    }
+
+    /// translate_texts 与 translate 同款直通/错误面：from == to 逐条原样
+    /// （不加载模型）；模型缺失时报错与单条路径逐字一致（委托同内核的
+    /// 回归闸门）。
+    #[test]
+    fn translate_texts_passthrough_and_missing_model_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = OfflineEngine::new(dir.path().to_path_buf(), Compute::Int8);
+        // from == to：逐条原样直通（含空串/空白）
+        let texts = vec!["hello".to_string(), String::new(), "  ".to_string()];
+        assert_eq!(eng.translate_texts(&texts, "en", "en").unwrap(), texts);
+        // 空输入：空返回
+        assert_eq!(
+            eng.translate_texts(&[], "en", "zh").unwrap(),
+            Vec::<String>::new()
+        );
+        // 模型缺失：与单条 translate 同文案（同一 load 路径）
+        let e1 = eng.translate("hello", "en", "zh").unwrap_err();
+        let e2 = eng
+            .translate_texts(&["hello".to_string()], "en", "zh")
+            .unwrap_err();
+        assert_eq!(e1.to_string(), e2.to_string());
+        assert!(e1.to_string().contains("语言包未安装"));
     }
 
     #[test]

@@ -112,14 +112,18 @@ const UNITS_PER_BATCH: usize = 16;
 /// docx/epub 回写由 docforge `writeback::*` 重解析原文件对齐 id 锚点
 /// （与本函数提取侧同口径），translation 单元 id 不漂移。
 ///
-/// 流程：parse → to_translation_units_with(min_chars) → 逐单元调
-/// [`crate::translate`]（facade 自带 from==to 原样、空串原样、zh 润色与
-/// ▁ 清理；离线引擎内部有 Translator 批缓存，量级可接受）→ 每 16 单元/批
-/// 回调 on_progress → 回写落盘。任一单元失败即整体 Err（"单元 {id} 翻译失败"）。
+/// 流程：parse → to_translation_units_with(min_chars) → 判定链预扫
+/// （防幻觉 → glossary → running memo → 缓存 → from==to 直通，命中的当场
+/// 定稿，未命中记入 pending）→ pending 按 16 条/批攒批送引擎（离线走
+/// [`crate::engine`] 单例的 translate_texts 一次 CT2 批——CT2 吞吐在 batch，
+/// 逐条 batch(1) 是大文档的主要吞吐浪费点；在线保持逐条 [`crate::translate`]）
+/// → 每批完成回调一次 on_progress → 回写落盘。任一单元失败即整体 Err
+/// （"单元 {id} 翻译失败"；CT2 整批 Err 定位到批内首 pending 单元）。
 ///
-/// use_cache=true 时逐单元先查文本 hash 缓存（[`DocCache`]，键=文本+翻译参数，
-/// 命中跳过引擎但进度照常推进），每批边界与收尾各落盘一次——断点续翻
-/// （中断重跑已翻单元全命中）+ 同文本只翻一次（页眉页脚重复文本一石二鸟）。
+/// use_cache=true 时预扫先查文本 hash 缓存（[`DocCache`]，键=文本+翻译参数，
+/// 命中跳过引擎但进度照常推进），批内新译文写缓存并在每批边界与收尾各
+/// 落盘一次——断点续翻（中断重跑已翻单元全命中）+ 同文本只翻一次
+/// （页眉页脚重复文本一石二鸟）。
 pub fn translate_document(
     input: &Path,
     out: &Path,
@@ -181,22 +185,40 @@ pub fn translate_document(
     let mut running_memo: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut running_merged = 0usize;
-    let mut translated: Vec<(String, String)> = Vec::with_capacity(total);
     let mut chars = 0usize;
-    for (done, unit) in units.iter().enumerate() {
-        // 防幻觉过滤（docforge@b5bf9a87 谓词）：220V / -10 to 50 C 这类纯
-        // 数字/单位/短代码文本送引擎只会得到幻觉（实测 "220V 电话"），
-        // 直接原样回填——译文=原文，回写锚点不受影响（也不进缓存）
+    // ---------- 阶段一：判定链预扫（不触引擎、不回调进度） ----------
+    // 逐单元依次判 防幻觉 → glossary 精确命中 → running memo → 缓存 →
+    // from==to 直通，命中的当场定稿；否则记入 pending（单元下标），留待
+    // 阶段二攒批送引擎。两遍结构（预扫 + 批执行）逐位复刻旧单遍逐条流的
+    // 判定链顺序与回填结果——统计口径（cache_hits/glossary_hits/running_merged）
+    // 与输出不变。
+    let mut texts_out: Vec<String> = Vec::with_capacity(total);
+    let mut pending: Vec<usize> = Vec::new();
+    // running 单元的批内去重（文本 → 首个 pending 槽位）：旧逐条流靠"首现
+    // 翻完记 memo"让后续页眉复用同一译文；两阶段流里 memo 要等批执行才填，
+    // 预扫阶段用槽位等价复刻——同文本只进批一次，批内重复单元挂到首现
+    // 槽位取译文（running_merged 口径不变）。
+    let mut pending_slots: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    // 批内重复的 running 文本（单元下标, 首现槽位）——批执行完统一回填
+    let mut batch_refs: Vec<(usize, usize)> = Vec::new();
+    for (idx, unit) in units.iter().enumerate() {
+        chars += unit.text.chars().count();
         let text = if !unit.has_translatable_text() {
+            // 防幻觉过滤（docforge@b5bf9a87 谓词）：220V / -10 to 50 C 这类纯
+            // 数字/单位/短代码文本送引擎只会得到幻觉（实测 "220V 电话"），
+            // 直接原样回填——译文=原文，回写锚点不受影响（也不进缓存）
             unit.text.clone()
         } else if let Some(dst) = glossary.exact_match(&unit.text) {
             // 术语表精确命中（glossary 规格 §3，插在防幻觉之后、缓存之前
             // 的顺序铁律）：固定译法直接回填，跳过 running memo/缓存/引擎
             // 一切成本；也不写缓存——改术语立即生效、不留脏缓存。from==to
-            // 直通（facade 短路在 crate::translate 内部）也晚于本判定。
+            // 直通（旧流 facade 短路）也晚于本判定。
             glossary_hits += 1;
             dst.to_string()
         } else if unit.running && running_memo.contains_key(&unit.text) {
+            // memo 由阶段二批执行填充，预扫时恒空（批内重复由 pending_slots
+            // 去重承担，见上）——分支保留以对齐判定链顺序铁律
             running_merged += 1;
             running_memo.get(&unit.text).unwrap().clone()
         } else if let Some(hit) = cache
@@ -207,39 +229,125 @@ pub fn translate_document(
             // ——进度是"处理进度"不是"翻译成本"
             cache_hits += 1;
             hit
+        } else if passthrough {
+            // from==to 直通（旧流发生在 crate::translate/facade 内部，位于
+            // 缓存之后）：预扫直接定稿——pending 全空、引擎零接触
+            unit.text.clone()
+        } else if unit.running {
+            if let Some(&slot) = pending_slots.get(unit.text.as_str()) {
+                // 批内重复的 running 文本（memo 未填的后续页眉）：挂首现
+                // 槽位，翻完取用——同文本只送批一次
+                running_merged += 1;
+                batch_refs.push((idx, slot));
+                String::new() // 占位，阶段二统一回填
+            } else {
+                pending_slots.insert(unit.text.as_str(), pending.len());
+                pending.push(idx);
+                String::new() // 占位，阶段二回填
+            }
         } else {
-            let t = crate::translate(
-                std::slice::from_ref(&unit.text),
-                &opts.from,
-                &opts.to,
-                &engine,
-                opts.polish,
-            )
-            .map_err(|e| format!("单元 {} 翻译失败：{}", unit.id, e))?
-            .pop()
-            .unwrap_or_default();
-            if let Some(c) = cache.as_mut() {
-                c.insert(&unit.text, &opts.from, &opts.to, &engine, opts.polish, &t);
-                // 断点续翻：每批边界落盘一次（崩溃最多丢一批）
-                if done % UNITS_PER_BATCH == 0 {
-                    c.save();
+            pending.push(idx);
+            String::new() // 占位，阶段二回填
+        };
+        texts_out.push(text);
+    }
+    // ---------- 阶段二：pending 攒批执行 ----------
+    // 每批 16 条（复用 UNITS_PER_BATCH——批边界同时是 save 与进度回调边界，
+    // 断点续翻与节流语义不变）。离线引擎整批走 engine::shared().translate_texts
+    // （一次 CT2 批）；在线引擎保持逐条 crate::translate（provider 自有批量/
+    // 限流语义，不掺和离线批）。
+    if !pending.is_empty() {
+        // 离线批量入口不做方向归一（facade 的 normalize 在其内部做），显式
+        // 传入归一码；缓存键仍用原始码，语义不变
+        let from = crate::lang::normalize(&opts.from);
+        let to = crate::lang::normalize(&opts.to);
+        let prescanned = total - pending.len();
+        for (ci, chunk) in pending.chunks(UNITS_PER_BATCH).enumerate() {
+            let batch: Vec<String> = chunk.iter().map(|&i| units[i].text.clone()).collect();
+            let outs = match &engine {
+                crate::Engine::Offline => {
+                    // 整批 Err（CT2 批调用不区分单条）——错误定位到批内首
+                    // pending 单元，粗粒度可接受（与现状"任一单元失败整体
+                    // Err"一致）
+                    crate::engine::shared()
+                        .translate_texts(&batch, &from, &to)
+                        .map(|mut outs| {
+                            // 与 facade 同款收尾：zh 润色 + ▁ 清理（引擎出口
+                            // 已 strip，此处幂等重复无害）
+                            if opts.polish && to == "zh" {
+                                for t in outs.iter_mut() {
+                                    *t = crate::postfix::polish_zh(t);
+                                }
+                            }
+                            for t in outs.iter_mut() {
+                                *t = crate::strip_sp_marker(t);
+                            }
+                            outs
+                        })
+                        .map_err(|e| format!("单元 {} 翻译失败：{}", units[chunk[0]].id, e))?
+                }
+                _ => {
+                    // 在线逐条：错误定位逐单元（与旧循环逐字一致）
+                    let mut outs = Vec::with_capacity(chunk.len());
+                    for &i in chunk {
+                        let t = crate::translate(
+                            std::slice::from_ref(&units[i].text),
+                            &opts.from,
+                            &opts.to,
+                            &engine,
+                            opts.polish,
+                        )
+                        .map_err(|e| format!("单元 {} 翻译失败：{}", units[i].id, e))?
+                        .pop()
+                        .unwrap_or_default();
+                        outs.push(t);
+                    }
+                    outs
+                }
+            };
+            for (slot_in_chunk, &i) in chunk.iter().enumerate() {
+                texts_out[i] = outs[slot_in_chunk].clone();
+                if let Some(c) = cache.as_mut() {
+                    c.insert(
+                        &units[i].text,
+                        &opts.from,
+                        &opts.to,
+                        &engine,
+                        opts.polish,
+                        &texts_out[i],
+                    );
+                }
+                // running 首现翻完记入 memo（后续同文本页复用；批内重复已在
+                // 预扫挂槽位，不重复进批）
+                if units[i].running {
+                    running_memo.insert(units[i].text.clone(), texts_out[i].clone());
                 }
             }
-            // 首个出现的 running 单元翻完记入 memo（后续同文本页复用）
-            if unit.running {
-                running_memo.insert(unit.text.clone(), t.clone());
+            // 断点续翻：每批边界落盘一次（崩溃最多丢一批）
+            if let Some(c) = cache.as_ref() {
+                c.save();
             }
-            t
-        };
-        chars += unit.text.chars().count();
-        translated.push((unit.id.clone(), text));
-        let done = done + 1;
-        if done % UNITS_PER_BATCH == 0 || done == total {
+            // 进度回调：每批完成一次（done 含预扫已分流单元——进度是"处理
+            // 进度"不是"翻译成本"，粒度从逐条变 16 条一跳，节流语义不变）
+            let done = (prescanned + (ci + 1) * UNITS_PER_BATCH).min(total);
             if let Some(cb) = &opts.on_progress {
                 cb(done, total);
             }
         }
+        // 批内重复 running 文本回填首现槽位译文（预扫挂起的引用）
+        for (dup_idx, slot) in batch_refs.drain(..) {
+            texts_out[dup_idx] = texts_out[pending[slot]].clone();
+        }
+    } else if let Some(cb) = &opts.on_progress {
+        // 全命中（含 from==to 直通）：预扫全分流、pending 空、引擎零接触；
+        // 旧逐条流收尾处也会回调一次 (total, total)
+        cb(total, total);
     }
+    let translated: Vec<(String, String)> = units
+        .iter()
+        .zip(texts_out)
+        .map(|(u, t)| (u.id.clone(), t))
+        .collect();
     // 收尾落盘（全命中时是同内容覆写，幂等无害；缺了这步不满一批的中断前
     // 进度会全丢）
     if let Some(c) = cache.as_ref() {

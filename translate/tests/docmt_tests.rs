@@ -476,6 +476,49 @@ fn cache_hit_e2e_second_run_all_hits() {
     );
 }
 
+// ---------- 判定链预扫 + 攒批（CT2 批量推理优化）：from==to 直通 + 全命中 ----------
+
+/// 预扫全分流回归（不打网不跑模型）：from==to 直通、术语精确命中、防幻觉
+/// 过滤三类判定都应在预扫阶段当场定稿——pending 全空、零引擎接触。引擎选
+/// Google 仅作哨兵（占位不触网）：若回归导致单元漏进 pending，阶段二会真的
+/// 打网而失败；正常路径零网络。进度回调只在收尾到达 (total, total) 一次
+/// （预扫不回调、无批可回）。
+#[test]
+fn prescan_drains_all_units_without_engine_touch() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("doc.txt");
+    std::fs::write(&input, "thread pool\n\n这是一段普通正文。\n\n220V\n").unwrap();
+    let out = dir.path().join("doc.bilingual.md");
+    let calls: Arc<Mutex<Vec<(usize, usize)>>> = Arc::default();
+    let sink = calls.clone();
+    let opts = DocTranslateOptions {
+        engine: Engine::Google, // 哨兵：pending 非空即打网失败
+        from: "en".into(),
+        to: "en".into(), // 直通：非术语单元原样
+        strategy: BiStrategy::Inline,
+        polish: false,
+        min_chars: 2,
+        on_progress: Some(Arc::new(move |done, total| {
+            sink.lock().unwrap().push((done, total));
+        })),
+        use_cache: false,
+        glossary: Glossary::parse("thread pool = 线程池"),
+    };
+    let stats = docmt::translate_document(&input, &out, &opts).unwrap();
+    assert_eq!(stats.units, 3);
+    assert_eq!(stats.glossary_hits, 1, "仅术语单元精确命中");
+    assert_eq!(stats.cache_hits, 0, "直通路径不经过缓存");
+    // 预扫全分流：pending 空 → 无批回调，仅收尾一次 (total, total)
+    assert_eq!(*calls.lock().unwrap(), vec![(3, 3)]);
+    let md = std::fs::read_to_string(&out).unwrap();
+    assert!(md.contains("thread pool\n线程池"), "术语单元回填固定译法：\n{md}");
+    assert!(
+        md.contains("这是一段普通正文。\n这是一段普通正文。"),
+        "直通单元应原样：\n{md}"
+    );
+    assert!(md.contains("220V\n220V"), "防幻觉单元应原样（不进批）：\n{md}");
+}
+
 // ---------- 术语表（glossary 规格 §6）：from==to 直通 + 精确命中 ----------
 
 /// 术语表精确命中端到端（不打网不跑模型）：判定链顺序铁律——glossary 插在
