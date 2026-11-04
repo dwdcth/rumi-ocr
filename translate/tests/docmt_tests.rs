@@ -3,6 +3,8 @@
 //! ——测 rumi 侧组合用法，不重测 docforge 自身）、translate_document 错误
 //! 分支与 from==to 全链路（facade 短路原样，零模型零网络）。
 //! 真模型 E2E 为 #[ignore]（en_zh 已装时才跑）。
+//! 既有构造点全部 use_cache: false——测试不碰用户真实缓存目录
+//! （缓存逻辑单测见 cache_tests.rs，同样走 load_at(tempdir)）。
 
 use std::sync::{Arc, Mutex};
 
@@ -131,6 +133,7 @@ fn missing_file_errors_before_parse() {
         polish: false,
         min_chars: 2,
         on_progress: None,
+        use_cache: false,
     };
     let err = docmt::translate_document(&input, &out, &opts).unwrap_err();
     assert!(err.contains("文件不存在"), "实际：{err}");
@@ -153,6 +156,7 @@ fn empty_units_errors() {
         polish: false,
         min_chars: 2,
         on_progress: None,
+        use_cache: false,
     };
     let err = docmt::translate_document(&input, &out, &opts).unwrap_err();
     assert!(err.contains("文档无可翻译文本单元"), "实际：{err}");
@@ -178,6 +182,7 @@ fn full_pipeline_from_eq_to_passes_through() {
         on_progress: Some(Arc::new(move |done, total| {
             sink.lock().unwrap().push((done, total));
         })),
+        use_cache: false,
     };
     let stats = docmt::translate_document(&input, &out, &opts).unwrap();
     assert_eq!(stats.units, 2);
@@ -225,6 +230,7 @@ fn e2e_doc_translate_txt_en_zh() {
             polish: false,
             min_chars: 2,
             on_progress: None,
+            use_cache: false,
         },
     )
     .unwrap();
@@ -298,6 +304,7 @@ fn docx_writeback_dispatch_roundtrip() {
             polish: false,
             min_chars: 2,
             on_progress: None,
+            use_cache: false,
         },
     )
     .unwrap();
@@ -330,6 +337,7 @@ fn unsupported_output_extension_errors() {
             polish: false,
             min_chars: 2,
             on_progress: None,
+            use_cache: false,
         },
     )
     .unwrap_err();
@@ -356,6 +364,7 @@ fn txt_writeback_dispatch_roundtrip() {
             polish: false,
             min_chars: 2,
             on_progress: None,
+            use_cache: false,
         },
     )
     .unwrap();
@@ -384,6 +393,7 @@ fn page_alt_falls_back_with_note_for_pageless_format() {
             polish: false,
             min_chars: 2,
             on_progress: None,
+            use_cache: false,
         },
     )
     .unwrap();
@@ -398,4 +408,60 @@ fn bi_strategy_parse_includes_page() {
     assert_eq!(BiStrategy::parse("page"), Some(BiStrategy::PageAlt));
     assert_eq!(BiStrategy::parse("pagealt"), Some(BiStrategy::PageAlt));
     assert_eq!(BiStrategy::parse("inline"), Some(BiStrategy::Inline));
+}
+
+// ---------- 缓存命中端到端（use_cache: true，规格 §3 决策：#[ignore] 手动跑） ----------
+
+/// 断点续翻端到端：同一输入连跑两遍，第一遍全引擎（cache_hits=0、缓存落盘），
+/// 第二遍全命中（cache_hits==units，进度照常推进）。需 en_zh 已装且测试进程
+/// 带 RUMI_TRANSLATE_CACHE=<tempdir>（测试禁止触碰用户真实缓存目录，env 未设
+/// 即跳过）：
+/// `RUMI_TRANSLATE_CACHE=/tmp/某临时目录 cargo test -p rumi-translate \
+///  --test docmt_tests cache_hit_e2e -- --ignored --nocapture`
+#[test]
+#[ignore = "手动跑：需 en_zh 模型 + RUMI_TRANSLATE_CACHE=<tempdir>（见测试文档）"]
+fn cache_hit_e2e_second_run_all_hits() {
+    use rumi_translate::{download, registry};
+    let Ok(cache_dir) = std::env::var("RUMI_TRANSLATE_CACHE") else {
+        eprintln!("skip：未设置 RUMI_TRANSLATE_CACHE（不碰用户真实缓存）");
+        return;
+    };
+    let spec = registry::by_key("en_zh").expect("注册表应含 en_zh");
+    if !download::is_complete(spec, &rumi_translate::models_dir()) {
+        eprintln!("skip：en_zh 未安装");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("doc.txt");
+    std::fs::write(&input, "The default port is 8080.\n\nSet the environment variable first.\n")
+        .unwrap();
+    let opts = DocTranslateOptions {
+        engine: Engine::Offline,
+        from: "en".into(),
+        to: "zh".into(),
+        strategy: BiStrategy::Inline,
+        polish: false,
+        min_chars: 2,
+        on_progress: None,
+        use_cache: true,
+    };
+    let out1 = dir.path().join("first.md");
+    let first = docmt::translate_document(&input, &out1, &opts).unwrap();
+    assert_eq!(first.cache_hits, 0, "首翻应零命中");
+    assert!(
+        std::path::Path::new(&cache_dir).is_file(),
+        "首翻后缓存文件应已落盘（含批边界与收尾 save）"
+    );
+    let out2 = dir.path().join("second.md");
+    let second = docmt::translate_document(&input, &out2, &opts).unwrap();
+    assert_eq!(
+        second.cache_hits, second.units,
+        "重跑应全命中（断点续翻：中断重跑零引擎成本）"
+    );
+    assert_eq!(second.units, 2);
+    assert_eq!(
+        std::fs::read_to_string(&out1).unwrap(),
+        std::fs::read_to_string(&out2).unwrap(),
+        "命中路径与引擎路径产出应一致"
+    );
 }

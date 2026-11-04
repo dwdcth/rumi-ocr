@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use crate::cache::DocCache;
+
 /// 双语策略（Inline/Only/Appendix 镜像 docforge::emit::BiStrategy；
 /// PageAlt 为 rumi 层扩展，仅 markdown 输出完整实现）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -66,6 +68,9 @@ pub struct DocTranslateOptions {
     /// 进度回调 (已翻译单元数, 总单元数)；调用方取消语义 v1 不做
     /// （返回 false 中止留 v2）。
     pub on_progress: Option<std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>>,
+    /// 翻译缓存（默认 true）：文本级命中跳过引擎；进度照常推进。
+    /// from==to 的直通路径不经过缓存（无引擎成本，无缓存意义）。
+    pub use_cache: bool,
 }
 
 /// 文档翻译统计。
@@ -79,6 +84,9 @@ pub struct DocStats {
     /// 策略退化说明（如 PageAlt 遇无页概念格式退化为附录时的提示）；
     /// None = 策略按所选完整生效。UI/CLI 在完成态展示。
     pub note: Option<String>,
+    /// 缓存命中单元数（use_cache=false 或 from==to 直通时恒 0）。
+    /// UI/CLI「缓存命中 n/N」展示待后续，字段先记。
+    pub cache_hits: usize,
 }
 
 /// 进度回调节流：每 16 单元回调一次（末批不足也回调），UI 不必逐单元重绘。
@@ -96,6 +104,10 @@ const UNITS_PER_BATCH: usize = 16;
 /// [`crate::translate`]（facade 自带 from==to 原样、空串原样、zh 润色与
 /// ▁ 清理；离线引擎内部有 Translator 批缓存，量级可接受）→ 每 16 单元/批
 /// 回调 on_progress → 回写落盘。任一单元失败即整体 Err（"单元 {id} 翻译失败"）。
+///
+/// use_cache=true 时逐单元先查文本 hash 缓存（[`DocCache`]，键=文本+翻译参数，
+/// 命中跳过引擎但进度照常推进），每批边界与收尾各落盘一次——断点续翻
+/// （中断重跑已翻单元全命中）+ 同文本只翻一次（页眉页脚重复文本一石二鸟）。
 pub fn translate_document(
     input: &Path,
     out: &Path,
@@ -113,16 +125,35 @@ pub fn translate_document(
         return Err("文档无可翻译文本单元（空文件或全为非文本块）".to_string());
     }
     let total = units.len();
+    // 缓存装配：use_cache 开且非 from==to 直通才加载——直通走 facade 短路
+    // 零引擎成本，进缓存无意义（不读不写，也不碰用户缓存目录）。路径用
+    // RUMI_TRANSLATE_CACHE 覆盖缺省数据目录（测试隔离的钩子，见下）。
+    let passthrough = crate::lang::normalize(&opts.from) == crate::lang::normalize(&opts.to);
+    let mut cache = if opts.use_cache && !passthrough {
+        Some(DocCache::load_at(
+            cache_path_override().unwrap_or_else(DocCache::default_path),
+        ))
+    } else {
+        None
+    };
+    let mut cache_hits = 0usize;
     let mut translated: Vec<(String, String)> = Vec::with_capacity(total);
     let mut chars = 0usize;
     for (done, unit) in units.iter().enumerate() {
         // 防幻觉过滤（docforge@b5bf9a87 谓词）：220V / -10 to 50 C 这类纯
         // 数字/单位/短代码文本送引擎只会得到幻觉（实测 "220V 电话"），
-        // 直接原样回填——译文=原文，回写锚点不受影响
+        // 直接原样回填——译文=原文，回写锚点不受影响（也不进缓存）
         let text = if !unit.has_translatable_text() {
             unit.text.clone()
+        } else if let Some(hit) = cache.as_ref().and_then(|c| {
+            c.get(&unit.text, &opts.from, &opts.to, &opts.engine, opts.polish)
+        }) {
+            // 文本级命中（同文本跨单元/跨文档/页眉页脚只翻一次）；进度照常推进
+            // ——进度是"处理进度"不是"翻译成本"
+            cache_hits += 1;
+            hit
         } else {
-            crate::translate(
+            let t = crate::translate(
                 std::slice::from_ref(&unit.text),
                 &opts.from,
                 &opts.to,
@@ -131,7 +162,15 @@ pub fn translate_document(
             )
             .map_err(|e| format!("单元 {} 翻译失败：{}", unit.id, e))?
             .pop()
-            .unwrap_or_default()
+            .unwrap_or_default();
+            if let Some(c) = cache.as_mut() {
+                c.insert(&unit.text, &opts.from, &opts.to, &opts.engine, opts.polish, &t);
+                // 断点续翻：每批边界落盘一次（崩溃最多丢一批）
+                if done % UNITS_PER_BATCH == 0 {
+                    c.save();
+                }
+            }
+            t
         };
         chars += unit.text.chars().count();
         translated.push((unit.id.clone(), text));
@@ -141,6 +180,11 @@ pub fn translate_document(
                 cb(done, total);
             }
         }
+    }
+    // 收尾落盘（全命中时是同内容覆写，幂等无害；缺了这步不满一批的中断前
+    // 进度会全丢）
+    if let Some(c) = cache.as_ref() {
+        c.save();
     }
     // 输出分派（见函数文档）。扩展名小写比较，无扩展名按不支持处理
     // （CLI/UI 的默认输出恒带 .md，走到这里的无扩展名只会是显式误用）
@@ -262,6 +306,7 @@ pub fn translate_document(
         chars,
         elapsed_ms: t0.elapsed().as_millis(),
         note,
+        cache_hits,
     })
 }
 
@@ -327,6 +372,16 @@ fn translate_parse_error(e: docforge::DocError) -> String {
         "含扫描页且未注入 OCR 引擎（v1 暂不支持扫描 PDF 翻译，请转图片批量 OCR）".to_string()
     } else {
         e.to_string()
+    }
+}
+
+/// 缓存路径覆盖：环境变量 RUMI_TRANSLATE_CACHE。运行时读取（测试里不引入
+/// set_var 的 unsafe），未设置/空串返回 None 走 [`DocCache::default_path`]。
+/// 主要供手动验证缓存命中用（集成用例标 #[ignore]，纯逻辑层已覆盖足够）。
+fn cache_path_override() -> Option<std::path::PathBuf> {
+    match std::env::var("RUMI_TRANSLATE_CACHE") {
+        Ok(p) if !p.is_empty() => Some(std::path::PathBuf::from(p)),
+        _ => None,
     }
 }
 

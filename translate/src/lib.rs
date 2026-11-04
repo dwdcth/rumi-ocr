@@ -3,6 +3,7 @@
 //! 设计与选型见 `docs/translate-design.md`；实现规格见 `docs/translate-spec-*.md`。
 //! 全同步 API：UI 沿用「std 线程 + oneshot 回 dioxus spawn」，server 用 spawn_blocking。
 
+pub mod cache;
 pub mod docmt;
 pub mod download;
 pub mod engine;

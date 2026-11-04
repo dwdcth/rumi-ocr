@@ -377,6 +377,7 @@ fn start_doc_translate(
             strategy: doc_strategy_from_layout(&st.doc_layout),
             polish: st.polish,
             min_chars: 2,
+            use_cache: true,
             on_progress: Some(std::sync::Arc::new(move |done, total| {
                 let _ = sink.unbounded_send((done, total));
             })),

@@ -262,6 +262,7 @@ fn doc_cmd(input: &str, args: &Args) {
         strategy,
         polish: !args.no_polish,
         min_chars: 2,
+        use_cache: true,
         on_progress: Some(std::sync::Arc::new(|done, total| {
             eprintln!("已翻译 {done}/{total} 单元");
         })),
@@ -269,9 +270,11 @@ fn doc_cmd(input: &str, args: &Args) {
     match docmt::translate_document(&input_path, &out, &opts) {
         Ok(stats) => {
             println!(
-                "单元 {} · 字符 {} · 耗时 {:.1} s → {}",
+                "单元 {} · 字符 {} · 缓存命中 {}/{} · 耗时 {:.1} s → {}",
                 stats.units,
                 stats.chars,
+                stats.cache_hits,
+                stats.units,
                 stats.elapsed_ms as f64 / 1000.0,
                 out.display()
             );
