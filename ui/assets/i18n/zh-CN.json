@@ -247,5 +247,7 @@
  "settings.translate.layout": "双语布局",
  "settings.translate.layout_inline": "段落对照（一段原文接一段译文）",
  "settings.translate.layout_page": "页面交替（一页原文接一页译文）",
- "settings.translate.layout_only": "仅译文"
+ "settings.translate.layout_only": "仅译文",
+ "settings.translate.glossary": "术语表",
+ "settings.translate.glossary_ph": "一行一条：原文 = 译文（# 开头为注释）"
 }

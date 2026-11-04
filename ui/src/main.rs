@@ -2094,6 +2094,7 @@ fn SettingsPage(
     let mut tr_mirror_argos = use_signal(move || s.translate.mirror_argos.clone());
     let mut tr_mirror_hf = use_signal(move || s.translate.mirror_hf.clone());
     let mut tr_mirror_github = use_signal(move || s.translate.mirror_github.clone());
+    let mut tr_glossary = use_signal(move || s.translate.glossary.clone());
     // 运行日志：查看开关 + 尾部内容镜像
     let mut log_show = use_signal(|| false);
     let mut log_text = use_signal(String::new);
@@ -2683,6 +2684,23 @@ fn SettingsPage(
                             },
                         }
                         span { class: "hint", "{t(translate_ui::tr::SET_MIRROR_PH)}" }
+                    }
+                }
+                // 术语表（glossary 规格 §5）：textarea 多行，onblur 存
+                div { class: "formrow",
+                    label { "{t(translate_ui::tr::SET_GLOSSARY)}" }
+                    div { class: "field",
+                        textarea {
+                            class: "ctl",
+                            style: "height: 6em; resize: vertical; font-family: monospace;",
+                            value: "{tr_glossary()}",
+                            placeholder: "{t(translate_ui::tr::SET_GLOSSARY_PH)}",
+                            oninput: move |e| tr_glossary.set(e.value()),
+                            onblur: move |_| {
+                                let v = tr_glossary();
+                                let _ = settings::update(move |st| { st.translate.glossary = v; Ok(()) });
+                            },
+                        }
                     }
                 }
             }

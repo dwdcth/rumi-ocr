@@ -167,6 +167,9 @@ pub struct TranslateSettings {
     /// 文档翻译双语布局：inline(默认) 段落对照 | page 页面交替 | only 仅译文
     /// （appendix 经 CLI 可达；page 遇无页概念格式自动退化为原文+译文附录）
     pub doc_layout: String,
+    /// 术语表（glossary）：一行一条 `原文 = 译文`，# 注释；文档翻译时
+    /// 精确命中单元直接用固定译法，OpenAI 引擎注入 prompt（v2 再扩文本翻译）
+    pub glossary: String,
     // 下载镜像（空串 = 保留内置默认顺序，见 download::Mirrors::default）
     /// Argos 源 base（默认 https://argos-net.com/v1）
     pub mirror_argos: String,
@@ -192,6 +195,7 @@ impl Default for TranslateSettings {
             last_from: "en".into(),
             last_to: "zh".into(),
             doc_layout: "inline".into(),
+            glossary: String::new(),
             mirror_argos: String::new(),
             mirror_hf: String::new(),
             mirror_github: String::new(),

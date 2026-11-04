@@ -193,6 +193,7 @@ fn engine_tag_online_engines_do_not_cross_hit() {
             base_url: "http://api".into(),
             api_key: "k".into(),
             model: "gpt".into(),
+            glossary: Vec::new(),
         },
         false,
         "gpt",
@@ -223,7 +224,8 @@ fn engine_tag_online_engines_do_not_cross_hit() {
             &Engine::OpenAI {
                 base_url: "http://api".into(),
                 api_key: "k".into(),
-                model: "other".into()
+                model: "other".into(),
+                glossary: Vec::new(),
             },
             false
         ),

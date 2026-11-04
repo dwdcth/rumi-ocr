@@ -239,28 +239,28 @@ fn deeplx_parse_bad_inputs() {
 
 #[test]
 fn openai_build_url_join_and_base_url() {
-    let spec = openai::build_with_names(&["a", "b"], "中文", "English", "http://127.0.0.1:11434/v1", "", "m1");
+    let spec = openai::build_with_names(&["a", "b"], "中文", "English", "http://127.0.0.1:11434/v1", "", "m1", &[]);
     assert_eq!(spec.url, "http://127.0.0.1:11434/v1/chat/completions");
 
     // base_url 尾部斜杠被清理。
-    let spec = openai::build_with_names(&["a"], "中文", "English", "http://x/v1/", "", "m1");
+    let spec = openai::build_with_names(&["a"], "中文", "English", "http://x/v1/", "", "m1", &[]);
     assert_eq!(spec.url, "http://x/v1/chat/completions");
 }
 
 #[test]
 fn openai_build_auth_header_only_with_key() {
     // key 为空（本地 ollama 类无鉴权）：不传 Authorization。
-    let no_key = openai::build_with_names(&["a"], "中文", "English", "http://x/v1", "", "m");
+    let no_key = openai::build_with_names(&["a"], "中文", "English", "http://x/v1", "", "m", &[]);
     assert_eq!(header(&no_key, "Authorization"), None);
     assert_eq!(header(&no_key, "Content-Type"), Some("application/json"));
 
-    let with_key = openai::build_with_names(&["a"], "中文", "English", "http://x/v1", "sk-test", "m");
+    let with_key = openai::build_with_names(&["a"], "中文", "English", "http://x/v1", "sk-test", "m", &[]);
     assert_eq!(header(&with_key, "Authorization"), Some("Bearer sk-test"));
 }
 
 #[test]
 fn openai_build_body_prompt_and_join() {
-    let spec = openai::build_with_names(&["a", "b"], "中文", "English", "http://x/v1", "", "m1");
+    let spec = openai::build_with_names(&["a", "b"], "中文", "English", "http://x/v1", "", "m1", &[]);
     let v = body_json(&spec);
     assert_eq!(v["model"], "m1");
     assert_eq!(v["temperature"], 0.0);
@@ -277,7 +277,7 @@ fn openai_build_body_prompt_and_join() {
 
 #[test]
 fn openai_build_default_model_when_empty() {
-    let spec = openai::build_with_names(&["a"], "中文", "English", "http://x/v1", "", "");
+    let spec = openai::build_with_names(&["a"], "中文", "English", "http://x/v1", "", "", &[]);
     assert_eq!(body_json(&spec)["model"], "gpt-4o-mini");
 }
 
@@ -324,7 +324,7 @@ fn dispatch_empty_texts_ok_empty_for_all_engines() {
         OnlineEngine::Microsoft,
         OnlineEngine::DeepL { api_key: "k".into(), pro: false },
         OnlineEngine::DeepLX { url: "http://127.0.0.1:1188/translate".into() },
-        OnlineEngine::OpenAI { base_url: "http://x/v1".into(), api_key: String::new(), model: String::new() },
+        OnlineEngine::OpenAI { base_url: "http://x/v1".into(), api_key: String::new(), model: String::new(), glossary: Vec::new() },
     ] {
         let out = translate_online(&[], "zh", "en", &engine).expect("空 texts 应返回 Ok");
         assert!(out.is_empty());
@@ -356,8 +356,27 @@ fn engine_labels() {
         rumi_translate::online::engine_label(&OnlineEngine::OpenAI {
             base_url: String::new(),
             api_key: String::new(),
-            model: String::new()
+            model: String::new(),
+            glossary: Vec::new(),
         }),
         "OpenAI 兼容"
+    );
+}
+
+/// 术语表注入（glossary 规格 §4）：非空时 system 末尾拼 prompt_block；
+/// 空表不拼（既有 body/prompt/join 断言传 &[]，system 原样，天然覆盖）。
+#[test]
+fn openai_build_appends_glossary_prompt_block() {
+    let g = vec![("thread pool".to_string(), "线程池".to_string())];
+    let spec = openai::build_with_names(&["a"], "中文", "English", "http://x/v1", "", "m1", &g);
+    let v = body_json(&spec);
+    let sys = v["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        sys.starts_with("You are a translation engine. Translate the user text from 中文 to English."),
+        "注入段应拼在系统提示词末尾：{sys}"
+    );
+    assert!(
+        sys.contains("\n\n术语表（翻译时必须遵循以下固定译法）：\n- thread pool → 线程池\n"),
+        "system 应含规格写死的术语段：{sys}"
     );
 }

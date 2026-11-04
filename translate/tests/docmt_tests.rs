@@ -9,6 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use rumi_translate::docmt::{self, BiStrategy, DocTranslateOptions};
+use rumi_translate::glossary::Glossary;
 use rumi_translate::Engine;
 
 /// 手搓两页文档：各一块 Paragraph（无页名 → 锚点口径 p{页序}-b{块序}）。
@@ -134,6 +135,7 @@ fn missing_file_errors_before_parse() {
         min_chars: 2,
         on_progress: None,
         use_cache: false,
+        glossary: Glossary::default(),
     };
     let err = docmt::translate_document(&input, &out, &opts).unwrap_err();
     assert!(err.contains("文件不存在"), "实际：{err}");
@@ -157,6 +159,7 @@ fn empty_units_errors() {
         min_chars: 2,
         on_progress: None,
         use_cache: false,
+        glossary: Glossary::default(),
     };
     let err = docmt::translate_document(&input, &out, &opts).unwrap_err();
     assert!(err.contains("文档无可翻译文本单元"), "实际：{err}");
@@ -183,6 +186,7 @@ fn full_pipeline_from_eq_to_passes_through() {
             sink.lock().unwrap().push((done, total));
         })),
         use_cache: false,
+        glossary: Glossary::default(),
     };
     let stats = docmt::translate_document(&input, &out, &opts).unwrap();
     assert_eq!(stats.units, 2);
@@ -231,6 +235,7 @@ fn e2e_doc_translate_txt_en_zh() {
             min_chars: 2,
             on_progress: None,
             use_cache: false,
+            glossary: Glossary::default(),
         },
     )
     .unwrap();
@@ -305,6 +310,7 @@ fn docx_writeback_dispatch_roundtrip() {
             min_chars: 2,
             on_progress: None,
             use_cache: false,
+            glossary: Glossary::default(),
         },
     )
     .unwrap();
@@ -338,6 +344,7 @@ fn unsupported_output_extension_errors() {
             min_chars: 2,
             on_progress: None,
             use_cache: false,
+            glossary: Glossary::default(),
         },
     )
     .unwrap_err();
@@ -365,6 +372,7 @@ fn txt_writeback_dispatch_roundtrip() {
             min_chars: 2,
             on_progress: None,
             use_cache: false,
+            glossary: Glossary::default(),
         },
     )
     .unwrap();
@@ -394,6 +402,7 @@ fn page_alt_falls_back_with_note_for_pageless_format() {
             min_chars: 2,
             on_progress: None,
             use_cache: false,
+            glossary: Glossary::default(),
         },
     )
     .unwrap();
@@ -444,6 +453,7 @@ fn cache_hit_e2e_second_run_all_hits() {
         min_chars: 2,
         on_progress: None,
         use_cache: true,
+        glossary: Glossary::default(),
     };
     let out1 = dir.path().join("first.md");
     let first = docmt::translate_document(&input, &out1, &opts).unwrap();
@@ -463,5 +473,44 @@ fn cache_hit_e2e_second_run_all_hits() {
         std::fs::read_to_string(&out1).unwrap(),
         std::fs::read_to_string(&out2).unwrap(),
         "命中路径与引擎路径产出应一致"
+    );
+}
+
+// ---------- 术语表（glossary 规格 §6）：from==to 直通 + 精确命中 ----------
+
+/// 术语表精确命中端到端（不打网不跑模型）：判定链顺序铁律——glossary 插在
+/// 防幻觉之后、running memo/缓存/引擎之前。from==to 的直通短路发生在
+/// crate::translate（facade）内部，晚于本判定：术语单元照样回填固定译法
+/// （glossary_hits==1），非术语单元原样直通；直通路径不经过缓存。
+#[test]
+fn glossary_exact_hit_beats_from_eq_to_passthrough() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("doc.txt");
+    std::fs::write(&input, "thread pool\n\n另一段普通正文。\n").unwrap();
+    let out = dir.path().join("doc.bilingual.md");
+    let opts = DocTranslateOptions {
+        engine: Engine::Offline, // from==to 短路，shared() 不会被触达
+        from: "zh".into(),
+        to: "zh".into(),
+        strategy: BiStrategy::Inline,
+        polish: false,
+        min_chars: 2,
+        on_progress: None,
+        use_cache: false,
+        glossary: Glossary::parse("thread pool = 线程池"),
+    };
+    let stats = docmt::translate_document(&input, &out, &opts).unwrap();
+    assert_eq!(stats.units, 2);
+    assert_eq!(stats.glossary_hits, 1, "仅术语单元应精确命中");
+    assert_eq!(stats.cache_hits, 0, "直通路径不经过缓存");
+    let md = std::fs::read_to_string(&out).unwrap();
+    // Inline 形态：命中单元 = 原文 + 固定译文；未命中单元 = 原样直通
+    assert!(
+        md.contains("thread pool\n线程池"),
+        "术语单元应回填固定译法：\n{md}"
+    );
+    assert!(
+        md.contains("另一段普通正文。\n另一段普通正文。"),
+        "非术语单元应原样直通：\n{md}"
     );
 }

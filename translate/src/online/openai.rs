@@ -16,6 +16,32 @@ fn system_prompt(from_name: &str, to_name: &str) -> String {
     )
 }
 
+/// 系统提示词 + 术语表注入段（glossary 规格 §4）：末尾拼 prompt_block 的
+/// 规格写死格式——复用 [`crate::glossary::Glossary::prompt_block`] 避免两处
+/// 格式漂移；空术语表原样返回（零开销）。
+fn system_prompt_with_glossary(
+    from_name: &str,
+    to_name: &str,
+    glossary: &[(String, String)],
+) -> String {
+    let mut prompt = system_prompt(from_name, to_name);
+    if !glossary.is_empty() {
+        // 引擎链路里术语表是 (原文, 译文) 对（Engine 枚举不带自定义类型），
+        // 这里回装成 Glossary 复用统一的 prompt_block 渲染
+        let g = crate::glossary::Glossary {
+            terms: glossary
+                .iter()
+                .map(|(src, dst)| crate::glossary::GlossaryTerm {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                })
+                .collect(),
+        };
+        prompt.push_str(&g.prompt_block());
+    }
+    prompt
+}
+
 /// 构建请求的实质逻辑（入参已是展示名）。
 ///
 /// 独立出来并 pub 是为了单测绕开 `crate::lang::display`——工人 A 并行实现中该函数
@@ -28,6 +54,7 @@ pub fn build_with_names(
     base_url: &str,
     api_key: &str,
     model: &str,
+    glossary: &[(String, String)],
 ) -> RequestSpec {
     // base_url 已含 /v1 由用户负责，这里只做尾部斜杠清理后拼路径。
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -38,7 +65,7 @@ pub fn build_with_names(
         "messages": [
             {
                 "role": "system",
-                "content": system_prompt(from_name, to_name),
+                "content": system_prompt_with_glossary(from_name, to_name, glossary),
             },
             {
                 "role": "user",
@@ -69,6 +96,7 @@ pub fn build(
     base_url: &str,
     api_key: &str,
     model: &str,
+    glossary: &[(String, String)],
 ) -> RequestSpec {
     build_with_names(
         texts,
@@ -77,6 +105,7 @@ pub fn build(
         base_url,
         api_key,
         model,
+        glossary,
     )
 }
 
@@ -115,8 +144,9 @@ pub fn translate(
     base_url: &str,
     api_key: &str,
     model: &str,
+    glossary: &[(String, String)],
 ) -> Result<Vec<String>, String> {
-    let spec = build(texts, from, to, base_url, api_key, model);
+    let spec = build(texts, from, to, base_url, api_key, model, glossary);
     let body = super::send(&spec).map_err(|e| format!("openai: {e}"))?;
     parse(&body, texts.len()).map_err(|e| format!("openai: {e}"))
 }

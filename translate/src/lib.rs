@@ -8,6 +8,7 @@ pub mod cache;
 pub mod docmt;
 pub mod download;
 pub mod engine;
+pub mod glossary;
 pub mod lang;
 pub mod online;
 pub mod postfix;
@@ -59,6 +60,11 @@ pub enum Engine {
         base_url: String,
         api_key: String,
         model: String,
+        /// 术语表 (原文, 译文) 对（glossary 规格 §4）：随请求注入 openai 的
+        /// system prompt——只有 OpenAI 兼容引擎有 prompt 通道；其余构造点
+        /// （文本翻译页/CLI/server）恒 `vec![]`，docmt 在文档翻译 opts 带
+        /// 非空术语表时克隆本枚举填入。
+        glossary: Vec<(String, String)>,
     },
 }
 
@@ -109,10 +115,12 @@ pub fn translate(
                     base_url,
                     api_key,
                     model,
+                    glossary,
                 } => online::OnlineEngine::OpenAI {
                     base_url: base_url.clone(),
                     api_key: api_key.clone(),
                     model: model.clone(),
+                    glossary: glossary.clone(),
                 },
                 Engine::Offline => unreachable!(),
             };

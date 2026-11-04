@@ -155,10 +155,14 @@ pub(crate) fn engine_tag(e: &crate::Engine) -> String {
             format!("deepl:{}", hash8(&format!("{api_key}:{pro}")))
         }
         crate::Engine::DeepLX { url } => format!("deeplx:{}", hash8(url)),
+        // glossary 字段不进 tag（glossary 规格 §3/§4 的 v1 取舍）：术语精确
+        // 命中发生在缓存查询之前、不产生缓存读写；prompt 注入只影响其余
+        // 单元的译文语境。tag 改动会让全部既有 openai 缓存条目失效，故保守不动。
         crate::Engine::OpenAI {
             base_url,
             api_key,
             model,
+            ..
         } => format!("openai:{base_url}{model}{}", hash8(api_key)),
     }
 }

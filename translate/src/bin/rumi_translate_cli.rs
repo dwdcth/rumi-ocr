@@ -263,6 +263,8 @@ fn doc_cmd(input: &str, args: &Args) {
         polish: !args.no_polish,
         min_chars: 2,
         use_cache: true,
+        // 术语表 v1 走设置页（UI）维护；CLI 不带 glossary 参数（空表=不干预）
+        glossary: rumi_translate::glossary::Glossary::default(),
         on_progress: Some(std::sync::Arc::new(|done, total| {
             eprintln!("已翻译 {done}/{total} 单元");
         })),
@@ -310,6 +312,8 @@ fn build_engine(args: &Args) -> Option<Engine> {
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             api_key: args.api_key.clone().unwrap_or_default(),
             model: args.model.clone(),
+            // 术语表 v1 经设置文件维护；CLI 不带 glossary 参数（空=不注入）
+            glossary: Vec::new(),
         }),
         other => {
             eprintln!("未知引擎：{other}（可选 offline/google/microsoft/deepl/deeplx/openai）");

@@ -71,6 +71,11 @@ pub struct DocTranslateOptions {
     /// 翻译缓存（默认 true）：文本级命中跳过引擎；进度照常推进。
     /// from==to 的直通路径不经过缓存（无引擎成本，无缓存意义）。
     pub use_cache: bool,
+    /// 术语表（glossary 规格 §3）：单元文本精确命中 → 直接回填固定译法，
+    /// 跳过 running memo/缓存/引擎一切成本（插在防幻觉之后，见
+    /// [`translate_document`] 判定链）；OpenAI 兼容引擎另把整表注入
+    /// system prompt。默认空表，全链路照旧。
+    pub glossary: crate::glossary::Glossary,
 }
 
 /// 文档翻译统计。
@@ -90,6 +95,8 @@ pub struct DocStats {
     /// 跨页重复（页眉/页脚类，docforge running-detect 标记）单元被合并
     /// 复用的次数——同文本只翻一次，后续页复用译文（锚点不缺位）。
     pub running_merged: usize,
+    /// 术语表精确命中单元数（命中即固定译法、零引擎成本；glossary 规格 §3）。
+    pub glossary_hits: usize,
 }
 
 /// 进度回调节流：每 16 单元回调一次（末批不足也回调），UI 不必逐单元重绘。
@@ -142,6 +149,31 @@ pub fn translate_document(
         None
     };
     let mut cache_hits = 0usize;
+    // OpenAI 兼容引擎才有 prompt 注入通道（glossary 规格 §4）：术语表非空时
+    // 克隆引擎枚举填入 (原文, 译文) 对——循环外一次性，避免逐单元克隆；
+    // google/microsoft/deepl 无 prompt 通道不注入（精确匹配已覆盖关键场景），
+    // 术语表为空直接用原引擎（行为与改动前完全一致）。
+    let engine = match &opts.engine {
+        crate::Engine::OpenAI {
+            base_url,
+            api_key,
+            model,
+            ..
+        } if !opts.glossary.is_empty() => crate::Engine::OpenAI {
+            base_url: base_url.clone(),
+            api_key: api_key.clone(),
+            model: model.clone(),
+            glossary: opts
+                .glossary
+                .terms
+                .iter()
+                .map(|t| (t.src.clone(), t.dst.clone()))
+                .collect(),
+        },
+        _ => opts.engine.clone(),
+    };
+    let glossary = &opts.glossary;
+    let mut glossary_hits = 0usize;
     // 跨页重复（页眉/页脚类）单元的文本 → 译文 memo（docforge running-detect
     // 标记，d24c61f0 起）：同文本只送引擎一次，后续页复用——每页锚点都有
     // 译文（回写/附录不缺位），页眉不再翻 N 遍灌满附录。与文本 hash 缓存
@@ -157,12 +189,20 @@ pub fn translate_document(
         // 直接原样回填——译文=原文，回写锚点不受影响（也不进缓存）
         let text = if !unit.has_translatable_text() {
             unit.text.clone()
+        } else if let Some(dst) = glossary.exact_match(&unit.text) {
+            // 术语表精确命中（glossary 规格 §3，插在防幻觉之后、缓存之前
+            // 的顺序铁律）：固定译法直接回填，跳过 running memo/缓存/引擎
+            // 一切成本；也不写缓存——改术语立即生效、不留脏缓存。from==to
+            // 直通（facade 短路在 crate::translate 内部）也晚于本判定。
+            glossary_hits += 1;
+            dst.to_string()
         } else if unit.running && running_memo.contains_key(&unit.text) {
             running_merged += 1;
             running_memo.get(&unit.text).unwrap().clone()
-        } else if let Some(hit) = cache.as_ref().and_then(|c| {
-            c.get(&unit.text, &opts.from, &opts.to, &opts.engine, opts.polish)
-        }) {
+        } else if let Some(hit) = cache
+            .as_ref()
+            .and_then(|c| c.get(&unit.text, &opts.from, &opts.to, &engine, opts.polish))
+        {
             // 文本级命中（同文本跨单元/跨文档/页眉页脚只翻一次）；进度照常推进
             // ——进度是"处理进度"不是"翻译成本"
             cache_hits += 1;
@@ -172,14 +212,14 @@ pub fn translate_document(
                 std::slice::from_ref(&unit.text),
                 &opts.from,
                 &opts.to,
-                &opts.engine,
+                &engine,
                 opts.polish,
             )
             .map_err(|e| format!("单元 {} 翻译失败：{}", unit.id, e))?
             .pop()
             .unwrap_or_default();
             if let Some(c) = cache.as_mut() {
-                c.insert(&unit.text, &opts.from, &opts.to, &opts.engine, opts.polish, &t);
+                c.insert(&unit.text, &opts.from, &opts.to, &engine, opts.polish, &t);
                 // 断点续翻：每批边界落盘一次（崩溃最多丢一批）
                 if done % UNITS_PER_BATCH == 0 {
                     c.save();
@@ -334,6 +374,7 @@ pub fn translate_document(
         note,
         cache_hits,
         running_merged,
+        glossary_hits,
     })
 }
 

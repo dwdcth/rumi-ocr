@@ -247,5 +247,7 @@
  "settings.translate.layout": "Bilingual layout",
  "settings.translate.layout_inline": "Interleaved (paragraph by paragraph)",
  "settings.translate.layout_page": "Page alternating (page by page)",
- "settings.translate.layout_only": "Translation only"
+ "settings.translate.layout_only": "Translation only",
+ "settings.translate.glossary": "Glossary",
+ "settings.translate.glossary_ph": "One per line: source = translation (# for comments)"
 }

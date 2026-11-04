@@ -32,6 +32,8 @@ pub enum OnlineEngine {
         base_url: String,
         api_key: String,
         model: String,
+        /// 术语表 (原文, 译文) 对（glossary 规格 §4）：非空时注入 system prompt。
+        glossary: Vec<(String, String)>,
     },
 }
 
@@ -69,7 +71,8 @@ pub fn translate_online(
             base_url,
             api_key,
             model,
-        } => openai::translate(texts, from, to, base_url, api_key, model),
+            glossary,
+        } => openai::translate(texts, from, to, base_url, api_key, model, glossary),
     }
 }
 

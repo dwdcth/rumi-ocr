@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use rumi_translate::docmt::{translate_document, BiStrategy, DocTranslateOptions};
+use rumi_translate::glossary::Glossary;
 use rumi_translate::Engine;
 
 /// from==to 直通选项（facade 短路原样返回，引擎与缓存都不触达——
@@ -24,6 +25,7 @@ fn opts(from: &str, to: &str) -> DocTranslateOptions {
         min_chars: 2,
         on_progress: None,
         use_cache: false,
+        glossary: Glossary::default(),
     }
 }
 

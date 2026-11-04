@@ -251,6 +251,8 @@ fn parse_engine(name: &str, p: &TranslateBody) -> Option<rumi_translate::Engine>
             base_url: p.openai_base_url.clone().unwrap_or_default(),
             api_key: p.openai_api_key.clone().unwrap_or_default(),
             model: p.openai_model.clone().unwrap_or_default(),
+            // 术语表 v1 为 UI 设置面功能；HTTP 请求体不带 glossary（空=不注入）
+            glossary: Vec::new(),
         }),
         _ => None,
     }

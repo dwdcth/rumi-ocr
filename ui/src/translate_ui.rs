@@ -117,6 +117,8 @@ pub(crate) mod tr {
     pub const SET_MIRROR_HF: &str = "settings.translate.mirror_hf";
     pub const SET_MIRROR_GITHUB: &str = "settings.translate.mirror_github";
     pub const SET_MIRROR_PH: &str = "settings.translate.mirror_ph";
+    pub const SET_GLOSSARY: &str = "settings.translate.glossary";
+    pub const SET_GLOSSARY_PH: &str = "settings.translate.glossary_ph";
     // 规格外补充词条（沿用现有 *thread_lost 文案风格；回报已注明）
     pub const THREAD_LOST: &str = "translate.thread_lost";
     pub const MODELS_THREAD_LOST: &str = "translate.models.thread_lost";
@@ -165,6 +167,12 @@ pub(crate) fn engine_from_settings(st: &TranslateSettings) -> Engine {
             base_url: st.openai_base_url.clone(),
             api_key: st.openai_api_key.clone(),
             model: st.openai_model.clone(),
+            // 术语表注入（glossary 规格 §4：设置页文本域 → prompt 段）
+            glossary: rumi_translate::glossary::Glossary::parse(&st.glossary)
+                .terms
+                .into_iter()
+                .map(|t| (t.src, t.dst))
+                .collect(),
         },
         // offline 及任何未知串：离线恒可用，是最安全的回退
         _ => Engine::Offline,
@@ -378,6 +386,8 @@ fn start_doc_translate(
             polish: st.polish,
             min_chars: 2,
             use_cache: true,
+            // 术语表：设置页文本域解析（精确命中固定译法 + OpenAI prompt 注入）
+            glossary: rumi_translate::glossary::Glossary::parse(&st.glossary),
             on_progress: Some(std::sync::Arc::new(move |done, total| {
                 let _ = sink.unbounded_send((done, total));
             })),
@@ -1429,10 +1439,12 @@ mod tests {
             ..Default::default()
         };
         match engine_from_settings(&o) {
-            Engine::OpenAI { base_url, api_key, model } => {
+            Engine::OpenAI { base_url, api_key, model, glossary } => {
                 assert_eq!(base_url, "http://127.0.0.1:8000/v1");
                 assert_eq!(api_key, "sk");
                 assert_eq!(model, "qwen");
+                // 默认设置无术语表 → 引擎带空表（不注入 prompt）
+                assert!(glossary.is_empty(), "空设置应构造空术语表");
             }
             other => panic!("OpenAI 映射错误：{other:?}"),
         }
