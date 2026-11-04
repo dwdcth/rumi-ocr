@@ -328,7 +328,7 @@ fn unsupported_output_extension_errors() {
     std::fs::write(&input, "Hello world paragraph.").unwrap();
     let err = docmt::translate_document(
         &input,
-        &dir.path().join("out.bilingual.pdf"),
+        &dir.path().join("out.bilingual.xyz"),
         &DocTranslateOptions {
             engine: Engine::Offline,
             from: "en".into(),

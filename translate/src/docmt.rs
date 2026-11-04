@@ -96,7 +96,9 @@ const UNITS_PER_BATCH: usize = 16;
 ///
 /// **输出格式按 out 扩展名分派**（大小写不敏感）：`.md`/`.markdown` → 双语
 /// Markdown；`.docx` → docforge 定位改写回写（保原样式/资源，仅动正文 XML，
-/// 原件为 docx）；`.epub` → epub 回写（原件为 epub）。其他扩展名 Err。
+/// 原件为 docx）；`.epub` → epub 回写（原件为 epub）；`.pdf` → 双语对照
+/// PDF（纯生成式，任何输入格式可出，见 [`crate::bilingual_pdf`]）。
+/// 其他扩展名 Err。
 /// docx/epub 回写由 docforge `writeback::*` 重解析原文件对齐 id 锚点
 /// （与本函数提取侧同口径），translation 单元 id 不漂移。
 ///
@@ -212,7 +214,9 @@ pub fn translate_document(
     // PageAlt 的格式支持面：markdown 页级交替（docforge@6a1e183 起）、
     // epub 部件交替（b5bf9a87 起，spine 插译文部件）、docx 节交替
     // （9eb3d98d 起，按原文档分节/分页符边界"原文节→分页→译文节"，
-    // Word 无真页下的最佳近似）；其余无页概念格式仍退化为附录
+    // Word 无真页下的最佳近似）、pdf 按源页分组对照（bilingual_pdf 天然
+    // 就是"原文引用 + 译文"的页节形态，无退化可言）；其余无页概念格式
+    // 仍退化为附录
     let epub_alt = opts.strategy == BiStrategy::PageAlt
         && ext == "epub"
         && in_ext == "epub";
@@ -220,7 +224,7 @@ pub fn translate_document(
         && ext == "docx"
         && in_ext == "docx";
     let note = if opts.strategy == BiStrategy::PageAlt
-        && !matches!(ext.as_str(), "md" | "markdown")
+        && !matches!(ext.as_str(), "md" | "markdown" | "pdf")
         && !epub_alt
         && !docx_alt
     {
@@ -295,9 +299,14 @@ pub fn translate_document(
             out,
         )
         .map_err(|e| format!("odt 回写失败：{e}"))?,
+        // 双语对照 PDF（纯生成式，任何输入格式可出——不进 needs_same_input）
+        "pdf" => {
+            crate::bilingual_pdf::export_bilingual_pdf(&units, &translated, out)
+                .map_err(|e| format!("双语 PDF 导出失败：{e}"))?;
+        }
         other => {
             return Err(format!(
-                "不支持的输出格式 .{other}（可选 .md / .docx / .epub / .txt / .html / .fb2 / .odt）"
+                "不支持的输出格式 .{other}（可选 .md / .docx / .epub / .txt / .html / .fb2 / .odt / .pdf）"
             ))
         }
     }

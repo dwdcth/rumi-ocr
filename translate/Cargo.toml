@@ -48,6 +48,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # lang-detect=源语言检测（TranslationUnit.lang，v2 自动检测用），
 # docx/epub/pdf=主流文档格式。
 docforge = { git = "https://github.com/dwdcth/docforge", features = ["encoding", "lang-detect", "docx", "epub", "pdf", "fb2", "odt"] }
+# 双语对照 PDF 出口（bilingual_pdf）：与 ocr crate 同版本同源。字体嵌入
+# 经验（TTC 剥离重建 sfnt + Type0）从 ocr/dual_pdf.rs 复制进本 crate，
+# 刻意不加 translate→ocr 依赖保持轻依赖
+oxidize-pdf = "5"
 
 [dev-dependencies]
 tempfile = "3"
