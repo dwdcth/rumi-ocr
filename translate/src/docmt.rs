@@ -165,23 +165,34 @@ pub fn translate_document(
             "输出 .{ext} 需要同格式输入（当前输入 .{in_ext}）；跨格式请输出 .md"
         ));
     }
-    // PageAlt 的格式支持面（docforge@b5bf9a87 起）：markdown 页级交替、
-    // epub 部件交替（真·一页原文一页译文，spine 插译文部件）；
-    // docx/odt 等无页概念格式仍退化为原文全文+译文附录
+    // PageAlt 的格式支持面：markdown 页级交替（docforge@6a1e183 起）、
+    // epub 部件交替（b5bf9a87 起，spine 插译文部件）、docx 节交替
+    // （9eb3d98d 起，按原文档分节/分页符边界"原文节→分页→译文节"，
+    // Word 无真页下的最佳近似）；其余无页概念格式仍退化为附录
     let epub_alt = opts.strategy == BiStrategy::PageAlt
         && ext == "epub"
         && in_ext == "epub";
+    let docx_alt = opts.strategy == BiStrategy::PageAlt
+        && ext == "docx"
+        && in_ext == "docx";
     let note = if opts.strategy == BiStrategy::PageAlt
         && !matches!(ext.as_str(), "md" | "markdown")
         && !epub_alt
+        && !docx_alt
     {
         Some(format!(
-            ".{ext} 无固定页概念（Word 渲染时才分页），已按「原文全文 + 译文附录」输出"
+            ".{ext} 无固定页概念，已按「原文全文 + 译文附录」输出"
         ))
     } else {
         None
     };
     match ext.as_str() {
+        "docx" if docx_alt => docforge::writeback::writeback_docx_alternating(
+            input,
+            &translated,
+            out,
+        )
+        .map_err(|e| format!("docx 节交替回写失败：{e}"))?,
         "epub" if epub_alt => docforge::writeback::writeback_epub_alternating(
             input,
             &translated,
