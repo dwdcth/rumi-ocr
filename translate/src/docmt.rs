@@ -9,6 +9,8 @@
 
 use std::path::Path;
 
+use docforge::writeback::stream::{WritebackFormat, WritebackSession};
+
 use crate::cache::DocCache;
 
 /// 双语策略（Inline/Only/Appendix 镜像 docforge::emit::BiStrategy；
@@ -53,6 +55,23 @@ impl From<BiStrategy> for docforge::emit::BiStrategy {
                 docforge::emit::BiStrategy::OriginalPlusAppendix
             }
         }
+    }
+}
+
+/// 输出扩展名 → 流式回写会话格式（docforge stream::WritebackFormat；htm 与
+/// html 同义）。None = 该扩展名不走会话（.md/.markdown 是 rumi 侧 Document
+/// 渲染、.pdf 是 bilingual_pdf 生成式、未知扩展名直接报错——session 均不适用）。
+/// 返回 Some 的扩展名同时也是「保原格式回写要求同格式输入」的判定面（两份
+/// 名单本是同一语义，共用一份避免漂移）。
+fn session_writeback_format(ext: &str) -> Option<WritebackFormat> {
+    match ext {
+        "docx" => Some(WritebackFormat::Docx),
+        "epub" => Some(WritebackFormat::Epub),
+        "txt" => Some(WritebackFormat::Txt),
+        "html" | "htm" => Some(WritebackFormat::Html),
+        "fb2" => Some(WritebackFormat::Fb2),
+        "odt" => Some(WritebackFormat::Odt),
+        _ => None,
     }
 }
 
@@ -192,6 +211,17 @@ const UNITS_PER_BATCH: usize = 16;
 /// → 每批完成回调一次 on_progress → 回写落盘。任一单元失败即整体 Err
 /// （"单元 {id} 翻译失败"；CT2 整批 Err 定位到批内首 pending 单元）。
 ///
+/// 回写分派（超大文档内存优化，docforge@35a1d99e 流式会话）：默认策略
+/// （Inline/Only/Appendix）+ 保格式输出（.docx/.epub/.txt/.html/.htm/.fb2/
+/// .odt——本来就要求同格式输入，session 语义完全匹配）走
+/// [`WritebackSession`] 流式回写——译文产出点（预扫命中 / 每批完成）即
+/// push 直落 spill 磁盘（零 RAM 驻留），判定链+批全部完成后 finish 一次性
+/// 打包（与对应全量 writeback_* 同解析器/策略/忽略口径，仅译文喂入从
+/// 一次性全集变流式），翻译期间不再驻留全量译文 Vec。PageAlt（md/epub/
+/// docx 交替与退化附录）与 .md/.pdf 输出维持全量 translated 路径。任一
+/// new/push/finish 失败整体 Err（"回写会话失败：{e}"）；中途失败 spill
+/// 临时文件随会话 Drop 兜底删除（docforge 侧自管，无需手动清理）。
+///
 /// use_cache=true 时预扫先查文本 hash 缓存（[`DocCache`]，键=文本+翻译参数，
 /// 命中跳过引擎但进度照常推进），批内新译文写缓存并在每批边界与收尾各
 /// 落盘一次——断点续翻（中断重跑已翻单元全命中）+ 同文本只翻一次
@@ -272,13 +302,56 @@ pub fn translate_document(
         std::collections::HashMap::new();
     let mut running_merged = 0usize;
     let mut chars = 0usize;
+    // 输出/输入扩展名（小写比较；无扩展名按不支持处理——CLI/UI 的默认输出
+    // 恒带 .md，走到这里的无扩展名只会是显式误用）。提前到判定链之前：回写
+    // 会话判定与其同格式前置检查都要用，纯路径检视行为不变
+    let ext = out
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let in_ext = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    // 保原格式回写要求输入与输出同格式（writeback 重解析原文件定位改写）；
+    // 跨格式需求（如 txt→docx）一律走 .md 输出。前置友好报错替代深层 ZIP
+    // 错误。（原在回写阶段检查，随会话建立一并前置——判定链/翻译是可能花
+    // 钱花时间的，注定失败的请求不该先跑完再报；文案与口径不变）
+    let needs_same_input = session_writeback_format(&ext).is_some();
+    if needs_same_input && in_ext != ext {
+        return Err(format!(
+            "输出 .{ext} 需要同格式输入（当前输入 .{in_ext}）；跨格式请输出 .md"
+        ));
+    }
+    // ---------- 回写会话建立（判定链之前：spill 就绪，译文产出即直落盘） ----------
+    // 默认策略（Inline/Only/Appendix）+ 保格式输出组合走流式回写；PageAlt
+    // 已排除，strategy 映射即 opts.strategy.into()。会话带 Drop 兜底（docforge
+    // stream 侧成败路径都删 spill），中途任何 Err 直接 ? 返回即可。
+    let mut session: Option<WritebackSession> = None;
+    if opts.strategy != BiStrategy::PageAlt {
+        if let Some(fmt) = session_writeback_format(&ext) {
+            session = Some(
+                WritebackSession::new(fmt, input, out, opts.strategy.into())
+                    .map_err(|e| format!("回写会话失败：{e}"))?,
+            );
+        }
+    }
+    // 译文暂存（下标=单元序）：仅全量路径（PageAlt 交替 / .md/.pdf 输出）
+    // 构造；session 路径判定链命中与批结果都直落 spill，这里恒空——内存
+    // 收益就在这一处不攒全量译文
+    let mut texts_out: Vec<String> = if session.is_some() {
+        Vec::new()
+    } else {
+        Vec::with_capacity(total)
+    };
     // ---------- 阶段一：判定链预扫（不触引擎、不回调进度） ----------
     // 逐单元依次判 防幻觉 → glossary 精确命中 → running memo → 缓存 →
     // from==to 直通，命中的当场定稿；否则记入 pending（单元下标），留待
     // 阶段二攒批送引擎。两遍结构（预扫 + 批执行）逐位复刻旧单遍逐条流的
     // 判定链顺序与回填结果——统计口径（cache_hits/glossary_hits/running_merged）
-    // 与输出不变。
-    let mut texts_out: Vec<String> = Vec::with_capacity(total);
+    // 与输出不变。session 在会话存在时改道直落 spill（见循环尾）。
     // 每单元实际源语言（auto 检测的载体，阶段二分组批/缓存键/引擎调用都用
     // 它）：固定 from 恒 opts.from（现状）；auto 时 unit.lang 经 639-3 映射，
     // None = 检测不出。与 texts_out 同长同序。
@@ -290,7 +363,8 @@ pub fn translate_document(
     // 槽位取译文（running_merged 口径不变）。
     let mut pending_slots: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
-    // 批内重复的 running 文本（单元下标, 首现槽位）——批执行完统一回填
+    // 批内重复的 running 文本（单元下标, 首现槽位）——首现槽位所在批完成时
+    // 统一回填（session 路径译文不驻留 texts_out，只能在产出点消费）
     let mut batch_refs: Vec<(usize, usize)> = Vec::new();
     for (idx, unit) in units.iter().enumerate() {
         chars += unit.text.chars().count();
@@ -361,7 +435,19 @@ pub fn translate_document(
             pending.push(idx);
             String::new() // 占位，阶段二回填
         };
-        texts_out.push(text);
+        match session.as_mut() {
+            Some(s) => {
+                // 判定链当场定稿的条目（防幻觉原样 / 术语 / running 复用 /
+                // 缓存命中 / 直通）立即 push 进会话——译文帧直落 spill 磁盘。
+                // pending 占位空串不入（阶段二批完成后再 push 真译文）；
+                // session.push 对空白本就静默忽略，这里跳过省一次调用
+                if !text.is_empty() {
+                    s.push(&unit.id, &text)
+                        .map_err(|e| format!("回写会话失败：{e}"))?;
+                }
+            }
+            None => texts_out.push(text),
+        }
     }
     // ---------- 阶段二：pending 攒批执行 ----------
     // 每批 16 条（复用 UNITS_PER_BATCH——批边界同时是 save 与进度回调边界，
@@ -387,7 +473,15 @@ pub fn translate_document(
             // 传入归一码；缓存键用单元实际 from（原始码），语义不变
             let from_norm = crate::lang::normalize(&from_g);
             for chunk in idxs.chunks(UNITS_PER_BATCH) {
-                let batch: Vec<String> = chunk.iter().map(|&i| units[i].text.clone()).collect();
+                // chunk 元素是 pending 槽位（group_indices 返回的 keys 下标），
+                // 取文本/回填前必须经 pending[i] 映射回单元下标——e294a7c 引入
+                // 分组批时漏了这层映射，预扫命中在前时整批错位（该回归无测试
+                // 覆盖：既有用例的 pending 恒为空或恰为全序 0..n），随本处
+                // session 化重构一并修复
+                let batch: Vec<String> = chunk
+                    .iter()
+                    .map(|&i| units[pending[i]].text.clone())
+                    .collect();
                 let outs = match &engine {
                     crate::Engine::Offline => {
                         // 整批 Err（CT2 批调用不区分单条）——错误定位到批内首
@@ -409,7 +503,7 @@ pub fn translate_document(
                                 outs
                             })
                             .map_err(|e| {
-                                format!("单元 {} 翻译失败：{}", units[chunk[0]].id, e)
+                                format!("单元 {} 翻译失败：{}", units[pending[chunk[0]]].id, e)
                             })?
                     }
                     _ => {
@@ -417,14 +511,15 @@ pub fn translate_document(
                         // 用单元实际值（固定模式 == opts.from，行为不变）
                         let mut outs = Vec::with_capacity(chunk.len());
                         for &i in chunk {
+                            let ui = pending[i];
                             let t = crate::translate(
-                                std::slice::from_ref(&units[i].text),
-                                unit_froms[i].as_deref().unwrap_or(&from_g),
+                                std::slice::from_ref(&units[ui].text),
+                                unit_froms[ui].as_deref().unwrap_or(&from_g),
                                 &opts.to,
                                 &engine,
                                 opts.polish,
                             )
-                            .map_err(|e| format!("单元 {} 翻译失败：{}", units[i].id, e))?
+                            .map_err(|e| format!("单元 {} 翻译失败：{}", units[ui].id, e))?
                             .pop()
                             .unwrap_or_default();
                             outs.push(t);
@@ -433,23 +528,54 @@ pub fn translate_document(
                     }
                 };
                 for (slot_in_chunk, &i) in chunk.iter().enumerate() {
-                    texts_out[i] = outs[slot_in_chunk].clone();
+                    let ui = pending[i];
+                    let tr = &outs[slot_in_chunk];
+                    // 批结果两条去向：session 路径逐条 push 直落 spill（每批
+                    // 完成即入会话，不等全量）；全量路径回填 texts_out
+                    match session.as_mut() {
+                        Some(s) => {
+                            s.push(&units[ui].id, tr)
+                                .map_err(|e| format!("回写会话失败：{e}"))?;
+                        }
+                        None => texts_out[ui] = tr.clone(),
+                    }
                     if let Some(c) = cache.as_mut() {
                         c.insert(
-                            &units[i].text,
-                            unit_froms[i].as_deref().unwrap_or(&from_g),
+                            &units[ui].text,
+                            unit_froms[ui].as_deref().unwrap_or(&from_g),
                             &opts.to,
                             &engine,
                             opts.polish,
-                            &texts_out[i],
+                            tr,
                         );
                     }
                     // running 首现翻完记入 memo（后续同文本页复用；批内重复已在
                     // 预扫挂槽位，不重复进批）
-                    if units[i].running {
-                        running_memo.insert(units[i].text.clone(), texts_out[i].clone());
+                    if units[ui].running {
+                        running_memo.insert(units[ui].text.clone(), tr.clone());
                     }
                 }
+                // 批内重复 running 文本（预扫挂起的 (重复单元, 首现槽位)）：
+                // 首现落在本批的此刻取同译文回填/入会话。同文本必同键同组，
+                // 槽位恰在本批被消费一次；session 路径没有 texts_out 可事后
+                // 回填，统一挪到译文产出点（全量路径结果等价，只是提前）
+                let mut unmatched_refs = Vec::new();
+                for (dup_idx, slot) in batch_refs.drain(..) {
+                    match chunk.iter().position(|&s| s == slot) {
+                        Some(pos) => {
+                            let tr = &outs[pos];
+                            match session.as_mut() {
+                                Some(s) => {
+                                    s.push(&units[dup_idx].id, tr)
+                                        .map_err(|e| format!("回写会话失败：{e}"))?;
+                                }
+                                None => texts_out[dup_idx] = tr.clone(),
+                            }
+                        }
+                        None => unmatched_refs.push((dup_idx, slot)),
+                    }
+                }
+                batch_refs = unmatched_refs;
                 // 断点续翻：每批边界落盘一次（崩溃最多丢一批）
                 if let Some(c) = cache.as_ref() {
                     c.save();
@@ -459,15 +585,11 @@ pub fn translate_document(
                 // 第三参=批内最后完成单元的章节名（① 规格指定口径）
                 processed += chunk.len();
                 let done = processed.min(total);
-                let last = chunk[chunk.len() - 1];
+                let last = pending[chunk[chunk.len() - 1]];
                 if let Some(cb) = &opts.on_progress {
                     cb(done, total, units[last].chapter.as_deref());
                 }
             }
-        }
-        // 批内重复 running 文本回填首现槽位译文（预扫挂起的引用）
-        for (dup_idx, slot) in batch_refs.drain(..) {
-            texts_out[dup_idx] = texts_out[pending[slot]].clone();
         }
     } else if let Some(cb) = &opts.on_progress {
         // 全命中（含 from==to 直通 / auto 全检测不出）：预扫全分流、pending
@@ -476,38 +598,10 @@ pub fn translate_document(
         let last_chapter = units.last().and_then(|u| u.chapter.as_deref());
         cb(total, total, last_chapter);
     }
-    let translated: Vec<(String, String)> = units
-        .iter()
-        .zip(texts_out)
-        .map(|(u, t)| (u.id.clone(), t))
-        .collect();
     // 收尾落盘（全命中时是同内容覆写，幂等无害；缺了这步不满一批的中断前
     // 进度会全丢）
     if let Some(c) = cache.as_ref() {
         c.save();
-    }
-    // 输出分派（见函数文档）。扩展名小写比较，无扩展名按不支持处理
-    // （CLI/UI 的默认输出恒带 .md，走到这里的无扩展名只会是显式误用）
-    let ext = out
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    // 保原格式回写要求输入与输出同格式（writeback 重解析原文件定位改写）；
-    // 跨格式需求（如 txt→docx）一律走 .md 输出。前置友好报错替代深层 ZIP 错误。
-    let in_ext = input
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    let needs_same_input = matches!(
-        ext.as_str(),
-        "docx" | "epub" | "txt" | "html" | "htm" | "fb2" | "odt"
-    );
-    if needs_same_input && in_ext != ext {
-        return Err(format!(
-            "输出 .{ext} 需要同格式输入（当前输入 .{in_ext}）；跨格式请输出 .md"
-        ));
     }
     // PageAlt 的格式支持面：markdown 页级交替（docforge@6a1e183 起）、
     // epub 部件交替（b5bf9a87 起，spine 插译文部件）、docx 节交替
@@ -532,80 +626,114 @@ pub fn translate_document(
     } else {
         None
     };
-    match ext.as_str() {
-        "docx" if docx_alt => docforge::writeback::writeback_docx_alternating(
-            input,
-            &translated,
-            out,
-        )
-        .map_err(|e| format!("docx 节交替回写失败：{e}"))?,
-        "epub" if epub_alt => docforge::writeback::writeback_epub_alternating(
-            input,
-            &translated,
-            out,
-        )
-        .map_err(|e| format!("epub 部件交替回写失败：{e}"))?,
-        "md" | "markdown" => {
-            let md = if opts.strategy == BiStrategy::PageAlt {
-                page_alternating_markdown(&doc, &translated)
-            } else {
-                docforge::emit::to_bilingual_markdown_with(&doc, &translated, opts.strategy.into())
-            };
-            std::fs::write(out, md).map_err(|e| format!("写入 {} 失败：{e}", out.display()))?;
-        }
-        "docx" => docforge::writeback::writeback_docx(
-            input,
-            &translated,
-            opts.strategy.into(),
-            out,
-        )
-        .map_err(|e| format!("docx 回写失败：{e}"))?,
-        "epub" => docforge::writeback::writeback_epub(
-            input,
-            &translated,
-            opts.strategy.into(),
-            out,
-        )
-        .map_err(|e| format!("epub 回写失败：{e}"))?,
-        // 纯文本/标记族回写（docforge@82cdbb46 起；txt 恒开、html 随 default、
-        // fb2/odt 已在本 crate feature 集中开启）
-        "txt" => docforge::writeback::writeback_txt(
-            input,
-            &translated,
-            opts.strategy.into(),
-            out,
-        )
-        .map_err(|e| format!("txt 回写失败：{e}"))?,
-        "html" | "htm" => docforge::writeback::writeback_html(
-            input,
-            &translated,
-            opts.strategy.into(),
-            out,
-        )
-        .map_err(|e| format!("html 回写失败：{e}"))?,
-        "fb2" => docforge::writeback::writeback_fb2(
-            input,
-            &translated,
-            opts.strategy.into(),
-            out,
-        )
-        .map_err(|e| format!("fb2 回写失败：{e}"))?,
-        "odt" => docforge::writeback::writeback_odt(
-            input,
-            &translated,
-            opts.strategy.into(),
-            out,
-        )
-        .map_err(|e| format!("odt 回写失败：{e}"))?,
-        // 双语对照 PDF（纯生成式，任何输入格式可出——不进 needs_same_input）
-        "pdf" => {
-            crate::bilingual_pdf::export_bilingual_pdf(&units, &translated, out)
-                .map_err(|e| format!("双语 PDF 导出失败：{e}"))?;
-        }
-        other => {
-            return Err(format!(
-                "不支持的输出格式 .{other}（可选 .md / .docx / .epub / .txt / .html / .fb2 / .odt / .pdf）"
-            ))
+    if let Some(s) = session {
+        // 流式回写会话收尾：回放 spill → 分发到对应 writeback_* 打包（与全量
+        // API 同一入口，语义零分叉）。成败路径都删 spill；DocStats 口径不随
+        // 会话变化（units 仍 = 翻译单元总数，UI/CLI 零感知）
+        s.finish()
+            .map_err(|e| format!("回写会话失败：{e}"))?;
+    } else {
+        // 全量路径：此刻才攒 translated 全集（session 路径不构造——这就是
+        // 内存收益所在）。只剩 PageAlt 交替/退化与 .md/.pdf 输出会用它
+        //（docforge@35a1d99e 起全量 API 吃 TranslationPair，二元组 From 即
+        // 不校验源的信任锚点形态）
+        let translated: Vec<docforge::emit::TranslationPair> = units
+            .iter()
+            .zip(texts_out)
+            .map(|(u, t)| (u.id.clone(), t).into())
+            .collect();
+        // 输出分派（见函数文档）。扩展名小写比较，无扩展名按不支持处理。
+        // docforge@35a1d99e 起回写器返回 WritebackReport（written/skipped
+        // 记因）——docmt 的 DocStats 口径不消费它，各臂收尾 `?;` 丢弃
+        match ext.as_str() {
+            "docx" if docx_alt => {
+                docforge::writeback::writeback_docx_alternating(input, &translated, out)
+                    .map_err(|e| format!("docx 节交替回写失败：{e}"))?;
+            }
+            "epub" if epub_alt => {
+                docforge::writeback::writeback_epub_alternating(input, &translated, out)
+                    .map_err(|e| format!("epub 部件交替回写失败：{e}"))?;
+            }
+            "md" | "markdown" => {
+                let md = if opts.strategy == BiStrategy::PageAlt {
+                    page_alternating_markdown(&doc, &translated)
+                } else {
+                    docforge::emit::to_bilingual_markdown_with(
+                        &doc,
+                        &translated,
+                        opts.strategy.into(),
+                    )
+                };
+                std::fs::write(out, md).map_err(|e| format!("写入 {} 失败：{e}", out.display()))?;
+            }
+            // 以下保格式分支只剩 PageAlt 策略会走到（默认策略已被 session
+            // 分支接管；docx/epub 的交替分支在上面 guard 命中）
+            "docx" => {
+                docforge::writeback::writeback_docx(
+                    input,
+                    &translated,
+                    opts.strategy.into(),
+                    out,
+                )
+                .map_err(|e| format!("docx 回写失败：{e}"))?;
+            }
+            "epub" => {
+                docforge::writeback::writeback_epub(
+                    input,
+                    &translated,
+                    opts.strategy.into(),
+                    out,
+                )
+                .map_err(|e| format!("epub 回写失败：{e}"))?;
+            }
+            // 纯文本/标记族回写（docforge@82cdbb46 起；txt 恒开、html 随 default、
+            // fb2/odt 已在本 crate feature 集中开启）
+            "txt" => {
+                docforge::writeback::writeback_txt(
+                    input,
+                    &translated,
+                    opts.strategy.into(),
+                    out,
+                )
+                .map_err(|e| format!("txt 回写失败：{e}"))?;
+            }
+            "html" | "htm" => {
+                docforge::writeback::writeback_html(
+                    input,
+                    &translated,
+                    opts.strategy.into(),
+                    out,
+                )
+                .map_err(|e| format!("html 回写失败：{e}"))?;
+            }
+            "fb2" => {
+                docforge::writeback::writeback_fb2(
+                    input,
+                    &translated,
+                    opts.strategy.into(),
+                    out,
+                )
+                .map_err(|e| format!("fb2 回写失败：{e}"))?;
+            }
+            "odt" => {
+                docforge::writeback::writeback_odt(
+                    input,
+                    &translated,
+                    opts.strategy.into(),
+                    out,
+                )
+                .map_err(|e| format!("odt 回写失败：{e}"))?;
+            }
+            // 双语对照 PDF（纯生成式，任何输入格式可出——不进 needs_same_input）
+            "pdf" => {
+                crate::bilingual_pdf::export_bilingual_pdf(&units, &translated, out)
+                    .map_err(|e| format!("双语 PDF 导出失败：{e}"))?;
+            }
+            other => {
+                return Err(format!(
+                    "不支持的输出格式 .{other}（可选 .md / .docx / .epub / .txt / .html / .fb2 / .odt / .pdf）"
+                ))
+            }
         }
     }
     Ok(DocStats {
@@ -627,7 +755,10 @@ pub fn translate_document(
 /// `Page.name`（无名为页序）——切单页后页序恒 0，因此对无名页把原页序写进
 /// `name`（`Some("2")` → id 仍为 `p2-bN`），有名页原样保留。译文侧传全量
 /// `translated`（to_bilingual_markdown_with 按 id 精确匹配，跨页条目自然忽略）。
-fn page_alternating_markdown(doc: &docforge::Document, translated: &[(String, String)]) -> String {
+fn page_alternating_markdown(
+    doc: &docforge::Document,
+    translated: &[docforge::emit::TranslationPair],
+) -> String {
     let mut pages: Vec<String> = Vec::with_capacity(doc.pages.len());
     for (idx, page) in doc.pages.iter().enumerate() {
         let mut single = doc.clone();
@@ -745,8 +876,8 @@ mod page_alt_tests {
         };
         // id 锚点：无名页 → 页序（p0-b0 / p1-b0）；译文前缀 T- 便于断言归属
         let translated = vec![
-            ("p0-b0".to_string(), "T-alpha 第一页译文".to_string()),
-            ("p1-b0".to_string(), "T-beta 第二页译文".to_string()),
+            ("p0-b0".to_string(), "T-alpha 第一页译文".to_string()).into(),
+            ("p1-b0".to_string(), "T-beta 第二页译文".to_string()).into(),
         ];
         let md = page_alternating_markdown(&doc, &translated);
         let p1o = md.find("Alpha first page").expect("页1原文");
@@ -769,7 +900,7 @@ mod page_alt_tests {
             }],
             ..Default::default()
         };
-        let translated = vec![("pch3.xhtml-b0".to_string(), "T-有名页译文".to_string())];
+        let translated = vec![("pch3.xhtml-b0".to_string(), "T-有名页译文".to_string()).into()];
         let md = page_alternating_markdown(&doc, &translated);
         assert!(md.contains("T-有名页译文"), "有名页锚点应匹配：\n{md}");
         assert!(md.contains("Named page body text."));

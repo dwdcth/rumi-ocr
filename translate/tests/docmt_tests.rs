@@ -38,7 +38,9 @@ fn two_page_doc() -> docforge::Document {
 }
 
 /// 假译文：按锚点给固定串（不含原文子串，Only 形态的"原文消失"断言才成立）。
-fn fake_translations(units: &[docforge::emit::TranslationUnit]) -> Vec<(String, String)> {
+/// docforge@35a1d99e 起全量 emit/回写 API 吃 TranslationPair（二元组 From 即
+/// 不校验源的信任锚点形态）。
+fn fake_translations(units: &[docforge::emit::TranslationUnit]) -> Vec<docforge::emit::TranslationPair> {
     units
         .iter()
         .map(|u| {
@@ -47,7 +49,7 @@ fn fake_translations(units: &[docforge::emit::TranslationUnit]) -> Vec<(String, 
                 "p1-b0" => "第二页译文。",
                 other => panic!("未知锚点：{other}"),
             };
-            (u.id.clone(), t.to_string())
+            (u.id.clone(), t.to_string()).into()
         })
         .collect()
 }
@@ -332,6 +334,67 @@ fn docx_writeback_dispatch_roundtrip() {
     let xml = String::from_utf8(buf).unwrap();
     let hits = xml.matches("Hello world this is a test paragraph.").count();
     assert!(hits >= 2, "Inline 应含原块+译文块两份，实得 {hits}：{xml}");
+}
+
+/// 回写会话路径（docforge stream::WritebackSession 接管保格式输出，默认
+/// 策略即走 session）：docx 直通（from==to 零模型）+ 术语精确命中混合——
+/// 两类预扫命中条目逐条 push 进会话（spill 直落盘，不攒全量译文 Vec），
+/// finish 打包后与全量路径语义一致（Inline：原块 + 译文块）。finish 后
+/// temp 目录无本会话残留 spill（docforge 侧 finish/Drop 都删临时文件）。
+#[test]
+fn docx_session_writeback_passthrough_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = build_minimal_docx(dir.path(), "thread pool");
+    let out = dir.path().join("out.session.docx");
+    let opts = DocTranslateOptions {
+        engine: Engine::Offline, // from==to 短路 + 术语命中，shared() 不会被触达
+        from: "en".into(),
+        to: "en".into(),
+        strategy: BiStrategy::Inline,
+        polish: false,
+        min_chars: 2,
+        on_progress: None,
+        use_cache: false,
+        glossary: Glossary::parse("thread pool = 线程池"),
+        ocr_engine: None,
+    };
+    let stats = docmt::translate_document(&input, &out, &opts).unwrap();
+    assert_eq!(stats.units, 2);
+    assert_eq!(stats.glossary_hits, 1, "仅术语单元精确命中（session push 来源之一）");
+    assert_eq!(stats.cache_hits, 0, "直通路径不经过缓存");
+    // 读回 zip 的 document.xml：术语单元 = 原块 + 固定译法块；直通单元 =
+    // 原块 + 原样译文块
+    use std::io::Read as _;
+    let f = std::fs::File::open(&out).unwrap();
+    let mut z = zip::ZipArchive::new(f).unwrap();
+    let mut buf = Vec::new();
+    z.by_name("word/document.xml").unwrap().read_to_end(&mut buf).unwrap();
+    let xml = String::from_utf8(buf).unwrap();
+    assert!(xml.contains("线程池"), "术语固定译法应随会话回写：{xml}");
+    assert!(xml.contains("thread pool"), "术语单元原块应保留（Inline）：{xml}");
+    assert_eq!(
+        xml.matches("Second plain paragraph here.").count(),
+        2,
+        "直通单元应原块+原样译文两份：{xml}"
+    );
+    // 会话收尾：本会话 spill 临时文件零残留（并行测试共享 pid，按本会话
+    // 独有内容「线程池」认领，避免误伤他测存活会话）
+    let prefix = format!("docforge-wb-{}-", std::process::id());
+    let leftover: Vec<std::path::PathBuf> = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            n.starts_with(&prefix)
+                && n.ends_with(".spill")
+                && std::fs::read(e.path())
+                    .map(|b| String::from_utf8_lossy(&b).contains("线程池"))
+                    .unwrap_or(false)
+        })
+        .map(|e| e.path())
+        .collect();
+    assert!(leftover.is_empty(), "finish 后不应残留本会话 spill：{leftover:?}");
 }
 
 /// 不支持的输出扩展名 → 明确报错（不落盘）。

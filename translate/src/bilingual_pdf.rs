@@ -24,7 +24,7 @@
 
 use std::path::Path;
 
-use docforge::emit::TranslationUnit;
+use docforge::emit::{TranslationPair, TranslationUnit};
 use docforge::writeback::appendix;
 use oxidize_pdf::{Color, Document, Font, Page};
 
@@ -48,7 +48,9 @@ const COLOR_QUOTE: Color = Color::Gray(0.45);
 const COLOR_BODY: Color = Color::Gray(0.0);
 
 /// units + translated → 双语对照 PDF。返回写入的条目数与跳过数
-/// （字体覆盖不足时 CJK 行 skipped，与 dual_pdf 降级语义一致）。
+/// （字体覆盖不足时 CJK 行 skipped，与 dual_pdf 降级语义一致）。translated
+/// 类型随 docforge@35a1d99e 的全量回写 API 升级为 TranslationPair（二元组
+/// From 即不校验源的信任锚点形态，与 docmt 全量路径攒的同一类型直传）。
 ///
 /// 统计口径：`written` = 至少写出一块（原文引用或译文正文）的条目数；
 /// `skipped` = 因字体覆盖不足整块跳过的文本行数（原文行与译文行逐行计，
@@ -57,7 +59,7 @@ const COLOR_BODY: Color = Color::Gray(0.0);
 /// 该分支只可能是直接调用方的构造错误。
 pub(crate) fn export_bilingual_pdf(
     units: &[TranslationUnit],
-    translated: &[(String, String)],
+    translated: &[TranslationPair],
     out: &Path,
 ) -> Result<(usize, usize), String> {
     let mut pages = appendix::to_appendix_pages(units, translated);

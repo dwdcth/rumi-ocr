@@ -121,6 +121,11 @@ pub fn route_pdf(path: &Path, opts: &RouteOptions) -> Result<Vec<PdfPage>, OcrEr
             intra_page: false,
             on_progress: opts.on_progress.clone(),
             keep_raster_pages: false,
+            // 扫描页 OCR 攒批旋钮（docforge@35a1d99e）：4 = 连续扫描页按 4 页
+            // 一批喂引擎（接口层攒批，连续段截断如 7 页→4+3）。真批红利需
+            // 引擎覆写 recognize_batch——rumi 适配器当前逐图，此值先取攒批
+            // 上限，引擎侧批实现后无需再动配置。
+            ocr_batch: 4,
         },
     );
     let doc = DocumentEngine::new(registry)
