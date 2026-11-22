@@ -216,7 +216,8 @@ pub mod sample {
         if let Some(h) = home {
             v.push(h.join(".local/share/fonts/msyh.ttc")); // 微软雅黑：简体 TrueType
         }
-        v.push("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc".into()); // CFF，覆盖广
+        v.push("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc".into()); // CFF，覆盖广（Arch）
+        v.push("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc".into()); // Debian/Ubuntu（fonts-noto-cjk）
         v.push("/usr/share/fonts/wps-office/HYZYB5.ttf".into()); // 繁体为主，兜底
         v
     }
