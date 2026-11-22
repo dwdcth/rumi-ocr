@@ -42,7 +42,9 @@ jobs:
             libudev-dev \
             libayatana-appindicator3-dev \
             libglib2.0-dev \
-            libxdo-dev
+            libxdo-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev
 
       # onnxruntime 不在 Ubuntu 官方源里：从 NuGet 官方包（微软 GitHub 仓库
       # 2026-11-17 起整体 404，release 资产全灭，PyPI/NuGet 未受影响）解出

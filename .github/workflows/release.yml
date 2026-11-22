@@ -112,7 +112,9 @@ jobs:
             libudev-dev \
             libayatana-appindicator3-dev \
             libglib2.0-dev \
-            libxdo-dev
+            libxdo-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev
 
       # ---- onnxruntime 准备（NuGet 统一源，按平台分支落位）----
       # unix：nuget 主包（zip）解出 runtimes/<rid>/native/ → /opt 布局 +
