@@ -78,6 +78,19 @@ cargo run -p rumi-translate -- --engine google --to zh "text" # 在线翻译
 （Arch 系 `pacman -S onnxruntime`，≥1.17），详见 `server/Cargo.toml` 注释与
 `.cargo/config.toml`。
 
+### 预编译包（CI 自动构建）
+
+[Releases](https://github.com/dwdcth/rumi-ocr/releases) 打 `v*` 标签即自动产出
+7 个平台包：Linux x64 / arm64、Windows x64 / arm64、macOS x64 / arm64 / universal2。
+解压后：
+
+- **Windows**：`onnxruntime.dll` 已随包（与 exe 同目录），直接运行 `rumi-ui.exe`
+- **Linux**：需系统 `webkit2gtk-4.1`（Debian/Ubuntu `apt install libwebkit2gtk-4.1-0`、
+  Arch `pacman -S webkit2gtk-4.1`）；用 `run-rumi-ui.sh` 启动（wrapper 会设
+  `LD_LIBRARY_PATH` 加载包内 `libonnxruntime.so`，直接跑裸二进制同理需要）
+- **macOS**：用 `run-rumi-ui.sh` 启动（包内已带 `libonnxruntime.dylib`）；
+  下载的包首次运行若被 Gatekeeper 拦：`xattr -d com.apple.quarantine rumi-ui`
+
 ## 📖 使用
 
 1. 启动后常驻托盘；`Alt+Q`（可配置）或托盘菜单触发**区域截图 OCR**，

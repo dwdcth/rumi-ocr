@@ -1,0 +1,340 @@
+# rumi 多平台自动打包（tag v* 触发 / 手动 workflow_dispatch）。
+# 结构参考 docforge 的 release.yml（7 目标 + SHA256SUMS + gh-release），
+# 但目标组合按 rumi 的依赖现实做了替换：
+#
+# docforge 的 7 目标里有 3 个交叉编译（musl、aarch64-linux zigbuild、
+# loongarch64 zigbuild），对 rumi 不可行——rumi-ui 是 wry/WebKitGTK 桌面
+# 应用（需要目标平台的 webview 链接环境），translate 链 ct2rs 的 C++
+# CTranslate2 也没有 musl/交叉预编译。因此 7 个产物全部用原生 runner：
+#
+#   1. x86_64-unknown-linux-gnu    ubuntu-latest
+#   2. aarch64-unknown-linux-gnu   ubuntu-24.04-arm（公共仓库免费的 arm runner）
+#   3. x86_64-pc-windows-msvc      windows-latest
+#   4. aarch64-pc-windows-msvc     windows-11-arm（experimental：ct2rs 未必有
+#                                  win-arm64 预编译，失败不阻塞发布）
+#   5. x86_64-apple-darwin         macos-15-intel
+#   6. aarch64-apple-darwin        macos-latest
+#   7. universal2-apple-darwin     macos-latest（lipo 合并 5+6，Mac 分发主流形态）
+#
+# onnxruntime 策略（全平台一致）：ort-sys 走 pkg-config 动态链（防双
+# protobuf 互劫持，因果见 server/Cargo.toml ort-sys 注释）。CI 下载微软
+# 官方预编译包 + 手写 .pc；Windows 加装 pkgconfiglite。win-arm64 没有
+# GitHub release 资产，改从 nuget 包（Microsoft.ML.OnnxRuntime.Runtime.
+# win-arm64，本质是 zip）取 native 库。动态库随分发包走：Windows 带
+# onnxruntime.dll（exe 同目录自动加载）；Linux/macOS 带 lib/ + run-*.sh
+# 包装脚本设 LD_LIBRARY_PATH / DYLD_LIBRARY_PATH。
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version-suffix:
+        description: '版本后缀（无 tag 触发时拼进包名，如 beta1）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  ORT_VERSION: "1.22.0"
+  # 与 docforge release 同款发布档位：thin LTO + 单 codegen unit + 剥符号
+  # （经 CARGO_PROFILE_* 环境变量下发，不动 workspace Cargo.toml，
+  # 本地构建行为不受影响）。
+  CARGO_PROFILE_RELEASE_LTO: thin
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '1'
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ort_pkg: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            ort_pkg: linux-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ort_pkg: win-x64
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            ort_pkg: win-arm64
+            experimental: true
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            ort_pkg: osx-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            ort_pkg: osx-arm64
+          - target: universal2-apple-darwin
+            os: macos-latest
+            ort_pkg: osx-universal
+            # lipo 需要同时装两个 target
+            rust_targets: 'x86_64-apple-darwin,aarch64-apple-darwin'
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets || matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix: release-${{ matrix.target }}
+
+      - name: Install desktop system deps (linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libasound2-dev \
+            libudev-dev \
+            libayatana-appindicator3-dev \
+            libglib2.0-dev \
+            libxdo-dev
+
+      # ---- onnxruntime 准备（按平台分支）----
+      # 非 Windows：GH release tgz → /opt/onnxruntime（universal 特殊：两
+      # 份，构建时分别指 PKG_CONFIG_PATH，不设全局）。
+      - name: Prepare onnxruntime (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          write_pc() { # $1 = 目录前缀（/opt 下 root 所有，sudo 写）
+            sudo mkdir -p "$1/lib/pkgconfig"
+            sudo tee "$1/lib/pkgconfig/onnxruntime.pc" >/dev/null <<EOF
+          prefix=$1
+          libdir=\${prefix}/lib
+          includedir=\${prefix}/include
+
+          Name: onnxruntime
+          Description: ONNX Runtime (dynamic link)
+          Version: ${ORT_VERSION}
+          Libs: -L\${libdir} -lonnxruntime
+          Cflags: -I\${includedir}
+          EOF
+          }
+          case "${{ matrix.ort_pkg }}" in
+            osx-universal)
+              for arch in x86_64 arm64; do
+                pkg="onnxruntime-osx-${arch}-${ORT_VERSION}"
+                sudo mkdir -p "/opt/ort-${arch}"
+                curl -sSL -o /tmp/ort.tgz \
+                  "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${pkg}.tgz"
+                sudo tar -xzf /tmp/ort.tgz -C "/opt/ort-${arch}" --strip-components=1
+                write_pc "/opt/ort-${arch}"
+              done
+              ;;
+            *)
+              pkg="onnxruntime-${{ matrix.ort_pkg }}-${ORT_VERSION}"
+              sudo mkdir -p /opt/onnxruntime
+              curl -sSL -o /tmp/ort.pkg \
+                "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${pkg}.tgz"
+              sudo tar -xzf /tmp/ort.pkg -C /opt/onnxruntime --strip-components=1
+              write_pc /opt/onnxruntime
+              echo "PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      # Windows x64：GH release zip（布局：顶层/{onnxruntime.dll, lib/onnxruntime.lib}）。
+      - name: Prepare onnxruntime + pkg-config (windows x64)
+        if: runner.os == 'Windows' && matrix.ort_pkg == 'win-x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install pkgconfiglite --no-progress -y
+          $pkg = "onnxruntime-win-x64-$env:ORT_VERSION"
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$env:ORT_VERSION/$pkg.zip"
+          Invoke-WebRequest -Uri $url -OutFile C:\ort.zip
+          Expand-Archive C:\ort.zip -DestinationPath C:\ort-raw
+          New-Item -ItemType Directory -Force C:\onnxruntime\lib | Out-Null
+          Copy-Item (Get-ChildItem C:\ort-raw -Recurse -Filter onnxruntime.dll | Select-Object -First 1).FullName C:\onnxruntime\
+          Copy-Item (Get-ChildItem C:\ort-raw -Recurse -Filter onnxruntime.lib | Select-Object -First 1).FullName C:\onnxruntime\lib\
+          New-Item -ItemType Directory -Force C:\onnxruntime\lib\pkgconfig | Out-Null
+          $pc = @(
+            'prefix=C:/onnxruntime'
+            'libdir=${prefix}/lib'
+            ''
+            'Name: onnxruntime'
+            'Description: ONNX Runtime (dynamic link)'
+            "Version: $env:ORT_VERSION"
+            'Libs: -L${libdir} -lonnxruntime'
+            'Cflags: -I${prefix}/include'
+          ) -join "`n"
+          Set-Content -Path C:\onnxruntime\lib\pkgconfig\onnxruntime.pc -Value $pc
+          "PKG_CONFIG_PATH=C:\onnxruntime\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # Windows arm64：GH release 无资产，改从 nuget 包取 native 库
+      # （nuget 包本质是 zip：runtimes/win-arm64/native/{onnxruntime.dll,.lib}）。
+      - name: Prepare onnxruntime + pkg-config (windows arm64)
+        if: runner.os == 'Windows' && matrix.ort_pkg == 'win-arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install pkgconfiglite --no-progress -y
+          $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.Runtime.win-arm64/$env:ORT_VERSION"
+          Invoke-WebRequest -Uri $url -OutFile C:\ort.zip
+          Expand-Archive C:\ort.zip -DestinationPath C:\ort-raw
+          New-Item -ItemType Directory -Force C:\onnxruntime\lib | Out-Null
+          Copy-Item C:\ort-raw\runtimes\win-arm64\native\onnxruntime.dll C:\onnxruntime\
+          Copy-Item C:\ort-raw\runtimes\win-arm64\native\onnxruntime.lib C:\onnxruntime\lib\
+          New-Item -ItemType Directory -Force C:\onnxruntime\lib\pkgconfig | Out-Null
+          $pc = @(
+            'prefix=C:/onnxruntime'
+            'libdir=${prefix}/lib'
+            ''
+            'Name: onnxruntime'
+            'Description: ONNX Runtime (dynamic link)'
+            "Version: $env:ORT_VERSION"
+            'Libs: -L${libdir} -lonnxruntime'
+            'Cflags: -I${prefix}/include'
+          ) -join "`n"
+          Set-Content -Path C:\onnxruntime\lib\pkgconfig\onnxruntime.pc -Value $pc
+          "PKG_CONFIG_PATH=C:\onnxruntime\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # 断言：探测不到直接红，不给 ort-sys 静默回退静态库
+      # （回退会重新引入第二份 protobuf，运行期 SIGSEGV）的机会。
+      # universal2 的 PKG_CONFIG_PATH 按架构在构建步内联指定，这里探
+      # 其中一份即可（两份布局相同）。
+      - name: Verify onnxruntime discoverable via pkg-config
+        if: matrix.ort_pkg != 'osx-universal'
+        shell: bash
+        run: pkg-config --modversion onnxruntime
+
+      # ---- 构建 ----
+      - name: Build (single target)
+        if: matrix.target != 'universal2-apple-darwin'
+        shell: bash
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Build (universal2: two slices + lipo)
+        if: matrix.target == 'universal2-apple-darwin'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PKG_CONFIG_PATH=/opt/ort-x86_64/lib/pkgconfig \
+            cargo build --release --workspace --target x86_64-apple-darwin
+          PKG_CONFIG_PATH=/opt/ort-arm64/lib/pkgconfig \
+            cargo build --release --workspace --target aarch64-apple-darwin
+          mkdir -p target/universal2-apple-darwin/release
+          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
+            lipo -create \
+              "target/x86_64-apple-darwin/release/$b" \
+              "target/aarch64-apple-darwin/release/$b" \
+              -output "target/universal2-apple-darwin/release/$b"
+          done
+
+      # ---- 包名（tag 名 / short sha + 可选后缀）----
+      - name: Determine release label
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            label="${GITHUB_REF#refs/tags/}"
+          else
+            label="rumi-$(echo "$GITHUB_SHA" | cut -c1-7)"
+            suffix="${{ inputs.version-suffix }}"
+            if [ -n "$suffix" ]; then label="$label-$suffix"; fi
+          fi
+          echo "LABEL=$label" >> "$GITHUB_ENV"
+
+      # ---- 打包（unix：tar.gz，bin + README + ort 动态库 + wrapper）----
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          target="${{ matrix.target }}"
+          stage="rumi-${LABEL}-${target}"
+          mkdir -p "$stage/lib"
+          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
+            cp "target/${target}/release/$b" "$stage/"
+          done
+          cp README.md "$stage/" 2>/dev/null || true
+          # ort 动态库 + run-*.sh 包装（LD/DYLD_LIBRARY_PATH 指包内 lib/）
+          case "${{ matrix.ort_pkg }}" in
+            linux-*)
+              cp -P /opt/onnxruntime/lib/libonnxruntime.so* "$stage/lib/"
+              dyld=''
+              ;;
+            osx-universal)
+              lipo -create \
+                /opt/ort-x86_64/lib/libonnxruntime.dylib \
+                /opt/ort-arm64/lib/libonnxruntime.dylib \
+                -output "$stage/lib/libonnxruntime.dylib"
+              dyld='DYLD_'
+              ;;
+            osx-*)
+              cp /opt/onnxruntime/lib/libonnxruntime.dylib "$stage/lib/"
+              dyld='DYLD_'
+              ;;
+          esac
+          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
+            {
+              echo '#!/bin/sh'
+              echo 'DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)'
+              echo "export ${dyld}LD_LIBRARY_PATH=\"\$DIR/lib:\$${dyld}LD_LIBRARY_PATH\""
+              echo "exec \"\$DIR/$b\" \"\$@\""
+            } > "$stage/run-$b.sh"
+            chmod +x "$stage/run-$b.sh"
+          done
+          tar czf "rumi-${LABEL}-${target}.tar.gz" "$stage"
+
+      # ---- 打包（windows：zip，exe + README + onnxruntime.dll 同目录）----
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = '${{ matrix.target }}'
+          $stage = "rumi-$env:LABEL-$target"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          foreach ($b in 'rumi-ui','rumi-server','rumi-capture','rumi-translate-cli') {
+            Copy-Item "target/$target/release/$b.exe" $stage
+          }
+          if (Test-Path README.md) { Copy-Item README.md $stage }
+          Copy-Item C:\onnxruntime\onnxruntime.dll $stage
+          Compress-Archive -Path $stage -DestinationPath "rumi-$env:LABEL-$target.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rumi-${{ env.LABEL }}-${{ matrix.target }}
+          path: |
+            rumi-${{ env.LABEL }}-${{ matrix.target }}.tar.gz
+            rumi-${{ env.LABEL }}-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS.txt
+          ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
