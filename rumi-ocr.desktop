@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Rumi OCR
+Name[zh_CN]=Rumi OCR 识别
+GenericName=OCR Application
+GenericName[zh_CN]=截图识别应用
+Comment=Cross-platform screenshot OCR (Umi-OCR clone)
+Comment[zh_CN]=跨平台截图 OCR 工具（Umi-OCR 复刻）
+Exec=/home/banshan/项目/rumiocr/rumi/target/debug/rumi-ui
+Icon=/home/banshan/项目/rumiocr/rumi/ui/assets/icon.png
+Terminal=false
+Categories=Graphics;Utility;
+Keywords=OCR;screenshot;text;recognition;
+StartupWMClass=rumi-ui
