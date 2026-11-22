@@ -84,8 +84,31 @@ jobs:
 
       # protobuf link_guard（translate/tests/link_guard.rs）扫的是
       # target/debug 下的 rumi-ui / rumi-server，先构建这两个 bin。
+      # CXXFLAGS=-march=x86-64：CTranslate2 基础 kernels.cc 必须编出
+      # GENERIC 实例——CI 曾出现该 TU 被编出 __AVX2__（rust-lld:
+      # "did you mean (CpuIsa)2"），GENERIC/AVX 实例缺失链接失败；
+      # 显式钉基线覆盖任何来源的 ISA 泄漏（kernels_avx*.cc 的 -mavx*
+      # 是 per-source flags 追加在后，不受影响）。
       - name: Build bins (link_guard coverage)
         run: cargo build -p rumi-ui -p rumi-server
+        env:
+          CXXFLAGS: -march=x86-64
 
       - name: Test (workspace)
         run: cargo test --workspace
+        env:
+          CXXFLAGS: -march=x86-64
+
+      # 失败取证：CTranslate2 的全局 CXX flags 与 kernels 实例分布
+      # （kernels.cc 应为 CpuIsa)0，avx 副本为 CpuIsa)1，以此定位
+      # ISA 泄漏是否复发及来源）。
+      - name: Diagnose ct2rs cmake flags (on failure)
+        if: failure()
+        run: |
+          set -x
+          find target -path '*ct2rs*/out/build/CMakeCache.txt' \
+            -exec grep -H "CMAKE_CXX_FLAGS" {} \; | head -20
+          find target -path '*ct2rs*/out*' -name 'libctranslate2.a' | head -1 \
+            | xargs -r nm -C 2>/dev/null \
+            | grep "reduce_amax<(ctranslate2::cpu::CpuIsa)" \
+            | grep -oE "CpuIsa\)[0-9]+, float" | sort | uniq -c

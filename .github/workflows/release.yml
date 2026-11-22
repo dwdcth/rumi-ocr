@@ -196,9 +196,25 @@ jobs:
         run: pkg-config --modversion libonnxruntime
 
       # ---- 构建 ----
+      # CXXFLAGS 只在 x86_64 Linux 钉基线（原因见 ci.yml 同名注释：
+      # CTranslate2 基础 kernels.cc 的 ISA 泄漏防御）。
       - name: Build
         shell: bash
         run: cargo build --release --workspace --target ${{ matrix.target }}
+        env:
+          CXXFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-march=x86-64' || '' }}
+
+      - name: Diagnose ct2rs cmake flags (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          set -x
+          find target -path '*ct2rs*/out/build/CMakeCache.txt' \
+            -exec grep -H "CMAKE_CXX_FLAGS" {} \; | head -20
+          find target -path '*ct2rs*/out*' -name 'libctranslate2.a' | head -1 \
+            | xargs -r nm -C 2>/dev/null \
+            | grep "reduce_amax<(ctranslate2::cpu::CpuIsa)" \
+            | grep -oE "CpuIsa\)[0-9]+, float" | sort | uniq -c
 
       # ---- 包名（tag 名 / short sha + 可选后缀）----
       # 注意：LABEL 不带 rumi- 前缀（打包步会拼 rumi-${LABEL}-<target>）。
