@@ -23,10 +23,6 @@ spm-sys = ["ct2rs/sentencepiece"]
 default = []
 
 [dependencies]
-# 推理引擎：oneDNN 后端（vendored oneDNN v3.14.1，Intel+AMD Zen 优化）+ 分词由
-# 下面的纯 Rust sentencepiece-rs 承担。关闭默认 ruy：int8 GEMM 需要 oneDNN。
-# openmp-runtime-comp=GNU OpenMP 运行时。
-ct2rs = { version = "0.9", default-features = false, features = ["dnnl", "openmp-runtime-comp"] }
 # 分词：纯 Rust 直载 .spm（对拍 744/744 全等，见 docs/spm-parity-report.md）。
 # 锁死精确版本：上游为 2026-05 新 crate（单人维护），升级必须重跑
 # tests/spm_parity_tests.rs golden 回归；上游烂尾则 fork（用户已拍板自维护）。
@@ -52,6 +48,19 @@ docforge = { git = "https://github.com/dwdcth/docforge", tag = "v0.1.1", feature
 # 经验（TTC 剥离重建 sfnt + Type0）从 ocr/dual_pdf.rs 复制进本 crate，
 # 刻意不加 translate→ocr 依赖保持轻依赖
 oxidize-pdf = "5"
+
+# ct2rs 推理引擎按目标架构分两处声明（互斥 cfg，同平台只激活一条，无
+# feature 并集问题）：
+# - 主流平台：oneDNN 后端（vendored oneDNN，Intel/AMD Zen 优化）+ GNU
+#   OpenMP 运行时；关闭默认 ruy（int8 GEMM 需要 oneDNN）。
+# - loongarch64：oneDNN 上游只有 x64/aarch64/ppc64/riscv64 CPU 后端，
+#   无 LoongArch（x64 源文件喂 loongarch gcc 直接编挂）——去掉 dnnl，
+#   CTranslate2 回退内建 GEMM（能跑但慢），等社区移植后再放开。
+[target.'cfg(not(target_arch = "loongarch64"))'.dependencies]
+ct2rs = { version = "0.9", default-features = false, features = ["dnnl", "openmp-runtime-comp"] }
+
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+ct2rs = { version = "0.9", default-features = false, features = ["openmp-runtime-comp"] }
 
 [dev-dependencies]
 tempfile = "3"

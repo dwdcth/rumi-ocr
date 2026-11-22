@@ -8,10 +8,6 @@ name = "rumi_capture"
 path = "src/lib.rs"
 
 [dependencies]
-# portal（GNOME/通用 Wayland 全屏帧）
-ashpd = { version = "0.13", features = ["screenshot"] }
-# org.kde.Spectacle 专属 D-Bus（KDE 区域/窗口捕获）
-zbus = { version = "5", default-features = false, features = ["async-io"] }
 # spectacle_call 泛型 body 约束需要 serde::Serialize trait（zbus 自身已依赖）
 serde = { version = "1", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -20,6 +16,17 @@ futures = "0.3"
 # default-features 关掉 image/default，只留我们需要的 png —— 与 capture 自己的 image
 # 0.25 同版本实例，RgbaImage 类型零摩擦互通。xcap 类型不外泄（只在 backend 内用）。
 xcap = { version = "0.9", default-features = false }
+
+# Linux D-Bus 双后端（KDE Spectacle / xdg-desktop-portal）。target-gate 的
+# 原因：ashpd 0.13 的 file_path.rs 顶部 use std::os::unix 无 cfg 门，非
+# Linux 编译直接 E0433（Windows CI 实测）；zbus 连带 gate 收窄编译面。
+# 源码侧对应 #[cfg(target_os = "linux")]（KdeSpectacle/Portal 变体及
+# KDE→Portal 降级管线）。
+[target.'cfg(target_os = "linux")'.dependencies]
+# portal（GNOME/通用 Wayland 全屏帧）
+ashpd = { version = "0.13", features = ["screenshot"] }
+# org.kde.Spectacle 专属 D-Bus（KDE 区域/窗口捕获）
+zbus = { version = "5", default-features = false, features = ["async-io"] }
 
 [dependencies.tokio]
 version = "1"

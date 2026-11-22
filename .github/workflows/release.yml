@@ -195,6 +195,12 @@ jobs:
         shell: bash
         run: pkg-config --modversion libonnxruntime
 
+      # AppleClang 不带 OpenMP（CTranslate2 OPENMP_RUNTIME=COMP 需要），
+      # 装 brew libomp 并用 OpenMP_ROOT 让 CMake 的 FindOpenMP 命中。
+      - name: Install libomp (macos only)
+        if: runner.os == 'macOS'
+        run: brew install libomp
+
       # ---- 构建 ----
       # CXXFLAGS 只在 x86_64 Linux 钉基线（原因见 ci.yml 同名注释：
       # CTranslate2 基础 kernels.cc 的 ISA 泄漏防御）。
@@ -203,6 +209,7 @@ jobs:
         run: cargo build --release --workspace --target ${{ matrix.target }}
         env:
           CXXFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-march=x86-64' || '' }}
+          OpenMP_ROOT: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/libomp' || '' }}
 
       - name: Diagnose ct2rs cmake flags (on failure)
         if: failure()

@@ -22,5 +22,7 @@ futures = "0.3"
 # full/region/window 落盘 PNG
 image = { version = "0.25", default-features = false, features = ["png"] }
 # RUMI_FORCE_PORTAL 调试开关：手工构造 Capturer::Portal（规格须与
-# capture crate 的 zbus 一致，保证连接类型互通）
+# capture crate 的 zbus 一致，保证连接类型互通。linux-only：与 capture
+# 的 ashpd/zbus gate 同步（RUMI_FORCE_PORTAL 调试开关仅 Linux）
+[target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["async-io"] }

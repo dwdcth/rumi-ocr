@@ -137,8 +137,10 @@ fn format_line(l: &rumi_ocr::OcrLine) -> String {
 async fn run(cmd: &str, out: &str) -> Result<(), Error> {
     let cap = match Capturer::probe().await {
         Ok(c) => c,
+        // 允许 --force-portal 调试（仅 Linux：Portal 变体与 zbus 是
+        // capture 的 linux-only 面）
+        #[cfg(target_os = "linux")]
         Err(e) => {
-            // 允许 --force-portal 调试
             if std::env::var("RUMI_FORCE_PORTAL").is_ok() {
                 let conn = zbus::Connection::session()
                     .await
@@ -147,6 +149,12 @@ async fn run(cmd: &str, out: &str) -> Result<(), Error> {
             } else {
                 return Err(e);
             }
+        }
+        // 非 Linux probe() 恒成功（Xcap 唯一选择），此臂不可达
+        #[cfg(not(target_os = "linux"))]
+        Err(e) => {
+            let _ = e;
+            unreachable!("非 Linux 平台 probe() 恒成功（Xcap 唯一选择）")
         }
     };
     let caps = cap.caps();

@@ -121,10 +121,17 @@ impl From<std::io::Error> for Error {
 }
 
 /// Linux 截图后端。Windows/macOS 后端在 M4 加入后改为 trait 泛化。
+///
+/// 平台面：KDE/Portal 两个 D-Bus 后端仅 Linux（zbus/ashpd 在依赖层已
+/// target-gate——ashpd 0.13 无 `os::unix` 的 cfg 门，非 Linux 编译不过）；
+/// GrimSlurp（纯声明，无系统依赖，测试用它覆盖非 D-Bus 分支）与 Xcap
+/// 全平台。
 pub enum Capturer {
     /// KDE：org.kde.Spectacle 专属 D-Bus（区域/窗口/全屏，2026-10 于 Plasma 6.8 实测）
+    #[cfg(target_os = "linux")]
     KdeSpectacle { conn: zbus::Connection },
     /// 通用 Wayland：xdg-desktop-portal Screenshot（全屏；GNOME 亦可交互选区）
+    #[cfg(target_os = "linux")]
     Portal { conn: zbus::Connection },
     /// wlroots 系（Sway/Hyprland/Niri）：grim + slurp（需 feature "grim"）
     GrimSlurp,
@@ -210,6 +217,7 @@ impl Capturer {
 
     /// 降级重建：把共享实例替换为 Portal 后端（锁外新建 session 连接）并返回。
     /// 并发下若槽内已非 KDE（别的任务抢先降级，或原本就不是 KDE），直接采纳现值。
+    #[cfg(target_os = "linux")]
     async fn shared_fallback_portal() -> Result<&'static Capturer> {
         {
             let g = SHARED.lock().map_err(poisoned)?;
@@ -242,6 +250,7 @@ impl Capturer {
 
     /// 允许走 KDE→Portal 降级重试：仅当 self 是共享 KDE 实例，且错误判定可降级
     /// （[`should_fallback_to_portal`]）。
+    #[cfg(target_os = "linux")]
     fn portal_fallback_eligible(&self, e: &Error) -> bool {
         matches!(self, Capturer::KdeSpectacle { .. })
             && self.is_shared_instance()
@@ -250,7 +259,9 @@ impl Capturer {
 
     pub fn id(&self) -> &'static str {
         match self {
+            #[cfg(target_os = "linux")]
             Capturer::KdeSpectacle { .. } => "kde-spectacle",
+            #[cfg(target_os = "linux")]
             Capturer::Portal { .. } => "wayland-portal",
             Capturer::GrimSlurp => "grim-slurp",
             Capturer::Xcap => "xcap",
@@ -260,6 +271,7 @@ impl Capturer {
     pub fn caps(&self) -> Caps {
         match self {
             // Spectacle D-Bus: FullScreen / ActiveWindow / RectangularRegion 均可用
+            #[cfg(target_os = "linux")]
             Capturer::KdeSpectacle { .. } => Caps {
                 fullscreen: true,
                 region_native: true,
@@ -268,6 +280,7 @@ impl Capturer {
                 window_list: false,
             },
             // portal v2（KDE 6.8 实测）：全屏 OK；区域/窗口依赖各发行版后端实现
+            #[cfg(target_os = "linux")]
             Capturer::Portal { .. } => Caps {
                 fullscreen: true,
                 region_native: true, // 交互 UI；GNOME 上可选区域
@@ -298,6 +311,7 @@ impl Capturer {
 
     /// 无交互全屏帧。共享 KDE 实例失败（非取消/超时）时自动降级 Portal 重试一次。
     pub async fn fullscreen(&self) -> Result<Frame> {
+        #[cfg(target_os = "linux")]
         match self.fullscreen_once().await {
             Ok(f) => Ok(f),
             Err(e) if self.portal_fallback_eligible(&e) => {
@@ -305,11 +319,15 @@ impl Capturer {
             }
             Err(e) => Err(e),
         }
+        #[cfg(not(target_os = "linux"))]
+        self.fullscreen_once().await
     }
 
     async fn fullscreen_once(&self) -> Result<Frame> {
         match self {
+            #[cfg(target_os = "linux")]
             Capturer::KdeSpectacle { .. } => self.spectacle_call("FullScreen", &(0i32,)).await,
+            #[cfg(target_os = "linux")]
             Capturer::Portal { .. } => self.portal_shot(false).await,
             Capturer::GrimSlurp => Err(Error::Backend("grim 全屏待实现（本机无 grim）".into())),
             // xcap 无光标位置 API（0.9 未提供），按任务书取第一块显示器；
@@ -330,6 +348,7 @@ impl Capturer {
     /// 用户原生选区。选区 UI 由平台提供（Spectacle 覆盖层 / portal 交互窗 / slurp）。
     /// 共享 KDE 实例失败（非取消/超时）时自动降级 Portal 重试一次。
     pub async fn region_native(&self) -> Result<Frame> {
+        #[cfg(target_os = "linux")]
         match self.region_once().await {
             Ok(f) => Ok(f),
             Err(e) if self.portal_fallback_eligible(&e) => {
@@ -337,13 +356,17 @@ impl Capturer {
             }
             Err(e) => Err(e),
         }
+        #[cfg(not(target_os = "linux"))]
+        self.region_once().await
     }
 
     async fn region_once(&self) -> Result<Frame> {
         match self {
+            #[cfg(target_os = "linux")]
             Capturer::KdeSpectacle { .. } => {
                 self.spectacle_call("RectangularRegion", &(0i32,)).await
             }
+            #[cfg(target_os = "linux")]
             Capturer::Portal { .. } => self.portal_shot(true).await,
             Capturer::GrimSlurp => Err(Error::Backend("slurp 待实现（本机无 grim）".into())),
             // xcap 无选区 UI：调用方应按 caps.region_native=false 走内置冻结帧
@@ -358,6 +381,7 @@ impl Capturer {
     /// 窗口捕获，降级重试也会失败，故此处降级仅重建为 Portal 实例试探一次
     /// （与全屏/选区一致走统一管线，Portal 端报"不支持"即向上报错）。
     pub async fn active_window(&self) -> Result<Frame> {
+        #[cfg(target_os = "linux")]
         match self.active_once().await {
             Ok(f) => Ok(f),
             Err(e) if self.portal_fallback_eligible(&e) => {
@@ -365,11 +389,14 @@ impl Capturer {
             }
             Err(e) => Err(e),
         }
+        #[cfg(not(target_os = "linux"))]
+        self.active_once().await
     }
 
     async fn active_once(&self) -> Result<Frame> {
         match self {
             // 参数: includeWindowDecorations, includeMousePointer, includeWindowShadow
+            #[cfg(target_os = "linux")]
             Capturer::KdeSpectacle { .. } => {
                 self.spectacle_call("ActiveWindow", &(0i32, 0, 0)).await
             }
@@ -453,6 +480,7 @@ impl Capturer {
 
     // ---- KDE Spectacle ----
 
+    #[cfg(target_os = "linux")]
     async fn spectacle_call<B>(&self, method: &str, body: &B) -> Result<Frame>
     where
         // zbus 5.19 call_method 签名要求 body: Serialize + DynamicType 且 Sized（元组）
@@ -509,6 +537,7 @@ impl Capturer {
 
     // ---- xdg-desktop-portal ----
 
+    #[cfg(target_os = "linux")]
     async fn portal_shot(&self, interactive: bool) -> Result<Frame> {
         use ashpd::desktop::screenshot::Screenshot;
         let req = Screenshot::request()
@@ -535,6 +564,7 @@ impl Capturer {
 /// Connection 级 zbus::connection::Builder::method_timeout（builder.rs）。
 /// Spectacle 的选区/授权对话框可能等用户很久，放宽到 300s。
 /// （portal 的 ashpd 请求走自建连接，不受此超时影响。）
+#[cfg(target_os = "linux")]
 async fn session_conn() -> Result<zbus::Connection> {
     zbus::connection::Builder::session()
         .map_err(|e| Error::NoBackend(format!("session bus: {e}")))?
@@ -552,6 +582,7 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> Error {
 /// 用户取消 / 超时语义的关键词探测。Spectacle 的 ScreenshotFailed 原因串是
 /// 本地化文本，这里覆盖中英文常见表述；判定只服务于"要不要降级重试"，
 /// 宁可漏判（多报一次错）也不误降（用户取消后弹出 portal 授权窗）。
+#[cfg(target_os = "linux")]
 fn is_cancel_or_timeout(msg: &str) -> bool {
     const MARKS: [&str; 8] = [
         "cancel", "abort", "dismiss", "取消", "中止", "放弃", "timed out", "timeout",
@@ -564,6 +595,7 @@ fn is_cancel_or_timeout(msg: &str) -> bool {
 /// - `Backend`（D-Bus 错误 / 服务不存在 / 信号中断 / 崩溃）：降级——超时样消息除外
 /// - `Denied`（Spectacle 报失败）：非用户取消语义才降级
 /// - `NoBackend` / `Io`：不降级（Io 说明截图已产出、只是落盘解码失败，Portal 重试无意义）
+#[cfg(target_os = "linux")]
 fn should_fallback_to_portal(e: &Error) -> bool {
     match e {
         Error::Backend(m) | Error::Denied(m) => !is_cancel_or_timeout(m),
@@ -573,6 +605,7 @@ fn should_fallback_to_portal(e: &Error) -> bool {
 
 /// portal 权限被拒时的用户引导：仅当错误文本含 portal 痕迹时附加一句
 /// 处置建议（非交互全屏在 GNOME 等会话上最常见的失败形态就是授权被拒）。
+#[cfg(target_os = "linux")]
 fn with_portal_hint(msg: String) -> String {
     if msg.contains("portal") {
         format!("{msg}。可在系统设置→应用权限中允许截图，或改用 KDE Spectacle 后端")
@@ -649,6 +682,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn cancel_and_timeout_markers_are_recognized() {
         // 用户取消（中英文）与超时样消息
         for m in [
@@ -673,6 +707,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn fallback_decision_is_conservative() {
         // Backend/Denied（D-Bus/服务类失败）→ 降级
         assert!(should_fallback_to_portal(&Error::Backend(
@@ -694,6 +729,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn fallback_only_applies_to_shared_kde_instance() {
         // 非 KDE 后端永不降级（GrimSlurp 无需 D-Bus 连接，任意环境可构造）
         let g = Capturer::GrimSlurp;
@@ -702,6 +738,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn portal_hint_appended_only_with_portal_trace() {
         let hinted = with_portal_hint("portal response: access denied".into());
         assert!(hinted.contains("系统设置"), "应附加处置引导：{hinted}");
