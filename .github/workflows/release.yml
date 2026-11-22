@@ -225,15 +225,15 @@ jobs:
         run: cargo build --release --workspace --target ${{ matrix.target }}
         env:
           CXXFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-march=x86-64' || '' }}
-          OpenMP_ROOT: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/libomp' || '' }}
+          OpenMP_ROOT: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/opt/libomp' || '/usr/local/opt/libomp') || '' }}
           # oneDNN 的 OpenMP.cmake 只 append flags 不加 FindOpenMP 的
           # include 目录（上游对 AppleClang+brew libomp 的兼容缺口），
           # omp.h 找不到——CPATH 让 clang 直接搜到。
-          CPATH: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/libomp/include' || '' }}
+          CPATH: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/opt/libomp/include' || '/usr/local/opt/libomp/include') || '' }}
           # LIBRARY_PATH：clang 的 -L 补充（同 CPATH 之于 -I）。ct2rs 对
           # macOS 链 -lomp（brew libomp），但 /opt/homebrew/lib 不在 rustc
           # 传给链接器的默认搜索路径，缺此变量则 ld: library 'omp' not found。
-          LIBRARY_PATH: ${{ runner.os == 'macOS' && '/opt/homebrew/lib' || '' }}
+          LIBRARY_PATH: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/lib' || '/usr/local/lib') || '' }}
           # Windows：ct2rs 给 CTranslate2 传 static_crt(true)（/MT），Rust 侧
           # 必须同样 crt-static，否则 LNK2038 MT/MD 不匹配（静态 CRT 也免去
           # 用户装 VC++ redist）。onnxruntime.dll 是 /MD 自带 CRT，C API 纯 C
