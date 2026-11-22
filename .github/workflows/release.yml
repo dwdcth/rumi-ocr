@@ -209,7 +209,13 @@ jobs:
       # 装 brew libomp 并用 OpenMP_ROOT 让 CMake 的 FindOpenMP 命中。
       - name: Install libomp (macos only)
         if: runner.os == 'macOS'
-        run: brew install libomp
+        # link --force：libomp 是 keg-only，force 后 omp.h/libomp.dylib 进
+        # /opt/homebrew/{include,lib}（FindOpenMP 默认搜索路径）。不能只靠
+        # OpenMP_ROOT——CTranslate2 的 cmake_minimum_required(3.5) 使
+        # CMP0074 未启用，CMake 会显式忽略 <PackageName>_ROOT 环境变量。
+        run: |
+          brew install libomp
+          brew link --force libomp
 
       # ---- 构建 ----
       # CXXFLAGS 只在 x86_64 Linux 钉基线（原因见 ci.yml 同名注释：
@@ -224,6 +230,11 @@ jobs:
           # include 目录（上游对 AppleClang+brew libomp 的兼容缺口），
           # omp.h 找不到——CPATH 让 clang 直接搜到。
           CPATH: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/libomp/include' || '' }}
+          # Windows：ct2rs 给 CTranslate2 传 static_crt(true)（/MT），Rust 侧
+          # 必须同样 crt-static，否则 LNK2038 MT/MD 不匹配（静态 CRT 也免去
+          # 用户装 VC++ redist）。onnxruntime.dll 是 /MD 自带 CRT，C API 纯 C
+          # 跨边界不传 CRT 对象，混合合法。
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || '' }}
 
       - name: Diagnose ct2rs cmake flags (on failure)
         if: failure()
