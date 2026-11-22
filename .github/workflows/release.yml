@@ -10,17 +10,13 @@
 #   1. x86_64-unknown-linux-gnu    ubuntu-latest
 #   2. aarch64-unknown-linux-gnu   ubuntu-24.04-arm（公共仓库免费的 arm runner）
 #   3. x86_64-pc-windows-msvc      windows-latest
-#   4. aarch64-pc-windows-msvc     windows-11-arm（experimental：ct2rs 未必有
-#                                  win-arm64 预编译，失败不阻塞发布）
-#   5. x86_64-apple-darwin         macos-15-intel
-#   6. aarch64-apple-darwin        macos-latest
-#   7. universal2-apple-darwin     独立 job：下载 5+6 的裸 bin artifacts
-#                                  lipo 合并（不在单一 runner 上双 target 交叉
-#                                  构建——ct2rs build.rs 用宿主架构宏定
-#                                  CMAKE_OSX_ARCHITECTURES，交叉必错架构）
-#   8. loongarch64-unknown-linux-gnu QEMU 容器（ghcr.io/loong64/debian
-#                                  新世界）原生编译，experimental 试用期
-#                                  lipo 合并（不在单一 runner 上双 target 交叉
+#   4. x86_64-apple-darwin         macos-15-intel
+#   5. aarch64-apple-darwin        macos-latest
+#   6. loongarch64-unknown-linux-gnu QEMU 容器（ghcr.io/loong64/debian
+#                                  新世界）；CTranslate2 的 C++ 是 QEMU 编译
+#                                  大头（单轮 ~1h+），改用本仓库 loong64-deps
+#                                  release 里的预编译 libctranslate2.a
+#                                  （CT2RS_PREBUILT_DIR，ct2rs fork 支持）#                                  lipo 合并（不在单一 runner 上双 target 交叉
 #                                  构建——ct2rs build.rs 用宿主架构宏定
 #                                  CMAKE_OSX_ARCHITECTURES，交叉必错架构）
 #
@@ -81,10 +77,6 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             ort_rid: win-x64
-          - target: aarch64-pc-windows-msvc
-            os: windows-11-arm
-            ort_rid: win-arm64
-            experimental: true
           - target: x86_64-apple-darwin
             os: macos-15-intel
             ort_rid: osx-x64
@@ -341,88 +333,6 @@ jobs:
             rumi-${{ env.LABEL }}-${{ matrix.target }}.zip
           if-no-files-found: error
 
-      # macOS 单架构 job 额外传一份裸 bin 给 universal2 job lipo 合并用。
-      # （universal2 不能在单一 runner 上双 target 交叉构建：ct2rs build.rs
-      # 用宿主架构宏 cfg!(target_arch) 决定 CMAKE_OSX_ARCHITECTURES，在
-      # arm64 runner 上编 x86_64 slice 会把 CTranslate2 误编成 arm64。）
-      - name: Upload raw bins (macos, for universal2 lipo)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p rawbins
-          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
-            cp "target/${{ matrix.target }}/release/$b" rawbins/
-          done
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'macOS'
-        with:
-          name: bins-${{ matrix.target }}
-          path: rawbins
-          if-no-files-found: error
-
-  # universal2：合并两个原生 macOS job 的裸 bin（见上注），不再本机交叉。
-  universal2:
-    name: build (universal2-apple-darwin)
-    needs: build
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Determine release label
-        shell: bash
-        run: |
-          set -euxo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            label="${GITHUB_REF#refs/tags/}"
-          else
-            label="$(echo "$GITHUB_SHA" | cut -c1-7)"
-            suffix="${{ inputs.version-suffix }}"
-            if [ -n "$suffix" ]; then label="$label-$suffix"; fi
-          fi
-          echo "LABEL=$label" >> "$GITHUB_ENV"
-
-      - name: Download arch slices
-        uses: actions/download-artifact@v4
-        with:
-          pattern: bins-*
-          path: slices
-
-      - name: Lipo + package (universal2)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          x64_dir="slices/bins-x86_64-apple-darwin"
-          arm_dir="slices/bins-aarch64-apple-darwin"
-          test -d "$x64_dir" && test -d "$arm_dir"
-          # ort dylib：nuget 两份 lipo（同 build job 的源与版本）
-          curl -sSL -o /tmp/ort.nupkg \
-            "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/${ORT_VERSION}"
-          mkdir -p /tmp/ortx && unzip -q /tmp/ort.nupkg 'runtimes/osx-*' -d /tmp/ortx
-          target="universal2-apple-darwin"
-          stage="rumi-${LABEL}-${target}"
-          mkdir -p "$stage/lib"
-          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
-            lipo -create "$x64_dir/$b" "$arm_dir/$b" -output "$stage/$b"
-            install_name_tool -add_rpath @executable_path/lib "$stage/$b"
-            codesign --force --sign - "$stage/$b"
-          done
-          lipo -create \
-            /tmp/ortx/runtimes/osx-x64/native/libonnxruntime.dylib \
-            /tmp/ortx/runtimes/osx-arm64/native/libonnxruntime.dylib \
-            -output "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
-          codesign --force --sign - "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
-          cp README.md "$stage/" 2>/dev/null || true
-          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
-            printf '#!/bin/sh\nDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec "$DIR/%s" "$@"\n' "$b" > "$stage/run-$b.sh"
-            chmod +x "$stage/run-$b.sh"
-          done
-          tar czf "rumi-${LABEL}-${target}.tar.gz" "$stage"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rumi-${{ env.LABEL }}-universal2-apple-darwin
-          path: rumi-${{ env.LABEL }}-universal2-apple-darwin.tar.gz
-          if-no-files-found: error
-
   # 龙芯新世界（loongarch64）：GitHub 无原生 runner，走 QEMU 容器原生编译
   # （与 loong64/onnxruntime 官方构建同款路径；镜像 ghcr.io/loong64/debian
   # 是新世界 ABI 移植，按项目决策只支持新世界）。本地 QEMU 已全量验证
@@ -499,10 +409,20 @@ jobs:
           export PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig
           pkg-config --modversion libonnxruntime
 
+          # CTranslate2 预编译静态库（QEMU 下 C++ 编译是大头）：从本仓库
+          # loong64-deps release 下载，ct2rs 的 CT2RS_PREBUILT_DIR 直接链入，
+          # 跳过 CMake。头文件仍用源码树（git checkout 照常发生）。
+          mkdir -p /opt/ct2-prebuilt
+          curl -sSL -o /tmp/ct2.tgz \
+            "https://github.com/dwdcth/rumi-ocr/releases/download/loong64-deps/libctranslate2-loong64.tar.gz"
+          tar -xzf /tmp/ct2.tgz -C /opt/ct2-prebuilt
+          test -f /opt/ct2-prebuilt/libctranslate2.a
+
           cp -r /src /build
           cd /build
           rm -rf target
           export LD_LIBRARY_PATH=/opt/onnxruntime/lib
+          export CT2RS_PREBUILT_DIR=/opt/ct2-prebuilt
           cargo build --release --workspace --target loongarch64-unknown-linux-gnu
 
           # 打包（与 Linux 原生 job 同构：bins + ort so + run-*.sh）
@@ -535,7 +455,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [build, universal2, loongarch64]
+    needs: [build, loongarch64]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

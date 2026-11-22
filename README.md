@@ -81,7 +81,7 @@ cargo run -p rumi-translate -- --engine google --to zh "text" # 在线翻译
 ### 预编译包（CI 自动构建）
 
 [Releases](https://github.com/dwdcth/rumi-ocr/releases) 打 `v*` 标签即自动产出
-7 个平台包：Linux x64 / arm64、Windows x64 / arm64、macOS x64 / arm64 / universal2。
+6 个平台包：Linux x64 / arm64、Windows x64、macOS x64 / arm64、龙芯 loongarch64（新世界）。
 解压后：
 
 - **Windows**：`onnxruntime.dll` 已随包（与 exe 同目录），直接运行 `rumi-ui.exe`
