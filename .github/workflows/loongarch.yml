@@ -1,0 +1,141 @@
+# 龙芯（loongarch64，新世界）独立打包 workflow：手动触发。
+# 从 release.yml 拆出（发布不用等 2h 的 QEMU 长跑）。CTranslate2 用
+# loong64-deps release 的预编译 .a（CT2RS_PREBUILT_DIR），只编 Rust。
+name: loongarch64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version-suffix:
+        description: '版本后缀（无 tag 时拼进包名，如 beta1）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 龙芯新世界（loongarch64）：GitHub 无原生 runner，走 QEMU 容器原生编译
+  # （与 loong64/onnxruntime 官方构建同款路径；镜像 ghcr.io/loong64/debian
+  # 是新世界 ABI 移植，按项目决策只支持新世界）。本地 QEMU 已全量验证
+  # workspace 编译通过。慢是预期（QEMU 模拟 5-20x），timeout 预留 5.5h。
+  # ct2rs 依赖的 dwdcth/ctranslate2-rs fork 在此架构关 CPU dispatch + 无
+  # oneDNN（见 translate/Cargo.toml 注释），CT2 走内建 GEMM。
+  # onnxruntime 源：loong64/onnxruntime 社区构建（wheel 内嵌 C 库，
+  # 1.32.0；SONAME=libonnxruntime.so.1 与官方一致）。
+  # 首版 experimental（QEMU 时长风险），跑稳一个 tag 后转正。
+  loongarch64:
+    name: build (loongarch64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    continue-on-error: true
+    env:
+      LOONG_ORT_VERSION: "1.32.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release label
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            label="${GITHUB_REF#refs/tags/}"
+          else
+            label="$(echo "$GITHUB_SHA" | cut -c1-7)"
+            suffix="${{ inputs.version-suffix }}"
+            if [ -n "$suffix" ]; then label="$label-$suffix"; fi
+          fi
+          echo "LABEL=$label" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: loong64
+
+      # 脚本经 heredoc 落盘再 docker exec，避免多层引号转义。
+      - name: Build in QEMU loong64 container
+        run: |
+          cat > /tmp/loong-build.sh <<'EOS'
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build git curl unzip python3 ca-certificates pkg-config \
+            libssl-dev libclang-dev clang \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libudev-dev \
+            libayatana-appindicator3-dev libglib2.0-dev libxdo-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libgbm-dev libdrm-dev libx11-dev libxcb1-dev libwayland-dev
+
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          . ~/.cargo/env
+
+          # onnxruntime：loong64 社区构建（wheel 内嵌 C 库）
+          VER="1.32.0"
+          mkdir -p /opt/onnxruntime/lib/pkgconfig
+          curl -sL -o /tmp/ort.whl \
+            "https://github.com/loong64/onnxruntime/releases/download/v${VER}/onnxruntime-${VER}-cp313-cp313-manylinux_2_38_loongarch64.whl"
+          python3 -c "import zipfile; zipfile.ZipFile('/tmp/ort.whl').extractall('/tmp/ortx')"
+          cp "/tmp/ortx/onnxruntime/capi/libonnxruntime.so.${VER}" /opt/onnxruntime/lib/
+          ln -sf "libonnxruntime.so.${VER}" /opt/onnxruntime/lib/libonnxruntime.so
+          # SONAME=libonnxruntime.so.1（与官方包一致，运行期 loader 按此名找）
+          ln -sf "libonnxruntime.so.${VER}" /opt/onnxruntime/lib/libonnxruntime.so.1
+          cat > /opt/onnxruntime/lib/pkgconfig/libonnxruntime.pc <<PC
+          prefix=/opt/onnxruntime
+          libdir=\${prefix}/lib
+
+          Name: libonnxruntime
+          Description: ONNX Runtime (loong64 community build, dynamic link)
+          Version: ${VER}
+          Libs: -L\${libdir} -lonnxruntime
+          PC
+          export PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig
+          pkg-config --modversion libonnxruntime
+
+          # CTranslate2 预编译静态库（QEMU 下 C++ 编译是大头）：从本仓库
+          # loong64-deps release 下载，ct2rs 的 CT2RS_PREBUILT_DIR 直接链入，
+          # 跳过 CMake。头文件仍用源码树（git checkout 照常发生）。
+          mkdir -p /opt/ct2-prebuilt
+          curl -sSL -o /tmp/ct2.tgz \
+            "https://github.com/dwdcth/rumi-ocr/releases/download/loong64-deps/libctranslate2-loong64.tar.gz"
+          tar -xzf /tmp/ct2.tgz -C /opt/ct2-prebuilt
+          test -f /opt/ct2-prebuilt/libctranslate2.a
+
+          cp -r /src /build
+          cd /build
+          rm -rf target
+          export LD_LIBRARY_PATH=/opt/onnxruntime/lib
+          export CT2RS_PREBUILT_DIR=/opt/ct2-prebuilt
+          cargo build --release --workspace --target loongarch64-unknown-linux-gnu
+
+          # 打包（与 Linux 原生 job 同构：bins + ort so + run-*.sh）
+          target=loongarch64-unknown-linux-gnu
+          stage="rumi-${LABEL}-${target}"
+          mkdir -p "/out/${stage}/lib"
+          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
+            cp "target/${target}/release/$b" "/out/${stage}/"
+            printf '#!/bin/sh\nDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$DIR/%s" "$@"\n' "$b" > "/out/${stage}/run-$b.sh"
+            chmod +x "/out/${stage}/run-$b.sh"
+          done
+          cp -P /opt/onnxruntime/lib/libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1 "/out/${stage}/lib/"
+          cp README.md "/out/${stage}/" 2>/dev/null || true
+          tar czf "/out/rumi-${LABEL}-${target}.tar.gz" -C /out "$stage"
+          ls -la /out
+          EOS
+
+          docker run -d --name rumi-loong --platform linux/loong64 \
+            -v "$GITHUB_WORKSPACE":/src:ro \
+            ghcr.io/loong64/debian:trixie sleep infinity
+          docker cp /tmp/loong-build.sh rumi-loong:/tmp/loong-build.sh
+          docker exec -e LABEL="$LABEL" rumi-loong bash /tmp/loong-build.sh
+          mkdir -p dist
+          docker cp rumi-loong:/out/. dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rumi-${{ env.LABEL }}-loongarch64-unknown-linux-gnu
+          path: dist/rumi-${{ env.LABEL }}-loongarch64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+
