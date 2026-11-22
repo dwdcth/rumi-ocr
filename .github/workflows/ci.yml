@@ -62,7 +62,7 @@ jobs:
           sudo ln -sf libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1
           sudo cp -r build/native/include/. /opt/onnxruntime/include/
           sudo mkdir -p /opt/onnxruntime/lib/pkgconfig
-          sudo tee /opt/onnxruntime/lib/pkgconfig/onnxruntime.pc >/dev/null <<EOF
+          sudo tee /opt/onnxruntime/lib/pkgconfig/libonnxruntime.pc >/dev/null <<EOF
           prefix=/opt/onnxruntime
           libdir=\${prefix}/lib
           includedir=\${prefix}/include
