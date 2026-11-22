@@ -17,12 +17,20 @@
 #   7. universal2-apple-darwin     macos-latest（lipo 合并 5+6，Mac 分发主流形态）
 #
 # onnxruntime 策略（全平台一致）：ort-sys 走 pkg-config 动态链（防双
-# protobuf 互劫持，因果见 server/Cargo.toml ort-sys 注释）。CI 下载微软
-# 官方预编译包 + 手写 .pc；Windows 加装 pkgconfiglite。win-arm64 没有
-# GitHub release 资产，改从 nuget 包（Microsoft.ML.OnnxRuntime.Runtime.
-# win-arm64，本质是 zip）取 native 库。动态库随分发包走：Windows 带
-# onnxruntime.dll（exe 同目录自动加载）；Linux/macOS 带 lib/ + run-*.sh
-# 包装脚本设 LD_LIBRARY_PATH / DYLD_LIBRARY_PATH。
+# protobuf 互劫持，因果见 server/Cargo.toml ort-sys 注释）。源用 NuGet
+# 官方包 Microsoft.ML.OnnxRuntime（主包内嵌全 RID 的 runtimes/<rid>/
+# native/，本质是 zip）——微软官方 GitHub 仓库 2026-11-17 起整体 404，
+# release 资产全灭，但 PyPI/NuGet 分发未受影响。Windows 加装
+# pkgconfiglite 供 ort-sys 的 pkg-config 探测。
+#
+# 动态库随分发包走 + 各平台按链接器语义落位：
+# - Windows：onnxruntime.dll 与 exe 同目录（加载器自动找）。
+# - Linux：DT_NEEDED 是 SONAME libonnxruntime.so.1，包内 lib/ 放实体
+#   libonnxruntime.so + 符号链接 .so.1，run-*.sh 设 LD_LIBRARY_PATH。
+# - macOS：dylib 的 install_name 是 @rpath/libonnxruntime.<ver>.dylib，
+#   DYLD_LIBRARY_PATH 对 @rpath 依赖无效——包内 lib/ 按 install_name
+#   命名放 dylib，并用 install_name_tool 给每个 bin 加 LC_RPATH=
+#   @executable_path/lib（add_rpath 改动二进制后 codesign ad-hoc 重签）。
 
 name: release
 
@@ -41,7 +49,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  ORT_VERSION: "1.22.0"
+  ORT_VERSION: "1.22.1"
   # 与 docforge release 同款发布档位：thin LTO + 单 codegen unit + 剥符号
   # （经 CARGO_PROFILE_* 环境变量下发，不动 workspace Cargo.toml，
   # 本地构建行为不受影响）。
@@ -58,26 +66,26 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            ort_pkg: linux-x64
+            ort_rid: linux-x64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            ort_pkg: linux-arm64
+            ort_rid: linux-arm64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            ort_pkg: win-x64
+            ort_rid: win-x64
           - target: aarch64-pc-windows-msvc
             os: windows-11-arm
-            ort_pkg: win-arm64
+            ort_rid: win-arm64
             experimental: true
           - target: x86_64-apple-darwin
             os: macos-15-intel
-            ort_pkg: osx-x86_64
+            ort_rid: osx-x64
           - target: aarch64-apple-darwin
             os: macos-latest
-            ort_pkg: osx-arm64
+            ort_rid: osx-arm64
           - target: universal2-apple-darwin
             os: macos-latest
-            ort_pkg: osx-universal
+            ort_rid: osx-x64+osx-arm64
             # lipo 需要同时装两个 target
             rust_targets: 'x86_64-apple-darwin,aarch64-apple-darwin'
     runs-on: ${{ matrix.os }}
@@ -106,18 +114,36 @@ jobs:
             libglib2.0-dev \
             libxdo-dev
 
-      # ---- onnxruntime 准备（按平台分支）----
-      # 非 Windows：GH release tgz → /opt/onnxruntime（universal 特殊：两
-      # 份，构建时分别指 PKG_CONFIG_PATH，不设全局）。
+      # ---- onnxruntime 准备（NuGet 统一源，按平台分支落位）----
+      # unix：nuget 主包（zip）解出 runtimes/<rid>/native/ → /opt 布局 +
+      # 手写 .pc。universal2 解两份（构建步按架构内联指 PKG_CONFIG_PATH）。
+      # 来源改 NuGet 的原因：微软官方 GitHub 仓库 2026-11-17 起整体 404，
+      # GH release 资产全灭；PyPI/NuGet 分发未受影响。
       - name: Prepare onnxruntime (unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euxo pipefail
-          write_pc() { # $1 = 目录前缀（/opt 下 root 所有，sudo 写）
-            sudo mkdir -p "$1/lib/pkgconfig"
-            sudo tee "$1/lib/pkgconfig/onnxruntime.pc" >/dev/null <<EOF
-          prefix=$1
+          curl -sSL -o /tmp/ort.nupkg \
+            "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/${ORT_VERSION}"
+          mkdir -p /tmp/ortx && cd /tmp/ortx
+          unzip -q /tmp/ort.nupkg 'runtimes/*' 'build/native/include/*'
+          install_rid() { # $1 = nuget rid，$2 = /opt 目标目录
+            sudo mkdir -p "$2/lib" "$2/include"
+            sudo cp -r build/native/include/. "$2/include/"
+            case "$1" in
+              linux-*)
+                sudo cp "runtimes/$1/native/libonnxruntime.so" "$2/lib/"
+                # SONAME=libonnxruntime.so.1：运行期 loader 按此名解析
+                sudo ln -sf libonnxruntime.so "$2/lib/libonnxruntime.so.1"
+                ;;
+              osx-*)
+                sudo cp "runtimes/$1/native/libonnxruntime.dylib" "$2/lib/"
+                ;;
+            esac
+            sudo mkdir -p "$2/lib/pkgconfig"
+            sudo tee "$2/lib/pkgconfig/onnxruntime.pc" >/dev/null <<EOF
+          prefix=$2
           libdir=\${prefix}/lib
           includedir=\${prefix}/include
 
@@ -128,70 +154,33 @@ jobs:
           Cflags: -I\${includedir}
           EOF
           }
-          case "${{ matrix.ort_pkg }}" in
-            osx-universal)
-              for arch in x86_64 arm64; do
-                pkg="onnxruntime-osx-${arch}-${ORT_VERSION}"
-                sudo mkdir -p "/opt/ort-${arch}"
-                curl -sSL -o /tmp/ort.tgz \
-                  "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${pkg}.tgz"
-                sudo tar -xzf /tmp/ort.tgz -C "/opt/ort-${arch}" --strip-components=1
-                write_pc "/opt/ort-${arch}"
-              done
+          case "${{ matrix.ort_rid }}" in
+            osx-x64+osx-arm64)
+              install_rid osx-x64 /opt/ort-x86_64
+              install_rid osx-arm64 /opt/ort-arm64
               ;;
             *)
-              pkg="onnxruntime-${{ matrix.ort_pkg }}-${ORT_VERSION}"
-              sudo mkdir -p /opt/onnxruntime
-              curl -sSL -o /tmp/ort.pkg \
-                "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${pkg}.tgz"
-              sudo tar -xzf /tmp/ort.pkg -C /opt/onnxruntime --strip-components=1
-              write_pc /opt/onnxruntime
+              install_rid "${{ matrix.ort_rid }}" /opt/onnxruntime
               echo "PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig" >> "$GITHUB_ENV"
               ;;
           esac
 
-      # Windows x64：GH release zip（布局：顶层/{onnxruntime.dll, lib/onnxruntime.lib}）。
-      - name: Prepare onnxruntime + pkg-config (windows x64)
-        if: runner.os == 'Windows' && matrix.ort_pkg == 'win-x64'
+      # Windows：同一 nuget 主包，tar (bsdtar) 按 RID 选择性解压（比
+      # Expand-Archive 全量解 500MB 快得多）+ pkgconfiglite 提供探测。
+      - name: Prepare onnxruntime + pkg-config (windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           choco install pkgconfiglite --no-progress -y
-          $pkg = "onnxruntime-win-x64-$env:ORT_VERSION"
-          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$env:ORT_VERSION/$pkg.zip"
+          $rid = '${{ matrix.ort_rid }}'
+          $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/$env:ORT_VERSION"
           Invoke-WebRequest -Uri $url -OutFile C:\ort.zip
-          Expand-Archive C:\ort.zip -DestinationPath C:\ort-raw
+          New-Item -ItemType Directory -Force C:\ort-raw | Out-Null
+          tar -xf C:\ort.zip -C C:\ort-raw "runtimes/$rid/native"
           New-Item -ItemType Directory -Force C:\onnxruntime\lib | Out-Null
-          Copy-Item (Get-ChildItem C:\ort-raw -Recurse -Filter onnxruntime.dll | Select-Object -First 1).FullName C:\onnxruntime\
-          Copy-Item (Get-ChildItem C:\ort-raw -Recurse -Filter onnxruntime.lib | Select-Object -First 1).FullName C:\onnxruntime\lib\
-          New-Item -ItemType Directory -Force C:\onnxruntime\lib\pkgconfig | Out-Null
-          $pc = @(
-            'prefix=C:/onnxruntime'
-            'libdir=${prefix}/lib'
-            ''
-            'Name: onnxruntime'
-            'Description: ONNX Runtime (dynamic link)'
-            "Version: $env:ORT_VERSION"
-            'Libs: -L${libdir} -lonnxruntime'
-            'Cflags: -I${prefix}/include'
-          ) -join "`n"
-          Set-Content -Path C:\onnxruntime\lib\pkgconfig\onnxruntime.pc -Value $pc
-          "PKG_CONFIG_PATH=C:\onnxruntime\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      # Windows arm64：GH release 无资产，改从 nuget 包取 native 库
-      # （nuget 包本质是 zip：runtimes/win-arm64/native/{onnxruntime.dll,.lib}）。
-      - name: Prepare onnxruntime + pkg-config (windows arm64)
-        if: runner.os == 'Windows' && matrix.ort_pkg == 'win-arm64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          choco install pkgconfiglite --no-progress -y
-          $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.Runtime.win-arm64/$env:ORT_VERSION"
-          Invoke-WebRequest -Uri $url -OutFile C:\ort.zip
-          Expand-Archive C:\ort.zip -DestinationPath C:\ort-raw
-          New-Item -ItemType Directory -Force C:\onnxruntime\lib | Out-Null
-          Copy-Item C:\ort-raw\runtimes\win-arm64\native\onnxruntime.dll C:\onnxruntime\
-          Copy-Item C:\ort-raw\runtimes\win-arm64\native\onnxruntime.lib C:\onnxruntime\lib\
+          Copy-Item "C:\ort-raw\runtimes\$rid\native\onnxruntime.dll" C:\onnxruntime\
+          Copy-Item "C:\ort-raw\runtimes\$rid\native\onnxruntime.lib" C:\onnxruntime\lib\
           New-Item -ItemType Directory -Force C:\onnxruntime\lib\pkgconfig | Out-Null
           $pc = @(
             'prefix=C:/onnxruntime'
@@ -211,7 +200,7 @@ jobs:
       # universal2 的 PKG_CONFIG_PATH 按架构在构建步内联指定，这里探
       # 其中一份即可（两份布局相同）。
       - name: Verify onnxruntime discoverable via pkg-config
-        if: matrix.ort_pkg != 'osx-universal'
+        if: matrix.ort_rid != 'osx-x64+osx-arm64'
         shell: bash
         run: pkg-config --modversion onnxruntime
 
@@ -265,29 +254,41 @@ jobs:
             cp "target/${target}/release/$b" "$stage/"
           done
           cp README.md "$stage/" 2>/dev/null || true
-          # ort 动态库 + run-*.sh 包装（LD/DYLD_LIBRARY_PATH 指包内 lib/）
-          case "${{ matrix.ort_pkg }}" in
+          # ort 动态库落位（平台各自的链接器语义，见文件头注释）
+          case "${{ matrix.ort_rid }}" in
             linux-*)
-              cp -P /opt/onnxruntime/lib/libonnxruntime.so* "$stage/lib/"
-              dyld=''
+              # 实体 .so + SONAME 符号链接 .so.1（cp -P 保留链接，tar 同样保留）
+              cp -P /opt/onnxruntime/lib/libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1 "$stage/lib/"
               ;;
-            osx-universal)
+            osx-x64+osx-arm64)
               lipo -create \
                 /opt/ort-x86_64/lib/libonnxruntime.dylib \
                 /opt/ort-arm64/lib/libonnxruntime.dylib \
-                -output "$stage/lib/libonnxruntime.dylib"
-              dyld='DYLD_'
+                -output "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
               ;;
             osx-*)
-              cp /opt/onnxruntime/lib/libonnxruntime.dylib "$stage/lib/"
-              dyld='DYLD_'
+              cp /opt/onnxruntime/lib/libonnxruntime.dylib \
+                "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
               ;;
           esac
+          # macOS：依赖记的是 @rpath/libonnxruntime.<ver>.dylib，给每个 bin
+          # 加 LC_RPATH=@executable_path/lib 指包内；add_rpath 动过二进制，
+          # ad-hoc 重签（arm64 无签名直接拒绝加载）。
+          if [[ "${{ matrix.ort_rid }}" == osx-* ]]; then
+            for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
+              install_name_tool -add_rpath @executable_path/lib "$stage/$b"
+              codesign --force --sign - "$stage/$b"
+            done
+          fi
+          # run-*.sh：Linux 设 LD_LIBRARY_PATH（SONAME 解析）；macOS 已有
+          # rpath，wrapper 只为统一入口
           for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
             {
               echo '#!/bin/sh'
               echo 'DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)'
-              echo "export ${dyld}LD_LIBRARY_PATH=\"\$DIR/lib:\$${dyld}LD_LIBRARY_PATH\""
+              if [[ "${{ matrix.ort_rid }}" == linux-* ]]; then
+                echo 'export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"'
+              fi
               echo "exec \"\$DIR/$b\" \"\$@\""
             } > "$stage/run-$b.sh"
             chmod +x "$stage/run-$b.sh"

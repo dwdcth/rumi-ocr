@@ -20,7 +20,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  ORT_VERSION: "1.22.0"
+  ORT_VERSION: "1.22.1"
 
 jobs:
   check-and-test:
@@ -44,15 +44,21 @@ jobs:
             libglib2.0-dev \
             libxdo-dev
 
-      # onnxruntime 不在 Ubuntu 官方源里：下载微软官方预编译包 +
-      # 手写 .pc，让 ort-sys 的 pkg-config 探测命中动态库。
+      # onnxruntime 不在 Ubuntu 官方源里：从 NuGet 官方包（微软 GitHub 仓库
+      # 2026-11-17 起整体 404，release 资产全灭，PyPI/NuGet 未受影响）解出
+      # linux-x64 native 库 + 手写 .pc，让 ort-sys 的 pkg-config 探测命中
+      # 动态库。SONAME=libonnxruntime.so.1，运行期 loader 按此名找。
       - name: Prepare onnxruntime (pkg-config, dynamic link)
         run: |
           set -euxo pipefail
-          curl -sSL -o /tmp/ort.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
-          sudo mkdir -p /opt/onnxruntime
-          sudo tar -xzf /tmp/ort.tgz -C /opt/onnxruntime --strip-components=1
+          curl -sSL -o /tmp/ort.nupkg \
+            "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/${ORT_VERSION}"
+          mkdir -p /tmp/ortx && cd /tmp/ortx
+          unzip -q /tmp/ort.nupkg 'runtimes/linux-x64/native/*' 'build/native/include/*'
+          sudo mkdir -p /opt/onnxruntime/lib /opt/onnxruntime/include
+          sudo cp runtimes/linux-x64/native/libonnxruntime.so /opt/onnxruntime/lib/
+          sudo ln -sf libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1
+          sudo cp -r build/native/include/. /opt/onnxruntime/include/
           sudo mkdir -p /opt/onnxruntime/lib/pkgconfig
           sudo tee /opt/onnxruntime/lib/pkgconfig/onnxruntime.pc >/dev/null <<EOF
           prefix=/opt/onnxruntime
