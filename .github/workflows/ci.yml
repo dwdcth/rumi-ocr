@@ -73,10 +73,10 @@ jobs:
           Libs: -L\${libdir} -lonnxruntime
           Cflags: -I\${includedir}
           EOF
-          echo "PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
           # 运行期：测试进程加载 libonnxruntime.so（链接期走 .pc，加载期
           # loader 不认 pkg-config），/opt 非默认搜索路径必须显式给。
-          echo "LD_LIBRARY_PATH=/opt/onnxruntime/lib" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=/opt/onnxruntime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       # 断言：探测不到直接红，不给 ort-sys 静默回退静态库的机会。
       - name: Verify onnxruntime discoverable via pkg-config

@@ -14,7 +14,10 @@
 #                                  win-arm64 预编译，失败不阻塞发布）
 #   5. x86_64-apple-darwin         macos-15-intel
 #   6. aarch64-apple-darwin        macos-latest
-#   7. universal2-apple-darwin     macos-latest（lipo 合并 5+6，Mac 分发主流形态）
+#   7. universal2-apple-darwin     独立 job：下载 5+6 的裸 bin artifacts
+#                                  lipo 合并（不在单一 runner 上双 target 交叉
+#                                  构建——ct2rs build.rs 用宿主架构宏定
+#                                  CMAKE_OSX_ARCHITECTURES，交叉必错架构）
 #
 # onnxruntime 策略（全平台一致）：ort-sys 走 pkg-config 动态链（防双
 # protobuf 互劫持，因果见 server/Cargo.toml ort-sys 注释）。源用 NuGet
@@ -83,11 +86,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             ort_rid: osx-arm64
-          - target: universal2-apple-darwin
-            os: macos-latest
-            ort_rid: osx-x64+osx-arm64
-            # lipo 需要同时装两个 target
-            rust_targets: 'x86_64-apple-darwin,aarch64-apple-darwin'
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental == true }}
     steps:
@@ -95,11 +93,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.rust_targets || matrix.target }}
+          targets: ${{ matrix.target }}
 
+      # envVars 把 ORT_VERSION 纳入缓存键：target/ 里有 ct2rs 的 CMake
+      # 产物（CMakeCache/libctranslate2.a），ORT 换版本而 lock 未变时
+      # 防止复用脏缓存。
       - uses: Swatinem/rust-cache@v2
         with:
           prefix: release-${{ matrix.target }}
+          envVars: ORT_VERSION
 
       - name: Install desktop system deps (linux only)
         if: runner.os == 'Linux'
@@ -118,7 +120,7 @@ jobs:
 
       # ---- onnxruntime 准备（NuGet 统一源，按平台分支落位）----
       # unix：nuget 主包（zip）解出 runtimes/<rid>/native/ → /opt 布局 +
-      # 手写 .pc。universal2 解两份（构建步按架构内联指 PKG_CONFIG_PATH）。
+      # 手写 .pc（探测名 libonnxruntime——ort-sys probe 的名字）。
       # 来源改 NuGet 的原因：微软官方 GitHub 仓库 2026-11-17 起整体 404，
       # GH release 资产全灭；PyPI/NuGet 分发未受影响。
       - name: Prepare onnxruntime (unix)
@@ -130,22 +132,21 @@ jobs:
             "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/${ORT_VERSION}"
           mkdir -p /tmp/ortx && cd /tmp/ortx
           unzip -q /tmp/ort.nupkg 'runtimes/*' 'build/native/include/*'
-          install_rid() { # $1 = nuget rid，$2 = /opt 目标目录
-            sudo mkdir -p "$2/lib" "$2/include"
-            sudo cp -r build/native/include/. "$2/include/"
-            case "$1" in
-              linux-*)
-                sudo cp "runtimes/$1/native/libonnxruntime.so" "$2/lib/"
-                # SONAME=libonnxruntime.so.1：运行期 loader 按此名解析
-                sudo ln -sf libonnxruntime.so "$2/lib/libonnxruntime.so.1"
-                ;;
-              osx-*)
-                sudo cp "runtimes/$1/native/libonnxruntime.dylib" "$2/lib/"
-                ;;
-            esac
-            sudo mkdir -p "$2/lib/pkgconfig"
-            sudo tee "$2/lib/pkgconfig/libonnxruntime.pc" >/dev/null <<EOF
-          prefix=$2
+          sudo mkdir -p /opt/onnxruntime/lib /opt/onnxruntime/include
+          sudo cp -r build/native/include/. /opt/onnxruntime/include/
+          case "${{ matrix.ort_rid }}" in
+            linux-*)
+              sudo cp "runtimes/${{ matrix.ort_rid }}/native/libonnxruntime.so" /opt/onnxruntime/lib/
+              # SONAME=libonnxruntime.so.1：运行期 loader 按此名解析
+              sudo ln -sf libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1
+              ;;
+            osx-*)
+              sudo cp "runtimes/${{ matrix.ort_rid }}/native/libonnxruntime.dylib" /opt/onnxruntime/lib/
+              ;;
+          esac
+          sudo mkdir -p /opt/onnxruntime/lib/pkgconfig
+          sudo tee /opt/onnxruntime/lib/pkgconfig/libonnxruntime.pc >/dev/null <<EOF
+          prefix=/opt/onnxruntime
           libdir=\${prefix}/lib
           includedir=\${prefix}/include
 
@@ -155,17 +156,7 @@ jobs:
           Libs: -L\${libdir} -lonnxruntime
           Cflags: -I\${includedir}
           EOF
-          }
-          case "${{ matrix.ort_rid }}" in
-            osx-x64+osx-arm64)
-              install_rid osx-x64 /opt/ort-x86_64
-              install_rid osx-arm64 /opt/ort-arm64
-              ;;
-            *)
-              install_rid "${{ matrix.ort_rid }}" /opt/onnxruntime
-              echo "PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig" >> "$GITHUB_ENV"
-              ;;
-          esac
+          echo "PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
 
       # Windows：同一 nuget 主包，tar (bsdtar) 按 RID 选择性解压（比
       # Expand-Archive 全量解 500MB 快得多）+ pkgconfiglite 提供探测。
@@ -179,8 +170,9 @@ jobs:
           $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/$env:ORT_VERSION"
           Invoke-WebRequest -Uri $url -OutFile C:\ort.zip
           New-Item -ItemType Directory -Force C:\ort-raw | Out-Null
-          tar -xf C:\ort.zip -C C:\ort-raw "runtimes/$rid/native"
+          tar -xf C:\ort.zip -C C:\ort-raw "runtimes/$rid/native" "build/native/include"
           New-Item -ItemType Directory -Force C:\onnxruntime\lib | Out-Null
+          Copy-Item C:\ort-raw\build\native\include C:\onnxruntime\include -Recurse -Force
           Copy-Item "C:\ort-raw\runtimes\$rid\native\onnxruntime.dll" C:\onnxruntime\
           Copy-Item "C:\ort-raw\runtimes\$rid\native\onnxruntime.lib" C:\onnxruntime\lib\
           New-Item -ItemType Directory -Force C:\onnxruntime\lib\pkgconfig | Out-Null
@@ -199,37 +191,17 @@ jobs:
 
       # 断言：探测不到直接红，不给 ort-sys 静默回退静态库
       # （回退会重新引入第二份 protobuf，运行期 SIGSEGV）的机会。
-      # universal2 的 PKG_CONFIG_PATH 按架构在构建步内联指定，这里探
-      # 其中一份即可（两份布局相同）。
       - name: Verify onnxruntime discoverable via pkg-config
-        if: matrix.ort_rid != 'osx-x64+osx-arm64'
         shell: bash
         run: pkg-config --modversion libonnxruntime
 
       # ---- 构建 ----
-      - name: Build (single target)
-        if: matrix.target != 'universal2-apple-darwin'
+      - name: Build
         shell: bash
         run: cargo build --release --workspace --target ${{ matrix.target }}
 
-      - name: "Build (universal2: two slices + lipo)"
-        if: matrix.target == 'universal2-apple-darwin'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          PKG_CONFIG_PATH=/opt/ort-x86_64/lib/pkgconfig \
-            cargo build --release --workspace --target x86_64-apple-darwin
-          PKG_CONFIG_PATH=/opt/ort-arm64/lib/pkgconfig \
-            cargo build --release --workspace --target aarch64-apple-darwin
-          mkdir -p target/universal2-apple-darwin/release
-          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
-            lipo -create \
-              "target/x86_64-apple-darwin/release/$b" \
-              "target/aarch64-apple-darwin/release/$b" \
-              -output "target/universal2-apple-darwin/release/$b"
-          done
-
       # ---- 包名（tag 名 / short sha + 可选后缀）----
+      # 注意：LABEL 不带 rumi- 前缀（打包步会拼 rumi-${LABEL}-<target>）。
       - name: Determine release label
         shell: bash
         run: |
@@ -237,7 +209,7 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             label="${GITHUB_REF#refs/tags/}"
           else
-            label="rumi-$(echo "$GITHUB_SHA" | cut -c1-7)"
+            label="$(echo "$GITHUB_SHA" | cut -c1-7)"
             suffix="${{ inputs.version-suffix }}"
             if [ -n "$suffix" ]; then label="$label-$suffix"; fi
           fi
@@ -262,12 +234,6 @@ jobs:
               # 实体 .so + SONAME 符号链接 .so.1（cp -P 保留链接，tar 同样保留）
               cp -P /opt/onnxruntime/lib/libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1 "$stage/lib/"
               ;;
-            osx-x64+osx-arm64)
-              lipo -create \
-                /opt/ort-x86_64/lib/libonnxruntime.dylib \
-                /opt/ort-arm64/lib/libonnxruntime.dylib \
-                -output "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
-              ;;
             osx-*)
               cp /opt/onnxruntime/lib/libonnxruntime.dylib \
                 "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
@@ -275,21 +241,23 @@ jobs:
           esac
           # macOS：依赖记的是 @rpath/libonnxruntime.<ver>.dylib，给每个 bin
           # 加 LC_RPATH=@executable_path/lib 指包内；add_rpath 动过二进制，
-          # ad-hoc 重签（arm64 无签名直接拒绝加载）。
+          # ad-hoc 重签（arm64 无签名直接拒绝加载）。dylib 一并重签——
+          # nuget 解出的原 dylib 无有效签名，arm64 加载同样会被拒。
           if [[ "${{ matrix.ort_rid }}" == osx-* ]]; then
             for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
               install_name_tool -add_rpath @executable_path/lib "$stage/$b"
               codesign --force --sign - "$stage/$b"
             done
+            codesign --force --sign - "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
           fi
-          # run-*.sh：Linux 设 LD_LIBRARY_PATH（SONAME 解析）；macOS 已有
-          # rpath，wrapper 只为统一入口
+          # run-*.sh：Linux 设 LD_LIBRARY_PATH（SONAME 解析，尾部追加式防
+          # 空段引入 CWD 搜索）；macOS 已有 rpath，wrapper 只为统一入口
           for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
             {
               echo '#!/bin/sh'
               echo 'DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)'
               if [[ "${{ matrix.ort_rid }}" == linux-* ]]; then
-                echo 'export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"'
+                echo 'export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
               fi
               echo "exec \"\$DIR/$b\" \"\$@\""
             } > "$stage/run-$b.sh"
@@ -321,8 +289,90 @@ jobs:
             rumi-${{ env.LABEL }}-${{ matrix.target }}.zip
           if-no-files-found: error
 
-  release:
+      # macOS 单架构 job 额外传一份裸 bin 给 universal2 job lipo 合并用。
+      # （universal2 不能在单一 runner 上双 target 交叉构建：ct2rs build.rs
+      # 用宿主架构宏 cfg!(target_arch) 决定 CMAKE_OSX_ARCHITECTURES，在
+      # arm64 runner 上编 x86_64 slice 会把 CTranslate2 误编成 arm64。）
+      - name: Upload raw bins (macos, for universal2 lipo)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p rawbins
+          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
+            cp "target/${{ matrix.target }}/release/$b" rawbins/
+          done
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: bins-${{ matrix.target }}
+          path: rawbins
+          if-no-files-found: error
+
+  # universal2：合并两个原生 macOS job 的裸 bin（见上注），不再本机交叉。
+  universal2:
+    name: build (universal2-apple-darwin)
     needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release label
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            label="${GITHUB_REF#refs/tags/}"
+          else
+            label="$(echo "$GITHUB_SHA" | cut -c1-7)"
+            suffix="${{ inputs.version-suffix }}"
+            if [ -n "$suffix" ]; then label="$label-$suffix"; fi
+          fi
+          echo "LABEL=$label" >> "$GITHUB_ENV"
+
+      - name: Download arch slices
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bins-*
+          path: slices
+
+      - name: Lipo + package (universal2)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          x64_dir="slices/bins-x86_64-apple-darwin"
+          arm_dir="slices/bins-aarch64-apple-darwin"
+          test -d "$x64_dir" && test -d "$arm_dir"
+          # ort dylib：nuget 两份 lipo（同 build job 的源与版本）
+          curl -sSL -o /tmp/ort.nupkg \
+            "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/${ORT_VERSION}"
+          mkdir -p /tmp/ortx && unzip -q /tmp/ort.nupkg 'runtimes/osx-*' -d /tmp/ortx
+          target="universal2-apple-darwin"
+          stage="rumi-${LABEL}-${target}"
+          mkdir -p "$stage/lib"
+          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
+            lipo -create "$x64_dir/$b" "$arm_dir/$b" -output "$stage/$b"
+            install_name_tool -add_rpath @executable_path/lib "$stage/$b"
+            codesign --force --sign - "$stage/$b"
+          done
+          lipo -create \
+            /tmp/ortx/runtimes/osx-x64/native/libonnxruntime.dylib \
+            /tmp/ortx/runtimes/osx-arm64/native/libonnxruntime.dylib \
+            -output "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
+          codesign --force --sign - "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
+          cp README.md "$stage/" 2>/dev/null || true
+          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
+            printf '#!/bin/sh\nDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec "$DIR/%s" "$@"\n' "$b" > "$stage/run-$b.sh"
+            chmod +x "$stage/run-$b.sh"
+          done
+          tar czf "rumi-${LABEL}-${target}.tar.gz" "$stage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rumi-${{ env.LABEL }}-universal2-apple-darwin
+          path: rumi-${{ env.LABEL }}-universal2-apple-darwin.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [build, universal2]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
