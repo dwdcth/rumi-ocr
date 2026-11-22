@@ -50,17 +50,21 @@ docforge = { git = "https://github.com/dwdcth/docforge", tag = "v0.1.1", feature
 oxidize-pdf = "5"
 
 # ct2rs 推理引擎按目标架构分两处声明（互斥 cfg，同平台只激活一条，无
-# feature 并集问题）：
+# feature 并集问题）。源用 dwdcth fork 的 loongarch64 分支（基于上游
+# v0.9.22 + 一处 loongarch 补丁，见下）——同 crate 不能 crates.io/git
+# 双源混用，故全平台统一走 fork 分支；上游合并补丁后可切回 crates.io：
 # - 主流平台：oneDNN 后端（vendored oneDNN，Intel/AMD Zen 优化）+ GNU
 #   OpenMP 运行时；关闭默认 ruy（int8 GEMM 需要 oneDNN）。
-# - loongarch64：oneDNN 上游只有 x64/aarch64/ppc64/riscv64 CPU 后端，
-#   无 LoongArch（x64 源文件喂 loongarch gcc 直接编挂）——去掉 dnnl，
-#   CTranslate2 回退内建 GEMM（能跑但慢），等社区移植后再放开。
+# - loongarch64：两处硬障碍——oneDNN 上游无 LoongArch CPU 后端（x64
+#   源文件喂 loongarch gcc 直接编挂），CTranslate2 的 CPU_ISA_DISPATCH
+#   宏只覆盖 x86/arm（fork 补丁在 loongarch64 关 ENABLE_CPU_DISPATCH
+#   走 GENERIC 单 ISA 回退）。故去 dnnl，CT2 回退内建 GEMM（能跑但慢），
+#   等社区 oneDNN 移植后再放开。
 [target.'cfg(not(target_arch = "loongarch64"))'.dependencies]
-ct2rs = { version = "0.9", default-features = false, features = ["dnnl", "openmp-runtime-comp"] }
+ct2rs = { git = "https://github.com/dwdcth/ctranslate2-rs", branch = "loongarch64", default-features = false, features = ["dnnl", "openmp-runtime-comp"] }
 
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
-ct2rs = { version = "0.9", default-features = false, features = ["openmp-runtime-comp"] }
+ct2rs = { git = "https://github.com/dwdcth/ctranslate2-rs", branch = "loongarch64", default-features = false, features = ["openmp-runtime-comp"] }
 
 [dev-dependencies]
 tempfile = "3"
