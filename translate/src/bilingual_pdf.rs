@@ -327,8 +327,10 @@ impl Flow {
 
 /// 系统里探测 CJK 字体的候选路径（按序尝试，取第一个可用的）。
 const CJK_FONT_CANDIDATES: &[&str] = &[
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", // Arch
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc", // Arch
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", // Debian/Ubuntu（fonts-noto-cjk）
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", // Debian/Ubuntu
 ];
 
 /// 嵌入字体在 PDF 资源字典里的名字。
