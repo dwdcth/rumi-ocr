@@ -220,6 +220,10 @@ jobs:
         env:
           CXXFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-march=x86-64' || '' }}
           OpenMP_ROOT: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/libomp' || '' }}
+          # oneDNN 的 OpenMP.cmake 只 append flags 不加 FindOpenMP 的
+          # include 目录（上游对 AppleClang+brew libomp 的兼容缺口），
+          # omp.h 找不到——CPATH 让 clang 直接搜到。
+          CPATH: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/libomp/include' || '' }}
 
       - name: Diagnose ct2rs cmake flags (on failure)
         if: failure()
