@@ -221,7 +221,7 @@ jobs:
         shell: bash
         run: cargo build --release --workspace --target ${{ matrix.target }}
 
-      - name: Build (universal2: two slices + lipo)
+      - name: "Build (universal2: two slices + lipo)"
         if: matrix.target == 'universal2-apple-darwin'
         shell: bash
         run: |
