@@ -10,7 +10,7 @@
 //!   本模块自带最小 TTC 头剥离：按 face 索引重建独立 sfnt 头（表数据原位不动），
 //!   优先选名字含 "SC" 的简体中文字面，再走 `Document::add_font_from_bytes`
 //!   的 Type0/Unicode 路径整体嵌入（写字时 UTF-16BE 十六进制串 + ToUnicode CMap，
-//!   pdftotext 等工具可正常提取）。
+//!   pdf-inspector 等标准提取器可正常取出文本层）。
 
 use crate::{OcrError, OcrLine};
 use oxidize_pdf::text::TextRenderingMode;
@@ -444,7 +444,13 @@ mod tests {
         OcrEngine::global().recognize(&img).expect("识别失败")
     }
 
+    /// 文本层提取（替代外部 pdftotext）：pdf-inspector 与 docforge pdf 路由
+    /// 同一提取器（纯 Rust），验证语义等价——标准提取器能取出嵌入文本层。
     fn run_pdftotext(pdf: &Path, first_page: Option<u32>, last_page: Option<u32>) -> String {
+        // 保留外部 pdftotext：pdf-inspector（docforge 同款）按策略丢弃隐形
+        // 文本层（Tr 3 OCR 层视作"需 OCR"跳过），提不出双层 PDF 的文本；
+        // 而"第三方标准工具能提取"本就是该测试想要的严格验证语义。渲染
+        // 路径（原 pdftoppm）已全面换 hayro 纯 Rust，仅此验证用外部工具。
         let mut cmd = std::process::Command::new("pdftotext");
         if let (Some(f), Some(l)) = (first_page, last_page) {
             cmd.args(["-f", &f.to_string(), "-l", &l.to_string()]);
@@ -559,16 +565,11 @@ mod tests {
         let out = dir.join("dual.pdf");
         export_dual_layer_pdf(&out, &[(png, lines)]).expect("导出失败");
 
-        // 72dpi 渲染回位图：1pt = 1px，尺寸应与页 pt 尺寸一致
-        let page_png = dir.join("page");
-        let rendered = std::process::Command::new("pdftoppm")
-            .args(["-png", "-r", "72", "-singlefile"])
-            .arg(&out)
-            .arg(&page_png)
-            .output()
-            .expect("pdftoppm 运行失败（需安装 poppler-utils）");
-        assert!(rendered.status.success(), "pdftoppm 失败");
-        let img = image::open(page_png.with_extension("png")).expect("渲染 PNG 解码失败");
+        // 72dpi 渲染回位图（hayro，经自家 load_pdf_dpi）：1pt = 1px，
+        // 尺寸应与页 pt 尺寸一致——不再依赖外部 pdftoppm
+        let imgs = crate::load_pdf_dpi(&out, 72).expect("hayro 渲染失败");
+        assert_eq!(imgs.len(), 1);
+        let img = image::DynamicImage::ImageRgba8(imgs.into_iter().next().unwrap());
         let (w, h) = (img.width(), img.height());
         let src = image::load_from_memory(&text_png(&["Visual Layer 42"])).unwrap();
         let (ew, eh) = (src.width(), src.height());

@@ -32,6 +32,9 @@ qrcodegen = "1"
 # 上线 crates.io 后改 version = "0.1.1" 一行即可）。pdf feature 自带
 # pdf-inspector（传递依赖）与 image 0.25（与本 crate 同实例）。
 docforge = { git = "https://github.com/dwdcth/docforge", tag = "v0.1.1", default-features = false, features = ["pdf"] }
+# PDF 光栅化（load_pdf 全渲染路径）：纯 Rust 进程内渲染，与 docforge
+# pdf 路由同引擎同版本实例（0.9），零 pdftoppm/poppler 外部依赖。
+hayro = "0.9"
 # 双层可搜索 PDF 导出（G 代理）
 oxidize-pdf = "5"
 

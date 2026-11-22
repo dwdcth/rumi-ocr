@@ -51,7 +51,8 @@ jobs:
             libxcb1-dev \
             libwayland-dev \
             fonts-noto-cjk \
-            poppler-utils
+            poppler-utils \
+
 
       # onnxruntime 不在 Ubuntu 官方源里：从 NuGet 官方包（微软 GitHub 仓库
       # 2026-11-17 起整体 404，release 资产全灭，PyPI/NuGet 未受影响）解出

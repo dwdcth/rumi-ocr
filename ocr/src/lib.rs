@@ -22,8 +22,7 @@ use oar_ocr::domain::structure::StructureResult;
 use oar_ocr::prelude::*;
 use oar_ocr::processors::BoundingBox;
 use std::fmt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub mod postprocess;
@@ -318,10 +317,10 @@ const PDF_DEFAULT_DPI: u32 = 200;
 
 /// PDF → 按页 RGBA 图像列表（M3 §3）。
 ///
-/// 选型说明：oar-ocr **库 crate 没有 PDF API**（其 git 仓里 PDF 分页只存在于
-/// `oar-ocr-cli` 二进制 crate，经 hayro 渲染，无法作为库依赖复用），故按任务书
-/// 兜底方案走 poppler `pdftoppm` 子进程按页转 PNG，再经 [`load_frame`] 装载。
-/// 本机 poppler 26.10 可用；分发环境缺 pdftoppm 时返回 [`OcrError::Pdf`]。
+/// 选型说明：hayro **纯 Rust 进程内光栅化**（与 docforge pdf 页级路由同
+/// 引擎同版本），零 pdftoppm / poppler-utils 外部依赖——早年的 poppler
+/// 子进程方案（临时目录 + 页序重排）已整体移除，分发环境不再需要装
+/// poppler。白底合成直接产出 RGBA8。
 pub fn load_pdf(path: &Path) -> Result<Vec<RgbaImage>, OcrError> {
     load_pdf_dpi(path, PDF_DEFAULT_DPI)
 }
@@ -331,87 +330,85 @@ pub fn load_pdf_dpi(path: &Path, dpi: u32) -> Result<Vec<RgbaImage>, OcrError> {
     if !path.is_file() {
         return Err(OcrError::Pdf(format!("文件不存在：{}", path.display())));
     }
-    // 临时目录：系统临时区 + 进程号 + 纳秒，避免并发/重入互踩
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("rumi-pdf-{}-{}", std::process::id(), nanos));
-    std::fs::create_dir_all(&dir)?;
-    let result = pdf_pages_via_pdftoppm(path, dpi, None, &dir);
-    let _ = std::fs::remove_dir_all(&dir);
-    result
+    pdf_pages_via_hayro(path, dpi, None)
 }
 
 /// [`load_pdf`] 的页范围版本（1 起始、双端含）：PDF 智能路由只渲染扫描页区间用。
 ///
-/// DPI 固定取 [`PDF_DEFAULT_DPI`]（与全量渲染一致）；`first > last` 或越界返回空/报错
-/// 由 pdftoppm 语义兜底（越界页不产出，产出为空时报 [`OcrError::Pdf`]）。
+/// DPI 固定取 [`PDF_DEFAULT_DPI`]（与全量渲染一致）；区间越界报
+/// [`OcrError::Pdf`]。
 pub fn load_pdf_pages(path: &Path, first: u32, last: u32) -> Result<Vec<RgbaImage>, OcrError> {
     if !path.is_file() {
         return Err(OcrError::Pdf(format!("文件不存在：{}", path.display())));
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("rumi-pdf-{}-{}", std::process::id(), nanos));
-    std::fs::create_dir_all(&dir)?;
-    let result = pdf_pages_via_pdftoppm(path, PDF_DEFAULT_DPI, Some((first, last)), &dir);
-    let _ = std::fs::remove_dir_all(&dir);
-    result
+    pdf_pages_via_hayro(path, PDF_DEFAULT_DPI, Some((first, last)))
 }
 
-/// `pdftoppm` 按页转 PNG 并装载。`range = Some((first, last))` 时经 `-f/-l`
-/// 只渲染该闭区间（1 起始），`None` 渲染全文档。
-fn pdf_pages_via_pdftoppm(
+/// hayro 渲染闭区间页（1 起始）。`range = None` 渲染全文档。
+///
+/// 白底合成（`bg_color = WHITE`）直接产出 RGBA8，单边像素设 16384 上界
+/// 防畸形大页 OOM（与 docforge 的 render_pages 同款防护）。
+fn pdf_pages_via_hayro(
     path: &Path,
     dpi: u32,
     range: Option<(u32, u32)>,
-    dir: &Path,
 ) -> Result<Vec<RgbaImage>, OcrError> {
-    let prefix = dir.join("page");
-    let mut cmd = Command::new("pdftoppm");
-    cmd.arg("-png").arg("-r").arg(dpi.to_string());
-    if let Some((first, last)) = range {
-        cmd.arg("-f").arg(first.to_string());
-        cmd.arg("-l").arg(last.to_string());
-    }
-    let out = cmd
-        .arg(path)
-        .arg(&prefix)
-        .output()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                OcrError::Pdf("找不到 pdftoppm（需安装 poppler-utils）".into())
-            }
-            _ => OcrError::Io(e),
-        })?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(OcrError::Pdf(format!("pdftoppm 失败：{}", stderr.trim())));
-    }
-    // pdftoppm 命名 page-N.png（总页数 ≥10 时补零 page-01.png），
-    // 按解析出的页码数字排序，保证页序与原 PDF 一致
-    let mut pages: Vec<(u32, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let p = entry?.path();
-        if let Some(n) = page_number_of(&p) {
-            pages.push((n, p));
-        }
-    }
-    pages.sort_by_key(|(n, _)| *n);
-    if pages.is_empty() {
-        return Err(OcrError::Pdf("pdftoppm 未产出任何页面图像".into()));
-    }
-    pages.into_iter().map(|(_, p)| load_frame(&p)).collect()
-}
+    use hayro::hayro_interpret::InterpreterSettings;
+    use hayro::hayro_syntax::Pdf;
+    use hayro::vello_cpu::color::palette::css::WHITE;
+    use hayro::{PixmapSettings, RenderCache, RenderSettings};
 
-/// 从 `page-12.png` 这类文件名解析页码（无页码/非 png 返回 None）。
-fn page_number_of(p: &Path) -> Option<u32> {
-    let name = p.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".png")?;
-    stem.rsplit('-').next()?.parse().ok()
+    const MAX_RENDER_SIDE: f32 = 16384.0;
+
+    let bytes = std::fs::read(path)?;
+    let pdf = Pdf::new(bytes)
+        .map_err(|e| OcrError::Pdf(format!("hayro 打开 PDF 失败（{}）：{e:?}", path.display())))?;
+    let pages = pdf.pages();
+    let (first, last) = match range {
+        Some((f, l)) => (f, l),
+        None => (1, pages.len() as u32),
+    };
+    if first == 0 || last < first || last as usize > pages.len() {
+        return Err(OcrError::Pdf(format!(
+            "PDF 渲染页区间越界：{first}..={last}（总页数 {}）",
+            pages.len()
+        )));
+    }
+
+    let base_scale = (dpi.max(1) as f32) / 72.0;
+    let cache = RenderCache::new();
+    let interpreter_settings = InterpreterSettings::default();
+    let render_settings = RenderSettings::default();
+
+    let mut out = Vec::with_capacity((last - first + 1) as usize);
+    for page_no in first..=last {
+        let page = &pages[(page_no - 1) as usize];
+        let (pw, ph) = page.render_dimensions();
+        let max_dim = pw.max(ph).max(1.0);
+        let scale = if max_dim * base_scale > MAX_RENDER_SIDE {
+            MAX_RENDER_SIDE / max_dim
+        } else {
+            base_scale
+        };
+        let pixmap = hayro::render(
+            page,
+            &cache,
+            &interpreter_settings,
+            &render_settings,
+            &PixmapSettings { x_scale: scale, y_scale: scale, bg_color: WHITE },
+        );
+        let w = u32::from(pixmap.width());
+        let h = u32::from(pixmap.height());
+        if w == 0 || h == 0 {
+            return Err(OcrError::Pdf(format!("hayro 渲染第 {page_no} 页尺寸为空（{w}x{h}）")));
+        }
+        let raw = pixmap.data_as_u8_slice().to_vec();
+        let img = image::RgbaImage::from_raw(w, h, raw).ok_or_else(|| {
+            OcrError::Pdf(format!("hayro 渲染第 {page_no} 页像素缓冲长度异常（{w}x{h}）"))
+        })?;
+        out.push(img);
+    }
+    Ok(out)
 }
 
 /// 扫描图像中的二维码，返回全部解码文本（M3 §4）。
@@ -538,19 +535,6 @@ mod tests {
             quad_of(&rect),
             [[1.0, 2.0], [5.0, 2.0], [5.0, 8.0], [1.0, 8.0]]
         );
-    }
-
-    #[test]
-    fn page_number_parses_pdftoppm_names() {
-        fn mk(s: &str) -> &Path {
-            Path::new(s)
-        }
-        assert_eq!(page_number_of(mk("page-1.png")), Some(1));
-        assert_eq!(page_number_of(mk("page-12.png")), Some(12));
-        // 总页数 ≥10 时 poppler 补零
-        assert_eq!(page_number_of(mk("page-007.png")), Some(7));
-        assert_eq!(page_number_of(mk("page.txt")), None);
-        assert_eq!(page_number_of(mk("unrelated.png")), None);
     }
 
     /// 端到端：合成图 → OcrEngine::recognize → 非空且含期望文本。
