@@ -21,6 +21,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
   ORT_VERSION: "1.22.1"
+  CMAKE_GENERATOR: Ninja
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_NOHASHDIR: "true"
+  CCACHE_COMPILERCHECK: content
+  # lld 链接（RUSTFLAGS env 覆盖 config.toml，exclude-libs 显式携带）
+  RUSTFLAGS: -Clink-arg=-Wl,--exclude-libs,ALL -Clink-arg=-fuse-ld=lld
 
 jobs:
   check-and-test:
@@ -31,6 +39,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix: ci-v2
+          cache-on-failure: true
 
       - name: Install desktop system deps (webkit2gtk 4.1 etc.)
         run: |
@@ -45,6 +56,8 @@ jobs:
             libxdo-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
+            ninja-build \
+            lld \
             libgbm-dev \
             libdrm-dev \
             libx11-dev \
@@ -85,6 +98,12 @@ jobs:
           # 运行期：测试进程加载 libonnxruntime.so（链接期走 .pc，加载期
           # loader 不认 pkg-config），/opt 非默认搜索路径必须显式给。
           echo "LD_LIBRARY_PATH=/opt/onnxruntime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      # C++ 层 ccache（与 release.yml 同理：Cargo.lock 变化不再全废 C++）
+      - uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ccache-ci
+          max-size: 1G
 
       # 断言：探测不到直接红，不给 ort-sys 静默回退静态库的机会。
       - name: Verify onnxruntime discoverable via pkg-config

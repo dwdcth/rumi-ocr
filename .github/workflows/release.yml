@@ -54,12 +54,17 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   ORT_VERSION: "1.22.1"
-  # 与 docforge release 同款发布档位：thin LTO + 单 codegen unit + 剥符号
-  # （经 CARGO_PROFILE_* 环境变量下发，不动 workspace Cargo.toml，
-  # 本地构建行为不受影响）。
+  # 发布档位：thin LTO + codegen units 8 + 剥符号（经 CARGO_PROFILE_*
+  # 环境变量下发，不动 workspace Cargo.toml，本地构建行为不受影响）。
+  # cgu=1 禁止单 crate 内多核并行 codegen，Intel 3-4 核 runner 上拖慢
+  # 明显；ThinLTO 本身已跨 CGU 优化，1→8 的运行时差异在 1-3% 且算力
+  # 大头在 C++ 引擎（ORT/CT2）侧，用户无感。
   CARGO_PROFILE_RELEASE_LTO: thin
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '1'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '8'
   CARGO_PROFILE_RELEASE_STRIP: symbols
+  # CMake 走 Ninja（Unix；默认 Unix Makefiles 调度开销大，冷编译提速
+  # 10-20%）。Windows 不设（MSVC 需 msvc-dev-cmd 配套，保持默认生成器）。
+  CMAKE_GENERATOR: ${{ runner.os != 'Windows' && 'Ninja' || '' }}
 
 jobs:
   build:
@@ -97,8 +102,11 @@ jobs:
       # 防止复用脏缓存。
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix: release-${{ matrix.target }}
+          # v2 前缀：启用 ccache/Ninja 前的 CMakeCache 无 COMPILER_LAUNCHER
+          # 记录，存量恢复后 env 不会覆盖已存在的 cache，强制换前缀清一次
+          prefix: release-v2-${{ matrix.target }}
           envVars: ORT_VERSION
+          cache-on-failure: true
 
       - name: Install desktop system deps (linux only)
         if: runner.os == 'Linux'
@@ -114,11 +122,24 @@ jobs:
             libxdo-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
+            ninja-build \
+            lld \
             libgbm-dev \
             libdrm-dev \
             libx11-dev \
             libxcb1-dev \
             libwayland-dev
+
+      # C++ 层 ccache（Linux/macOS）：rust-cache 的 key 含 Cargo.lock，
+      # 依赖一变 target/ 全废（macOS Intel 冷编 C++ 就是 39min 的大头）；
+      # ccache 按编译单元内容寻址，Cargo.lock 变化仍可命中（ct2rs/
+      # onednn-src 未升时接近 100%）。Windows 不上：MSBuild 生成器 + /Zi
+      # PCH 等坑，且其 13.5min 可接受。
+      - uses: hendrikmuhs/ccache-action@v1
+        if: runner.os != 'Windows'
+        with:
+          key: ccache-${{ matrix.target }}
+          max-size: 1G
 
       # ---- onnxruntime 准备（NuGet 统一源，按平台分支落位）----
       # unix：nuget 主包（zip）解出 runtimes/<rid>/native/ → /opt 布局 +
@@ -199,14 +220,15 @@ jobs:
 
       # AppleClang 不带 OpenMP（CTranslate2 OPENMP_RUNTIME=COMP 需要），
       # 装 brew libomp 并用 OpenMP_ROOT 让 CMake 的 FindOpenMP 命中。
-      - name: Install libomp (macos only)
+      - name: Install libomp + ninja (macos only)
         if: runner.os == 'macOS'
         # link --force：libomp 是 keg-only，force 后 omp.h/libomp.dylib 进
         # /opt/homebrew/{include,lib}（FindOpenMP 默认搜索路径）。不能只靠
         # OpenMP_ROOT——CTranslate2 的 cmake_minimum_required(3.5) 使
         # CMP0074 未启用，CMake 会显式忽略 <PackageName>_ROOT 环境变量。
         run: |
-          brew install libomp
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+          brew install libomp ninja
           brew link --force libomp
 
       # ---- 构建 ----
@@ -230,7 +252,18 @@ jobs:
           # 必须同样 crt-static，否则 LNK2038 MT/MD 不匹配（静态 CRT 也免去
           # 用户装 VC++ redist）。onnxruntime.dll 是 /MD 自带 CRT，C API 纯 C
           # 跨边界不传 CRT 对象，混合合法。
-          RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || '' }}
+          # RUSTFLAGS（按平台三态；env 会覆盖 .cargo/config.toml 的
+          # rustflags，故 Linux 的 exclude-libs 一并显式携带，等价替换）：
+          # - Windows：crt-static（ct2rs 强制 /MT）
+          # - Linux：exclude-libs + lld 链接（GNU ld 单线程，ThinLTO +
+          #   大 C++ 静态库的链接期数十秒→数秒）
+          # - macOS：留空（沿用 config.toml；其 linux 段本就不适用）
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || (runner.os == 'Linux' && '-Clink-arg=-Wl,--exclude-libs,ALL -Clink-arg=-fuse-ld=lld' || '') }}
+          CMAKE_C_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'ccache' || '' }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'ccache' || '' }}
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_NOHASHDIR: 'true'
+          CCACHE_COMPILERCHECK: content
 
       - name: Diagnose ct2rs cmake flags (on failure)
         if: failure()
