@@ -80,7 +80,7 @@ jobs:
 
       # 断言：探测不到直接红，不给 ort-sys 静默回退静态库的机会。
       - name: Verify onnxruntime discoverable via pkg-config
-        run: pkg-config --modversion onnxruntime
+        run: pkg-config --modversion libonnxruntime
 
       # protobuf link_guard（translate/tests/link_guard.rs）扫的是
       # target/debug 下的 rumi-ui / rumi-server，先构建这两个 bin。

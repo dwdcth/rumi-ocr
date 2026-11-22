@@ -204,7 +204,7 @@ jobs:
       - name: Verify onnxruntime discoverable via pkg-config
         if: matrix.ort_rid != 'osx-x64+osx-arm64'
         shell: bash
-        run: pkg-config --modversion onnxruntime
+        run: pkg-config --modversion libonnxruntime
 
       # ---- 构建 ----
       - name: Build (single target)
