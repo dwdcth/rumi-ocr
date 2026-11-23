@@ -140,6 +140,8 @@ POST /api/ocr     # {"base64":"..."} 或 {"path":"..."} → {"code":100,"data":[
 
 架构与数据流、按日期的开发日志、踩坑记录与验证工作流，见
 [`docs/开发记录.md`](docs/开发记录.md)。任务队列见 `docs/task-queue.md`。
+6 平台 CI 构建、预编译依赖、跨发行版打包与发布运维经验总结，见
+[`docs/ci-packaging-guide.md`](docs/ci-packaging-guide.md)。
 
 ## 📄 许可
 
