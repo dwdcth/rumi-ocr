@@ -86,9 +86,12 @@ jobs:
     steps:
       - id: filter
         shell: bash
+        # ${{ }} 嵌双引号会被输入自带的引号截断，经 env 传递
+        env:
+          RAW: ${{ github.event.inputs.targets }}
         run: |
           set -euo pipefail
-          raw="${{ github.event.inputs.targets }}"
+          raw="$RAW"
           full='["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","x86_64-pc-windows-msvc","x86_64-apple-darwin","aarch64-apple-darwin"]'
           if [ -z "$raw" ] || [ "$raw" = "all" ]; then
             echo "matrix=$full" >> "$GITHUB_OUTPUT"
