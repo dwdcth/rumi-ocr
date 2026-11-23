@@ -77,6 +77,12 @@ jobs:
         run: |
           cat > /tmp/loong-build.sh <<'EOS'
           set -euxo pipefail
+          # commit 镜像不带 ENV（docker commit 不保留环境变量），ORT 探测
+          # 与加载路径显式给出（缺 PKG_CONFIG_PATH 时 ort-sys 回退下载
+          # 预编译包，loongarch64 无资产直接挂）
+          export PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig
+          export LD_LIBRARY_PATH=/opt/onnxruntime/lib
+          pkg-config --modversion libonnxruntime
           # CTranslate2 预编译静态库（loong64-deps release）
           mkdir -p /opt/ct2-prebuilt
           curl -sSL -o /tmp/ct2.tgz \
