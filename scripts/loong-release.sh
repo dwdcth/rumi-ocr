@@ -65,6 +65,8 @@ cargo build --release --workspace --target loongarch64-unknown-linux-gnu
 
 target=loongarch64-unknown-linux-gnu
 stage="rumi-${LABEL}-${target}"
+# 幂等：清掉上次跑可能残留的半成品（含 dangling symlink）
+rm -rf "/out/${stage}"
 mkdir -p "/out/${stage}/lib"
 for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
   cp "target/${target}/release/$b" "/out/${stage}/"
