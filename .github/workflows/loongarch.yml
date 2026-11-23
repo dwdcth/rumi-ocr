@@ -12,6 +12,8 @@ concurrency:
 
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       version-suffix:
@@ -134,4 +136,11 @@ jobs:
           name: rumi-${{ env.LABEL }}-loongarch64-unknown-linux-gnu
           path: dist/rumi-${{ env.LABEL }}-loongarch64-unknown-linux-gnu.tar.gz
           if-no-files-found: error
+
+      # tag 发布：资产与其他 5 平台并进同一个 GitHub Release（独立
+      # workflow 并行跑不拖慢主线；softprops 自动挂到同名 tag release）
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: dist/rumi-${{ env.LABEL }}-loongarch64-unknown-linux-gnu.tar.gz
 
