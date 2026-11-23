@@ -165,8 +165,13 @@ jobs:
           CT2=$(find target -name 'libctranslate2.a' 2>/dev/null | head -1)
           DNNL=$(find target -name 'libdnnl.a' 2>/dev/null | head -1)
           test -n "$CT2" && test -n "$DNNL"
-          DIR=$(dirname "$CT2")
-          CF=$(find "$DIR" -name 'libcpu_features.a' 2>/dev/null | head -1 || true)
+          # x86_64 的 CTranslate2 硬依赖 libcpu_features.a（GetX86Info 等）：
+          # 全 target 树搜（macOS 上它留在 out/build/third_party/cpu_features，
+          # 不在 out/lib 下），且 x86_64 目标强制断言存在。
+          CF=$(find target -name 'libcpu_features.a' 2>/dev/null | head -1 || true)
+          if [[ "${{ matrix.target }}" == x86_64-* ]]; then
+            test -n "$CF"
+          fi
           STAGE=ct2-prebuilt-${{ matrix.target }}
           rm -rf /tmp/$STAGE && mkdir -p /tmp/$STAGE
           cp "$CT2" /tmp/$STAGE/
