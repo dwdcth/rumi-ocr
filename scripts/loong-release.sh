@@ -50,6 +50,12 @@ test -f "$CT2_DIR/libctranslate2.a"
 cat > /tmp/loong-rel-build.sh <<'EOS'
 set -euxo pipefail
 . ~/.cargo/env
+# commit 镜像不带 ENV（docker commit 不保留运行期环境变量），ORT 探测
+# 与加载路径显式给出（缺 PKG_CONFIG_PATH 时 ort-sys 回退下载预编译包，
+# loongarch64 无资产直接挂）
+export PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig
+export LD_LIBRARY_PATH=/opt/onnxruntime/lib
+pkg-config --modversion libonnxruntime
 # tar 管道复制（排除挂载点 target 与 .git）：/src/target 是宿主的
 # symlink，与容器挂载目录 /build/target 冲突，cp 直接报错
 tar -C /src --exclude=./target --exclude=./.git -cf - . | tar -C /build -xf -
