@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  packages: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -69,6 +70,9 @@ jobs:
           restore-keys: loong-cargo-
 
       # 脚本经 heredoc 落盘再 docker exec，避免多层引号转义。
+      - name: Docker login ghcr (pull private image)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
       - name: Build in QEMU loong64 container
         run: |
           cat > /tmp/loong-build.sh <<'EOS'
