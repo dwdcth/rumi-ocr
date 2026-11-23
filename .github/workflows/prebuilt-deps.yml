@@ -227,6 +227,8 @@ jobs:
           Copy-Item $ct2.FullName "dist/$stage/"
           Copy-Item $dnnl.FullName "dist/$stage/"
           if ($cf) { Copy-Item $cf.FullName "dist/$stage/" }
+          # 剥调试/符号段（MSVC .lib 归档可压 ~70-80%）：runner 预装 LLVM
+          llvm-strip --strip-debug dist/$stage/*.lib
           $lock = Select-String -Path Cargo.lock -Pattern 'ct2rs' -Context 0,2 | Out-String
           $sha = if ($lock -match '#([0-9a-f]{7,40})') { $Matches[1] } else { 'unknown' }
           "ct2rs=$sha`ntarget=$t`ncmake=native(dnnl,openmp-comp,static-crt)" | Out-File "dist/$stage/BUILD_INFO"
