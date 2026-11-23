@@ -32,10 +32,10 @@
 # - Linux：包内 lib/ 放 libonnxruntime.so (+ SONAME 符号链接 .so.1) 与
 #   libxdo.so.*；二进制链接期写入 DT_RPATH=$ORIGIN/lib（--disable-new-dtags），
 #   直接运行与 run-*.sh 均可优先命中包内库。
-# - macOS：dylib 的 install_name 是 @rpath/libonnxruntime.<ver>.dylib，
-#   DYLD_LIBRARY_PATH 对 @rpath 依赖无效——包内 lib/ 按 install_name
-#   命名放 dylib，并用 install_name_tool 给每个 bin 加 LC_RPATH=
-#   @executable_path/lib（add_rpath 改动二进制后 codesign ad-hoc 重签）。
+# - macOS：包内 lib/ 随带 libonnxruntime.<ver>.dylib 与 libomp.dylib（Homebrew
+#   OpenMP 运行时），并用 install_name_tool 给每个 bin 加 LC_RPATH=@executable_path/lib、
+#   把 libomp 绝对路径改为 @rpath/libomp.dylib，最后全部 ad-hoc 重签并校验无外部
+#   /opt/homebrew 或 /usr/local 依赖。
 
 name: release
 
@@ -375,18 +375,36 @@ jobs:
             osx-*)
               cp /opt/onnxruntime/lib/libonnxruntime.dylib \
                 "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
+              # libomp：CTranslate2 的 OpenMP 运行时（brew libomp），未装 Homebrew
+              # 的 macOS 用户会因硬编码 /opt/homebrew 或 /usr/local 路径启动失败，随包携带。
+              omp_prefix="$(brew --prefix libomp)"
+              cp -L "${omp_prefix}/lib/libomp.dylib" "$stage/lib/libomp.dylib"
+              chmod 755 "$stage/lib/libomp.dylib"
+              install_name_tool -id @rpath/libomp.dylib "$stage/lib/libomp.dylib"
               ;;
           esac
-          # macOS：依赖记的是 @rpath/libonnxruntime.<ver>.dylib，给每个 bin
-          # 加 LC_RPATH=@executable_path/lib 指包内；add_rpath 动过二进制，
-          # ad-hoc 重签（arm64 无签名直接拒绝加载）。dylib 一并重签——
-          # nuget 解出的原 dylib 无有效签名，arm64 加载同样会被拒。
+          # macOS：给每个 bin 加 LC_RPATH=@executable_path/lib，并把 libomp 引用
+          # 改写为 @rpath/libomp.dylib；改动二进制后全部 ad-hoc 重签（arm64 无签名
+          # 直接拒绝加载），最后断言无残留 /opt/homebrew 或 /usr/local 依赖。
           if [[ "$ORT_RID" == osx-* ]]; then
             for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
               install_name_tool -add_rpath @executable_path/lib "$stage/$b"
+              while IFS= read -r omp_ref; do
+                [ -n "$omp_ref" ] && install_name_tool -change "$omp_ref" @rpath/libomp.dylib "$stage/$b"
+              done < <(otool -L "$stage/$b" | awk '/libomp\.dylib/ {print $1}')
               codesign --force --sign - "$stage/$b"
             done
             codesign --force --sign - "$stage/lib/libonnxruntime.${ORT_VERSION}.dylib"
+            codesign --force --sign - "$stage/lib/libomp.dylib"
+            # macOS 分发包自检：不允许任何外部 Homebrew/usr-local 绝对路径依赖
+            for f in "$stage"/rumi-* "$stage"/lib/*.dylib; do
+              echo "=== otool -L $(basename "$f") ==="
+              otool -L "$f"
+              if otool -L "$f" | grep -E '/opt/homebrew|/usr/local'; then
+                echo "✗ 发现未随包的 Homebrew/local 绝对路径依赖: $f" >&2
+                exit 1
+              fi
+            done
           fi
           # run-*.sh：Linux 设 LD_LIBRARY_PATH（SONAME 解析，尾部追加式防
           # 空段引入 CWD 搜索）；macOS 已有 rpath，wrapper 只为统一入口

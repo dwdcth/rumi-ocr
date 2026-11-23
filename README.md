@@ -89,9 +89,9 @@ cargo run -p rumi-translate -- --engine google --to zh "text" # 在线翻译
   `apt install libwebkit2gtk-4.1-0`、Arch `pacman -S webkit2gtk-4.1`）；`lib/` 已随包携带
   `libonnxruntime.so` 与 `libxdo.so.*`，二进制内嵌 `DT_RPATH=$ORIGIN/lib`，直接运行
   `./rumi-ui` 或通过 `run-rumi-ui.sh` 均可优先加载包内库
-- **macOS**（x64 / arm64）：包内已带 `libonnxruntime.dylib` 并写入 `@executable_path/lib`
-  RPATH，直接运行 `./rumi-ui` 或 `run-rumi-ui.sh` 均可；下载的包首次运行若被 Gatekeeper 拦：
-  `xattr -d com.apple.quarantine rumi-ui`
+- **macOS**（x64 / arm64）：包内已带 `libonnxruntime.dylib` 与 `libomp.dylib` 并写入
+  `@executable_path/lib` RPATH，免装 Homebrew 依赖，直接运行 `./rumi-ui` 或 `run-rumi-ui.sh` 均可；
+  下载的包首次运行若被 Gatekeeper 拦：`xattr -d com.apple.quarantine rumi-ui`
 
 ## 📖 使用
 
