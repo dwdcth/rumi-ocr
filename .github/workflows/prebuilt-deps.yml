@@ -221,12 +221,15 @@ jobs:
             Get-ChildItem "target/$t/release/build" -Directory | Where-Object Name -Match 'ct2rs|onednn' | ForEach-Object { $_.FullName }
             throw "archive not found: ct2=$ct2 dnnl=$dnnl"
           }
-          $cf = Get-ChildItem "target/$t/release/build/ct2rs-*" -Recurse -Filter cpu_features.lib | Select-Object -First 1
+          # cpu_features：CTranslate2 在 x86_64 上硬依赖（GetX86Info 等），
+          # 缺它则下游 LNK2019。同上全树搜，且必须存在。
+          $cf = Get-ChildItem "target/$t/release/build" -Recurse -Filter cpu_features.lib | Select-Object -First 1
+          if (-not $cf) { throw "cpu_features.lib not found under target/$t/release/build" }
           $stage = "ct2-prebuilt-$t"
           New-Item -ItemType Directory -Force "dist/$stage" | Out-Null
           Copy-Item $ct2.FullName "dist/$stage/"
           Copy-Item $dnnl.FullName "dist/$stage/"
-          if ($cf) { Copy-Item $cf.FullName "dist/$stage/" }
+          Copy-Item $cf.FullName "dist/$stage/"
           # 剥调试/符号段（MSVC .lib 归档可压 ~70-80%）：runner 预装 LLVM
           llvm-strip --strip-debug dist/$stage/*.lib
           $lock = Select-String -Path Cargo.lock -Pattern 'ct2rs' -Context 0,2 | Out-String

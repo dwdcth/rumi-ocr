@@ -457,6 +457,11 @@ jobs:
           test -f /opt/ct2-prebuilt/libctranslate2.a
 
           . ~/.cargo/env
+          # 镜像带着本地的中科大 crates 镜像配置（国内网络用）；GitHub 境外
+          # runner 拉它返回 403（cargo: failed to query replaced source
+          # registry），CI 上删掉改走 crates.io 官方源（runner 在美国机房，
+          # 直连最快最稳）。
+          rm -f /root/.cargo/config.toml
           cp -r /src/. /build/
           cd /build
           export CT2RS_PREBUILT_DIR=$PWD/ct2-prebuilt
