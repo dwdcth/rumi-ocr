@@ -212,6 +212,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           choco install pkgconfiglite --no-progress -y
+          # PATH 加固：Strawberry Perl 自带 pkg-config（perl 脚本，缺 Pod::Usage
+          # 直接崩）；GITHUB_PATH 前插 chocolatey\bin 确保命中 pkgconfiglite 的 exe
+          Add-Content $env:GITHUB_PATH "C:\ProgramData\chocolatey\bin"
+          if (-not (Test-Path "C:\ProgramData\chocolatey\bin\pkg-config.exe")) { throw "pkgconfiglite install failed" }
           $rid = $env:ORT_RID
           $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/$env:ORT_VERSION"
           Invoke-WebRequest -Uri $url -OutFile C:\ort.zip
