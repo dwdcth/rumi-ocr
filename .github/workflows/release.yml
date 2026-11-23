@@ -75,13 +75,36 @@ env:
 
 
 jobs:
+  # targets 预处理：把 inputs.targets 解析为 5 主流平台的 matrix 数组
+  # （剔除 loongarch64 别名——它只是 build-loong64 的开关，进 matrix 会
+  # 因查表为空毒死整个 build job）。单行 python 过滤（块标量内不能出
+  # 现零缩进行）。
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.filter.outputs.matrix }}
+    steps:
+      - id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="${{ github.event.inputs.targets }}"
+          full='["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","x86_64-pc-windows-msvc","x86_64-apple-darwin","aarch64-apple-darwin"]'
+          if [ -z "$raw" ] || [ "$raw" = "all" ]; then
+            echo "matrix=$full" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          matrix=$(printf '%s' "$raw" | python3 -c 'import json,sys; known={"x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","x86_64-pc-windows-msvc","x86_64-apple-darwin","aarch64-apple-darwin"}; print(json.dumps([t for t in json.load(sys.stdin) if t in known]))')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   build:
     name: build (${{ matrix.target }})
+    needs: setup
     strategy:
       fail-fast: false
       matrix:
         # 'all' 展开全表；否则用 inputs.targets（JSON 数组）过滤指定平台
-        target: ${{ fromJSON((inputs.targets != 'all' && inputs.targets) || (github.event.inputs.targets != 'all' && github.event.inputs.targets) || '["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","x86_64-pc-windows-msvc","x86_64-apple-darwin","aarch64-apple-darwin"]') }}
+        target: ${{ fromJSON(needs.setup.outputs.matrix) }}
     # 平台属性查表（动态 matrix 无 include 字段）
     runs-on: ${{ fromJSON('{"x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-unknown-linux-gnu":"ubuntu-24.04-arm","x86_64-pc-windows-msvc":"windows-latest","x86_64-apple-darwin":"macos-15-intel","aarch64-apple-darwin":"macos-latest"}')[matrix.target] }}
     env:
