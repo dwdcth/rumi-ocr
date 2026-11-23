@@ -12,13 +12,12 @@
 #   3. x86_64-pc-windows-msvc      windows-latest
 #   4. x86_64-apple-darwin         macos-15-intel
 #   5. aarch64-apple-darwin        macos-latest
-#   6. loongarch64-unknown-linux-gnu QEMU 容器（ghcr.io/loong64/debian
-#                                  新世界）；CTranslate2 的 C++ 是 QEMU 编译
-#                                  大头（单轮 ~1h+），改用本仓库 loong64-deps
-#                                  release 里的预编译 libctranslate2.a
-#                                  （CT2RS_PREBUILT_DIR，ct2rs fork 支持）#                                  lipo 合并（不在单一 runner 上双 target 交叉
-#                                  构建——ct2rs build.rs 用宿主架构宏定
-#                                  CMAKE_OSX_ARCHITECTURES，交叉必错架构）
+#   6. loongarch64-unknown-linux-gnu QEMU 容器（ghcr.io/dwdcth/rumi-loong-build:v1
+#                                  Debian trixie 新世界）；CTranslate2 的 C++ 是 QEMU 编译
+#                                  大头（单轮 ~1h+），改用本仓库 deps release 里的预编译
+#                                  libctranslate2.a（CT2RS_PREBUILT_DIR，ct2rs fork 支持）。
+#   注：macOS x64/arm64 各自原生构建不做 lipo 合并（ct2rs build.rs 用宿主架构宏定
+#   CMAKE_OSX_ARCHITECTURES，交叉必错架构）。
 #
 # onnxruntime 策略（全平台一致）：ort-sys 走 pkg-config 动态链（防双
 # protobuf 互劫持，因果见 server/Cargo.toml ort-sys 注释）。源用 NuGet
@@ -29,8 +28,9 @@
 #
 # 动态库随分发包走 + 各平台按链接器语义落位：
 # - Windows：onnxruntime.dll 与 exe 同目录（加载器自动找）。
-# - Linux：DT_NEEDED 是 SONAME libonnxruntime.so.1，包内 lib/ 放实体
-#   libonnxruntime.so + 符号链接 .so.1，run-*.sh 设 LD_LIBRARY_PATH。
+# - Linux：包内 lib/ 放 libonnxruntime.so (+ SONAME 符号链接 .so.1) 与
+#   libxdo.so.*；二进制链接期写入 DT_RPATH=$ORIGIN/lib（--disable-new-dtags），
+#   直接运行与 run-*.sh 均可优先命中包内库。
 # - macOS：dylib 的 install_name 是 @rpath/libonnxruntime.<ver>.dylib，
 #   DYLD_LIBRARY_PATH 对 @rpath 依赖无效——包内 lib/ 按 install_name
 #   命名放 dylib，并用 install_name_tool 给每个 bin 加 LC_RPATH=
@@ -40,7 +40,7 @@ name: release
 
 concurrency:
   # 同一 workflow+分支的新 run 自动取消旧 run（避免重复排队浪费）
-  group: release-${ github.ref }
+  group: release-${{ github.ref }}
   cancel-in-progress: true
 
 
@@ -303,9 +303,12 @@ jobs:
           # rustflags，故 Linux 的 exclude-libs 一并显式携带，等价替换）：
           # - Windows：crt-static（ct2rs 强制 /MT）
           # - Linux：exclude-libs + lld 链接（GNU ld 单线程，ThinLTO +
-          #   大 C++ 静态库的链接期数十秒→数秒）
+          #   大 C++ 静态库的链接期数十秒→数秒）+ DT_RPATH=$ORIGIN/lib
+          #   （--disable-new-dtags：DT_RUNPATH 排在 ld.so.cache 之后，会被
+          #   系统里别的版本的 libonnxruntime.so.1 抢先；RPATH 才能让直接
+          #   运行也优先用包内 lib/。GHA 表达式单引号字符串不做 $ 展开，写单 $）
           # - macOS：留空（沿用 config.toml；其 linux 段本就不适用）
-          RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || (runner.os == 'Linux' && '-Clink-arg=-Wl,--exclude-libs,ALL -Clink-arg=-fuse-ld=lld' || '') }}
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || (runner.os == 'Linux' && '-Clink-arg=-Wl,--exclude-libs,ALL -Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,--disable-new-dtags -Clink-arg=-Wl,-rpath,$ORIGIN/lib' || '') }}
           CMAKE_C_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'ccache' || '' }}
           CMAKE_CXX_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'ccache' || '' }}
           CCACHE_BASEDIR: ${{ github.workspace }}
@@ -357,6 +360,12 @@ jobs:
             linux-*)
               # 实体 .so + SONAME 符号链接 .so.1（cp -P 保留链接，tar 同样保留）
               cp -P /opt/onnxruntime/lib/libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1 "$stage/lib/"
+              # libxdo：dioxus-desktop 的菜单栏/托盘后端（muda / tray-icon）链入，
+              # 仅 rumi-ui 需要。构建机的 soname 换个发行版就可能不存在（Ubuntu
+              # 是 libxdo.so.3，Arch 的 xdotool 新版只有 .so.4），随包携带。
+              xdo=$(ldconfig -p | awk '/libxdo\.so\.[0-9]+/ {print $NF; exit}')
+              test -n "$xdo"
+              cp -L "$xdo" "$stage/lib/"
               ;;
             osx-*)
               cp /opt/onnxruntime/lib/libonnxruntime.dylib \
@@ -387,6 +396,10 @@ jobs:
             } > "$stage/run-$b.sh"
             chmod +x "$stage/run-$b.sh"
           done
+          # Linux 分发包自检（随包库 / 宿主允许清单 / RPATH / 加载器解析）
+          if [[ "$ORT_RID" == linux-* ]]; then
+            bash scripts/check-linux-package.sh "$stage"
+          fi
           tar czf "rumi-${LABEL}-${target}.tar.gz" "$stage"
 
       # ---- 打包（windows：zip，exe + README + onnxruntime.dll 同目录）----
@@ -490,10 +503,14 @@ jobs:
           rm -f /root/.cargo/config.toml
           cp -r /src/. /build/
           cd /build
-          export CT2RS_PREBUILT_DIR=$PWD/ct2-prebuilt
-          cargo build --release --workspace --target loongarch64-unknown-linux-gnu
+          export CT2RS_PREBUILT_DIR=/opt/ct2-prebuilt
+          # RUSTFLAGS 覆盖 config.toml，exclude-libs 必须一并携带；
+          # --disable-new-dtags + -rpath,$ORIGIN/lib 让直接运行优先命中包内 lib/
+          export RUSTFLAGS='-Clink-arg=-Wl,--exclude-libs,ALL -Clink-arg=-Wl,--disable-new-dtags -Clink-arg=-Wl,-rpath,$ORIGIN/lib'
+          # --no-default-features：龙芯无 oneDNN，关掉默认 ct2-dnnl，只链预编译 libctranslate2.a
+          cargo build --release --workspace --target loongarch64-unknown-linux-gnu --no-default-features
 
-          # 打包（与 Linux 原生 job 同构：bins + ort so + run-*.sh）
+          # 打包（与 Linux 原生 job 同构：bins + ort/xdo so + run-*.sh）
           target=loongarch64-unknown-linux-gnu
           stage="rumi-${LABEL}-${target}"
           mkdir -p "/out/${stage}/lib"
@@ -502,8 +519,15 @@ jobs:
             printf '#!/bin/sh\nDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$DIR/%s" "$@"\n' "$b" > "/out/${stage}/run-$b.sh"
             chmod +x "/out/${stage}/run-$b.sh"
           done
-          cp -P /opt/onnxruntime/lib/libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1 "/out/${stage}/lib/"
+          # 镜像里只有 libonnxruntime.so（无 .so.1 链接），解引用拷贝实体并建 SONAME 链接
+          cp -L /opt/onnxruntime/lib/libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so"
+          ln -sf libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so.1"
+          # libxdo 随包携带（不同发行版 soname 不同，仅 rumi-ui 需要）
+          xdo=$(PATH="$PATH:/usr/sbin:/sbin" ldconfig -p | awk '/libxdo\.so\.[0-9]+/ {print $NF; exit}')
+          test -n "$xdo"
+          cp -L "$xdo" "/out/${stage}/lib/"
           cp README.md "/out/${stage}/" 2>/dev/null || true
+          bash /build/scripts/check-linux-package.sh "/out/${stage}"
           tar czf "/out/rumi-${LABEL}-${target}.tar.gz" -C /out "$stage"
           ls -la /out
           EOS

@@ -15,7 +15,7 @@ name: ci
 
 concurrency:
   # 同一 workflow+分支的新 run 自动取消旧 run（避免重复排队浪费）
-  group: ci-${ github.ref }
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 

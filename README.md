@@ -85,11 +85,13 @@ cargo run -p rumi-translate -- --engine google --to zh "text" # 在线翻译
 解压后：
 
 - **Windows**：`onnxruntime.dll` 已随包（与 exe 同目录），直接运行 `rumi-ui.exe`
-- **Linux**：需系统 `webkit2gtk-4.1`（Debian/Ubuntu `apt install libwebkit2gtk-4.1-0`、
-  Arch `pacman -S webkit2gtk-4.1`）；用 `run-rumi-ui.sh` 启动（wrapper 会设
-  `LD_LIBRARY_PATH` 加载包内 `libonnxruntime.so`，直接跑裸二进制同理需要）
-- **macOS**：用 `run-rumi-ui.sh` 启动（包内已带 `libonnxruntime.dylib`）；
-  下载的包首次运行若被 Gatekeeper 拦：`xattr -d com.apple.quarantine rumi-ui`
+- **Linux**（x64 / arm64 / loongarch64）：需系统 `webkit2gtk-4.1`（Debian/Ubuntu
+  `apt install libwebkit2gtk-4.1-0`、Arch `pacman -S webkit2gtk-4.1`）；`lib/` 已随包携带
+  `libonnxruntime.so` 与 `libxdo.so.*`，二进制内嵌 `DT_RPATH=$ORIGIN/lib`，直接运行
+  `./rumi-ui` 或通过 `run-rumi-ui.sh` 均可优先加载包内库
+- **macOS**（x64 / arm64）：包内已带 `libonnxruntime.dylib` 并写入 `@executable_path/lib`
+  RPATH，直接运行 `./rumi-ui` 或 `run-rumi-ui.sh` 均可；下载的包首次运行若被 Gatekeeper 拦：
+  `xattr -d com.apple.quarantine rumi-ui`
 
 ## 📖 使用
 

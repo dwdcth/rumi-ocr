@@ -12,6 +12,11 @@ path = "src/lib.rs"
 name = "rumi-server"
 path = "src/bin/rumi_server.rs"
 
+[features]
+default = ["ct2-dnnl"]
+ct2-dnnl = ["rumi-translate/ct2-dnnl"]
+ct2-prebuilt = ["rumi-translate/ct2-prebuilt"]
+
 [dependencies]
 # M3 §5：Umi 兼容 HTTP API（默认 features 已含 json/query/tokio/http1）
 axum = "0.8"
@@ -26,7 +31,8 @@ rumi-ocr = { path = "../ocr" }
 # plugin:<名> 引擎（BlockingPluginProcess 走 Umi 插件协议）
 plugins-worker = { path = "../plugins-worker" }
 # /api/translate*（离线 CT2 + 在线 providers + 模型下载）
-rumi-translate = { path = "../translate" }
+# default-features = false：由本 crate [features] 透传（同 rumi-ui）
+rumi-translate = { path = "../translate", default-features = false }
 # 仅为本 crate 的依赖图启用 ort-sys 的 pkg-config 策略（特性统一作用于本图内
 # 的 rumi-ocr → oar-ocr → ort → ort-sys）：系统 libonnxruntime（动态）优先于
 # 预编译静态库。为什么必须：静态 ort-sys 内嵌 protobuf 3.14，而 rumi-translate

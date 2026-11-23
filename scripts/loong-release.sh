@@ -35,13 +35,13 @@ if ! ls /proc/sys/fs/binfmt_misc/ | grep -q qemu-loongarch64; then
   docker run --privileged --rm tonistiagi/binfmt --install loong64 >/dev/null
 fi
 
-# CTranslate2 预编译 .a（loong64-deps release）
+# CTranslate2 预编译 .a（deps release）
 CT2_DIR="$ROOT/target/loong-ct2-prebuilt"
 mkdir -p "$CT2_DIR" "$OUT"
 if [[ ! -f "$CT2_DIR/libctranslate2.a" ]]; then
-  curl -sSL -o /tmp/ct2.tgz \
+  curl -fsSL --retry 3 --retry-delay 5 -o /tmp/ct2.tgz \
     "https://github.com/${REPO}/releases/download/deps/ct2-prebuilt-loongarch64-unknown-linux-gnu.tar.gz"
-  tar -xzf /tmp/ct2.tgz -C "$CT2_DIR"
+  tar -xzf /tmp/ct2.tgz --strip-components=1 -C "$CT2_DIR"
 fi
 test -f "$CT2_DIR/libctranslate2.a"
 
@@ -61,7 +61,8 @@ pkg-config --modversion libonnxruntime
 tar -C /src --exclude=./target --exclude=./.git -cf - . | tar -C /build -xf -
 cd /build
 export CT2RS_PREBUILT_DIR=/opt2/ct2-prebuilt
-cargo build --release --workspace --target loongarch64-unknown-linux-gnu
+export RUSTFLAGS='-Clink-arg=-Wl,--exclude-libs,ALL -Clink-arg=-Wl,--disable-new-dtags -Clink-arg=-Wl,-rpath,$ORIGIN/lib'
+cargo build --release --workspace --target loongarch64-unknown-linux-gnu --no-default-features
 
 target=loongarch64-unknown-linux-gnu
 stage="rumi-${LABEL}-${target}"
@@ -76,7 +77,12 @@ done
 # 实体（-L 解引用镜像里的 symlink）+ SONAME 链接 .so.1（DT_NEEDED 名）
 cp -L /opt/onnxruntime/lib/libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so"
 ln -sf libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so.1"
+# libxdo 随包携带（不同发行版 soname 不同，仅 rumi-ui 需要）
+xdo=$(PATH="$PATH:/usr/sbin:/sbin" ldconfig -p | awk '/libxdo\.so\.[0-9]+/ {print $NF; exit}')
+test -n "$xdo"
+cp -L "$xdo" "/out/${stage}/lib/"
 cp README.md "/out/${stage}/" 2>/dev/null || true
+bash /build/scripts/check-linux-package.sh "/out/${stage}"
 tar czf "/out/${stage}.tar.gz" -C /out "$stage"
 EOS
 

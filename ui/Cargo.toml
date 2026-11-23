@@ -7,6 +7,11 @@ edition = "2024"
 name = "rumi-ui"
 path = "src/main.rs"
 
+[features]
+default = ["ct2-dnnl"]
+ct2-dnnl = ["rumi-translate/ct2-dnnl"]
+ct2-prebuilt = ["rumi-translate/ct2-prebuilt"]
+
 [dependencies]
 # Dioxus 0.7 桌面壳（wry/WebKitGTK）；launch_cfg 在 0.7 已不存在，用 LaunchBuilder
 dioxus = { version = "0.7", features = ["desktop"] }
@@ -15,7 +20,9 @@ rumi-capture = { path = "../capture" }
 # OCR 引擎（全局单例，后台线程调用；见 ../ocr）
 rumi-ocr = { path = "../ocr" }
 # 翻译核心（ct2rs 编译在此 crate；translate-spec-ui.md §6）
-rumi-translate = { path = "../translate" }
+# default-features = false：由本 crate [features] 透传，避免 --no-default-features
+# 构建预编译/龙芯模式时被隐式拉回 ct2-dnnl（onednn-src）
+rumi-translate = { path = "../translate", default-features = false }
 # 与 server 同款：ort-sys 走 pkg-config 动态链系统 libonnxruntime。ui 链接
 # translate（静态 protobuf-lite，经 ct2rs→sentencepiece-sys）后，静态 ort-sys
 # 内嵌的第二份 protobuf 会与之 duplicate symbol / 运行期互劫持——动态 ORT +
