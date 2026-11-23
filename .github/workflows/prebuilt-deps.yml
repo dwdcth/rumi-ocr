@@ -49,16 +49,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Windows 弃 VS/MSBuild 生成器改 Ninja（agy 定位：MSBuild 多配置产物
-      # 落点诡异 + nodeReuse 孤儿进程；单配置 Ninja 与 Unix 行为一致，
-      # cmake-rs 有 msvc+ninja 专门路径）。msvc-dev-cmd 注入 cl.exe 环境。
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: runner.os == 'Windows'
-      - name: Install ninja (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: choco install ninja --no-progress -y
-
       - name: Install desktop system deps (linux only)
         if: runner.os == 'Linux'
         run: |
@@ -150,9 +140,9 @@ jobs:
       - name: Build C++ deps via ct2rs
         shell: bash
         run: |
-          # 全平台统一 Ninja（Windows 经 msvc-dev-cmd 提供 cl 环境；
-          # env 空串坑已避——无条件 export）
-          export CMAKE_GENERATOR=Ninja
+          # 条件 export（Windows 用 VS 生成器：msvc-dev-cmd 注入的 env 与
+          # rustup 的 MSVC 探测冲突会踩坏 rustc 链接器）
+          if [ "${{ runner.os }}" != "Windows" ]; then export CMAKE_GENERATOR=Ninja; fi
           cargo build --release -p rumi-translate --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || '' }}
@@ -205,7 +195,12 @@ jobs:
                 }
               }
               $outLog = Join-Path $_.FullName "output"
-              if (Test-Path $outLog) { Write-Host "  [output tail 30]:"; Get-Content $outLog -Tail 30 }
+              if (Test-Path $outLog) {
+                Write-Host "  [output head 60]:"
+                Get-Content $outLog -TotalCount 60
+                Write-Host "  [output tail 30]:"
+                Get-Content $outLog -Tail 30
+              }
             }
           }
 
