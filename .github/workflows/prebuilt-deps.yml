@@ -1,0 +1,219 @@
+# 预编译第三方 C++ 依赖（CTranslate2 + oneDNN + cpu_features）→ deps release。
+# 手动触发，仅在 ct2rs/CTranslate2/oneDNN 版本变化时跑一次；此后正式
+# release workflow 经 CT2RS_PREBUILT_DIR 直链预编译归档，跳过全部 C++ 编译。
+#
+# 产出方式：cargo build -p rumi-translate（feature=dnnl）触发 ct2rs 完整
+# CMake 构建，随后从 target 的 build script OUT_DIR 捞出三个静态库打包。
+# 资产命名：ct2-prebuilt-<target>.tar.gz（内容含版本戳，构建时写入）。
+name: prebuilt-deps
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  ORT_VERSION: "1.22.1"
+
+jobs:
+  build:
+    name: prebuilt (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ort_rid: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            ort_rid: linux-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ort_rid: win-x64
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            ort_rid: osx-x64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            ort_rid: osx-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install desktop system deps (linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libudev-dev \
+            libayatana-appindicator3-dev libglib2.0-dev libxdo-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libgbm-dev libdrm-dev libx11-dev libxcb1-dev libwayland-dev
+
+      - name: Install libomp + ninja (macos only)
+        if: runner.os == 'macOS'
+        run: |
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+          brew install libomp ninja
+          brew link --force libomp
+
+      # onnxruntime（NuGet）+ .pc —— ct2rs 构建不需要 ORT，但
+      # oar-ocr/ort-sys 在依赖图里，探测失败会回退静态下载（污染产物
+      # 语义），保持与 release.yml 相同的动态链环境。
+      - name: Prepare onnxruntime (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -sSL -o /tmp/ort.nupkg \
+            "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/${ORT_VERSION}"
+          mkdir -p /tmp/ortx && cd /tmp/ortx
+          unzip -q /tmp/ort.nupkg 'runtimes/*' 'build/native/include/*'
+          sudo mkdir -p /opt/onnxruntime/lib /opt/onnxruntime/include
+          sudo cp -r build/native/include/. /opt/onnxruntime/include/
+          case "${{ matrix.ort_rid }}" in
+            linux-*)
+              sudo cp "runtimes/${{ matrix.ort_rid }}/native/libonnxruntime.so" /opt/onnxruntime/lib/
+              sudo ln -sf libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1
+              ;;
+            osx-*)
+              sudo cp "runtimes/${{ matrix.ort_rid }}/native/libonnxruntime.dylib" /opt/onnxruntime/lib/
+              ;;
+          esac
+          sudo mkdir -p /opt/onnxruntime/lib/pkgconfig
+          sudo tee /opt/onnxruntime/lib/pkgconfig/libonnxruntime.pc >/dev/null <<EOF
+          prefix=/opt/onnxruntime
+          libdir=\${prefix}/lib
+          includedir=\${prefix}/include
+
+          Name: onnxruntime
+          Description: ONNX Runtime (dynamic link)
+          Version: ${ORT_VERSION}
+          Libs: -L\${libdir} -lonnxruntime
+          Cflags: -I\${includedir}
+          EOF
+          echo "PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=/opt/onnxruntime/lib" >> "$GITHUB_ENV"
+
+      - name: Prepare onnxruntime + pkg-config (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install pkgconfiglite --no-progress -y
+          $rid = '${{ matrix.ort_rid }}'
+          $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/$env:ORT_VERSION"
+          Invoke-WebRequest -Uri $url -OutFile C:\ort.zip
+          New-Item -ItemType Directory -Force C:\ort-raw | Out-Null
+          tar -xf C:\ort.zip -C C:\ort-raw "runtimes/$rid/native" "build/native/include"
+          New-Item -ItemType Directory -Force C:\onnxruntime\lib | Out-Null
+          Copy-Item C:\ort-raw\build\native\include C:\onnxruntime\include -Recurse -Force
+          Copy-Item "C:\ort-raw\runtimes\$rid\native\onnxruntime.dll" C:\onnxruntime\
+          Copy-Item "C:\ort-raw\runtimes\$rid\native\onnxruntime.lib" C:\onnxruntime\lib\
+          New-Item -ItemType Directory -Force C:\onnxruntime\lib\pkgconfig | Out-Null
+          $pc = @(
+            'prefix=C:/onnxruntime',
+            'libdir=${prefix}/lib',
+            '',
+            'Name: onnxruntime',
+            'Description: ONNX Runtime (dynamic link)',
+            "Version: $env:ORT_VERSION",
+            'Libs: -L${libdir} -lonnxruntime',
+            'Cflags: -I${prefix}/include'
+          ) -join "`n"
+          Set-Content -Path C:\onnxruntime\lib\pkgconfig\libonnxruntime.pc -Value $pc
+          "PKG_CONFIG_PATH=C:\onnxruntime\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify onnxruntime discoverable via pkg-config
+        shell: bash
+        run: pkg-config --modversion libonnxruntime
+
+      # 完整 CMake 构建一次（产出三个静态库）
+      - name: Build C++ deps via ct2rs
+        shell: bash
+        run: cargo build --release -p rumi-translate --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || '' }}
+          OpenMP_ROOT: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/opt/libomp' || '/usr/local/opt/libomp') || '' }}
+          CPATH: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/opt/libomp/include' || '/usr/local/opt/libomp/include') || '' }}
+          LIBRARY_PATH: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/lib' || '/usr/local/lib') || '' }}
+          CMAKE_GENERATOR: ${{ runner.os != 'Windows' && 'Ninja' || '' }}
+
+      # 捞产物：ct2rs OUT_DIR 的 build/libctranslate2.a、onednn-src 的
+      # libdnnl.a、（x86_64）cpu_features 的 libcpu_features.a
+      - name: Collect archives (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          T=${{ matrix.target }}
+          CT2=$(find target/$T/release/build/ct2rs-*/out -name 'libctranslate2.a' | head -1)
+          DNNL=$(find target/$T/release/build/onednn-src-*/out -name 'libdnnl.a' | head -1)
+          test -n "$CT2" && test -n "$DNNL"
+          DIR=$(dirname "$CT2")
+          CF=$(find "$DIR" -name 'libcpu_features.a' 2>/dev/null | head -1 || true)
+          STAGE=ct2-prebuilt-$T
+          rm -rf /tmp/$STAGE && mkdir -p /tmp/$STAGE
+          cp "$CT2" /tmp/$STAGE/
+          cp "$DNNL" /tmp/$STAGE/
+          [ -n "$CF" ] && cp "$CF" /tmp/$STAGE/ || true
+          # 版本戳：ct2rs commit（Cargo.lock 解析）+ 构建参数摘要
+          CT2RS_SHA=$(grep -A2 'name = "ct2rs"' Cargo.lock | grep source | grep -oE '#[0-9a-f]+' | tr -d '#')
+          printf 'ct2rs=%s\ntarget=%s\ncmake=native(dnnl,openmp-comp%s)\n' \
+            "$CT2RS_SHA" "$T" "${{ runner.os == 'Windows' && ',static-crt' || '' }}" > /tmp/$STAGE/BUILD_INFO
+          tar czf ct2-prebuilt-$T.tar.gz -C /tmp $STAGE
+          tar tzf ct2-prebuilt-$T.tar.gz
+
+      - name: Collect archives (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $t = '${{ matrix.target }}'
+          $ct2 = Get-ChildItem "target/$t/release/build/ct2s-*" -Recurse -Filter ctranslate2.lib | Select-Object -First 1
+          $dnnl = Get-ChildItem "target/$t/release/build/onednn-src-*" -Recurse -Filter dnnl.lib | Select-Object -First 1
+          if (-not $ct2 -or -not $dnnl) { throw "archive not found: ct2=$ct2 dnnl=$dnnl" }
+          $cf = Get-ChildItem "target/$t/release/build/ct2s-*" -Recurse -Filter cpu_features.lib | Select-Object -First 1
+          $stage = "ct2-prebuilt-$t"
+          New-Item -ItemType Directory -Force "dist/$stage" | Out-Null
+          Copy-Item $ct2.FullName "dist/$stage/"
+          Copy-Item $dnnl.FullName "dist/$stage/"
+          if ($cf) { Copy-Item $cf.FullName "dist/$stage/" }
+          $lock = Select-String -Path Cargo.lock -Pattern 'ct2rs' -Context 0,2 | Out-String
+          $sha = if ($lock -match '#([0-9a-f]{7,40})') { $Matches[1] } else { 'unknown' }
+          "ct2rs=$sha`ntarget=$t`ncmake=native(dnnl,openmp-comp,static-crt)" | Out-File "dist/$stage/BUILD_INFO"
+          tar czf "ct2-prebuilt-$t.tar.gz" -C dist $stage
+          tar tzf "ct2-prebuilt-$t.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ct2-prebuilt-${{ matrix.target }}
+          path: ct2-prebuilt-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to deps release
+        run: |
+          ls -la dist/
+          # 统一 deps release（不存在则建；不匹配 v* 不触发正式发布 workflow）
+          gh release view deps -R dwdcth/rumi-ocr >/dev/null 2>&1 || \
+            gh release create deps -R dwdcth/rumi-ocr --title "预编译第三方依赖" \
+              --notes "CTranslate2+oneDNN(+cpu_features) 静态库，按平台。CT2RS_PREBUILT_DIR 消费。仅依赖版本变化时重建。"
+          gh release upload deps dist/*.tar.gz --clobber -R dwdcth/rumi-ocr
+        env:
+          GH_TOKEN: ${{ github.token }}
