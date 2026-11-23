@@ -45,11 +45,6 @@ jobs:
             os: macos-latest
             ort_rid: osx-arm64
     runs-on: ${{ matrix.os }}
-    # 平台过滤（github.event.inputs：job 级 if 的 inputs/matrix 解析限制绕行）
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      github.event.inputs.targets == 'all' ||
-      contains(github.event.inputs.targets, matrix.target)
     steps:
       - uses: actions/checkout@v4
 
