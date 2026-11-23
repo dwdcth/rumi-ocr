@@ -93,6 +93,19 @@ docker exec -e LABEL="$LABEL" rumi-loong-rel bash /tmp/loong-rel-build.sh
 
 TARBALL="$OUT/${STAGE}.tar.gz"
 ls -la "$TARBALL"
-echo "== 上传到 release $TAG =="
-gh release upload "$TAG" "$TARBALL" --clobber -R "$REPO"
-echo "完成: ${STAGE}.tar.gz → $TAG"
+# 产物结构自检（跑通标准）：4 bin + ort so 链 + wrapper 齐全
+tar -tzf "$TARBALL" | tee /tmp/loong-rel-list.txt | wc -l
+for f in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
+  grep -q "/$f\$" /tmp/loong-rel-list.txt || { echo "缺 bin: $f"; exit 1; }
+done
+grep -q "lib/libonnxruntime.so" /tmp/loong-rel-list.txt || { echo "缺 ort so"; exit 1; }
+echo "== 结构自检通过: $TARBALL =="
+
+# 上传是显式动作（测试跑通不需要传）：LOONG_RELEASE_UPLOAD=1 ./scripts/loong-release.sh ...
+if [[ "${LOONG_RELEASE_UPLOAD:-0}" == "1" ]]; then
+  echo "== 上传到 release $TAG =="
+  gh release upload "$TAG" "$TARBALL" --clobber -R "$REPO"
+  echo "完成: ${STAGE}.tar.gz → $TAG"
+else
+  echo "未设 LOONG_RELEASE_UPLOAD=1，跳过上传（产物在 $TARBALL）"
+fi
