@@ -182,11 +182,20 @@ jobs:
           Write-Host "Inspecting: $buildDir (exists=$(Test-Path $buildDir))"
           Get-ChildItem $buildDir -Directory | Where-Object Name -Match 'ct2rs|onednn' | ForEach-Object {
             Write-Host "--- DIR: $($_.FullName) ---"
-            Get-ChildItem $_.FullName -Recurse -File | Where-Object Extension -In '.lib','.a','.exe' | ForEach-Object {
-              Write-Host "  LIB: $($_.FullName) ($($_.Length) bytes)"
+            Get-ChildItem $_.FullName -Directory | ForEach-Object {
+              $inner = Join-Path $_.FullName "out"
+              if (Test-Path $inner) {
+                Write-Host "  [out 顶层]:"
+                Get-ChildItem $inner | Select-Object -First 20 | ForEach-Object { Write-Host "    $($_.Name)" }
+                $bdir = Join-Path $inner "build"
+                if (Test-Path $bdir) {
+                  Write-Host "  [out/build 顶层]:"
+                  Get-ChildItem $bdir | Select-Object -First 20 | ForEach-Object { Write-Host "    $($_.Name)" }
+                }
+              }
+              $outLog = Join-Path $_.FullName "output"
+              if (Test-Path $outLog) { Write-Host "  [output tail 30]:"; Get-Content $outLog -Tail 30 }
             }
-            $outLog = Join-Path $_.FullName "output"
-            if (Test-Path $outLog) { Write-Host "  [output tail 30]:"; Get-Content $outLog -Tail 30 }
           }
 
       - name: Collect archives (windows)
@@ -195,8 +204,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $t = '${{ matrix.target }}'
-          $ct2 = Get-ChildItem "target/$t/release/build/ct2rs-*" -Recurse -Filter ctranslate2.lib | Select-Object -First 1
-          $dnnl = Get-ChildItem "target/$t/release/build/onednn-src-*" -Recurse -Filter dnnl.lib | Select-Object -First 1
+          # Windows 的 build script 目录是 build\ct2rs\<hash>（子目录形式，
+          # 非 Unix 的 ct2rs-<hash>）——直接全树搜归档名，不猜目录布局
+          $ct2 = Get-ChildItem "target/$t/release/build" -Recurse -Filter ctranslate2.lib | Select-Object -First 1
+          $dnnl = Get-ChildItem "target/$t/release/build" -Recurse -Filter dnnl.lib | Select-Object -First 1
           if (-not $ct2 -or -not $dnnl) {
             Write-Host "=== 取证：target 下的 .lib ==="
             Get-ChildItem "target/$t/release/build" -Recurse -Include *.lib,*.a 2>$null | Select-Object -First 30 | ForEach-Object { $_.FullName }
