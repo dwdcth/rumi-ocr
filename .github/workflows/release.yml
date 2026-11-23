@@ -53,6 +53,10 @@ on:
         description: '版本后缀（无 tag 触发时拼进包名，如 beta1）'
         required: false
         default: ''
+      targets:
+        description: "平台选择：all=全部 6 平台；或 JSON 数组只跑指定平台（5 主流用 target 名，龙芯用 loongarch64）。例：['x86_64-unknown-linux-gnu','loongarch64']"
+        required: false
+        default: 'all'
 
 permissions:
   contents: write
@@ -76,23 +80,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            ort_rid: linux-x64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            ort_rid: linux-arm64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            ort_rid: win-x64
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-            ort_rid: osx-x64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            ort_rid: osx-arm64
-    runs-on: ${{ matrix.os }}
+        # 'all' 展开全表；否则用 inputs.targets（JSON 数组）过滤指定平台
+        target: ${{ fromJSON(inputs.targets == 'all' || github.event.inputs.targets == 'all' && '["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","x86_64-pc-windows-msvc","x86_64-apple-darwin","aarch64-apple-darwin"]' || github.event.inputs.targets) }}
+    # 平台属性查表（动态 matrix 无 include 字段）
+    runs-on: ${{ fromJSON('{"x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-unknown-linux-gnu":"ubuntu-24.04-arm","x86_64-pc-windows-msvc":"windows-latest","x86_64-apple-darwin":"macos-15-intel","aarch64-apple-darwin":"macos-latest"}')[matrix.target] }}
+    env:
+      ORT_RID: ${{ fromJSON('{"x86_64-unknown-linux-gnu":"linux-x64","aarch64-unknown-linux-gnu":"linux-arm64","x86_64-pc-windows-msvc":"win-x64","x86_64-apple-darwin":"osx-x64","aarch64-apple-darwin":"osx-arm64"}')[matrix.target] }}
     continue-on-error: ${{ matrix.experimental == true }}
     steps:
       - uses: actions/checkout@v4
@@ -161,14 +154,14 @@ jobs:
           unzip -q /tmp/ort.nupkg 'runtimes/*' 'build/native/include/*'
           sudo mkdir -p /opt/onnxruntime/lib /opt/onnxruntime/include
           sudo cp -r build/native/include/. /opt/onnxruntime/include/
-          case "${{ matrix.ort_rid }}" in
+          case "$ORT_RID" in
             linux-*)
-              sudo cp "runtimes/${{ matrix.ort_rid }}/native/libonnxruntime.so" /opt/onnxruntime/lib/
+              sudo cp "runtimes/$ORT_RID/native/libonnxruntime.so" /opt/onnxruntime/lib/
               # SONAME=libonnxruntime.so.1：运行期 loader 按此名解析
               sudo ln -sf libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1
               ;;
             osx-*)
-              sudo cp "runtimes/${{ matrix.ort_rid }}/native/libonnxruntime.dylib" /opt/onnxruntime/lib/
+              sudo cp "runtimes/$ORT_RID/native/libonnxruntime.dylib" /opt/onnxruntime/lib/
               ;;
           esac
           sudo mkdir -p /opt/onnxruntime/lib/pkgconfig
@@ -193,7 +186,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           choco install pkgconfiglite --no-progress -y
-          $rid = '${{ matrix.ort_rid }}'
+          $rid = $env:ORT_RID
           $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/$env:ORT_VERSION"
           Invoke-WebRequest -Uri $url -OutFile C:\ort.zip
           New-Item -ItemType Directory -Force C:\ort-raw | Out-Null
@@ -333,7 +326,7 @@ jobs:
           done
           cp README.md "$stage/" 2>/dev/null || true
           # ort 动态库落位（平台各自的链接器语义，见文件头注释）
-          case "${{ matrix.ort_rid }}" in
+          case "$ORT_RID" in
             linux-*)
               # 实体 .so + SONAME 符号链接 .so.1（cp -P 保留链接，tar 同样保留）
               cp -P /opt/onnxruntime/lib/libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1 "$stage/lib/"
@@ -347,7 +340,7 @@ jobs:
           # 加 LC_RPATH=@executable_path/lib 指包内；add_rpath 动过二进制，
           # ad-hoc 重签（arm64 无签名直接拒绝加载）。dylib 一并重签——
           # nuget 解出的原 dylib 无有效签名，arm64 加载同样会被拒。
-          if [[ "${{ matrix.ort_rid }}" == osx-* ]]; then
+          if [[ "$ORT_RID" == osx-* ]]; then
             for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
               install_name_tool -add_rpath @executable_path/lib "$stage/$b"
               codesign --force --sign - "$stage/$b"
@@ -360,7 +353,7 @@ jobs:
             {
               echo '#!/bin/sh'
               echo 'DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)'
-              if [[ "${{ matrix.ort_rid }}" == linux-* ]]; then
+              if [[ "$ORT_RID" == linux-* ]]; then
                 echo 'export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
               fi
               echo "exec \"\$DIR/$b\" \"\$@\""
@@ -393,8 +386,125 @@ jobs:
             rumi-${{ env.LABEL }}-${{ matrix.target }}.zip
           if-no-files-found: error
 
+  # 龙芯（loongarch64，新世界）：QEMU 容器 + 预装镜像 + deps release 的
+  # 预编译 CT2。独立 job（流程与主流平台不同：无 ort 步骤/无 rust-toolchain，
+  # 全在容器内）。targets 含 loongarch64 或 all 时跑；tag 触发恒跑。
+  build-loong64:
+    name: build (loongarch64-unknown-linux-gnu)
+    if: >-
+      github.event_name == 'push' ||
+      github.event.inputs.targets == 'all' ||
+      contains(github.event.inputs.targets, 'loongarch64')
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: write
+      packages: read
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release label
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            label="${GITHUB_REF#refs/tags/}"
+          else
+            label="$(echo "$GITHUB_SHA" | cut -c1-7)"
+            suffix="${{ inputs.version-suffix }}"
+            if [ -n "$suffix" ]; then label="$label-$suffix"; fi
+          fi
+          echo "LABEL=$label" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: loong64
+
+      # cargo 缓存挂载点（宿主目录，actions/cache 持久化；容器路径恒定
+      # /build/target 保证 build script fingerprint 跨轮有效）
+      - name: Restore cargo caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/loong-target
+            /tmp/loong-cargo-registry
+            /tmp/loong-cargo-git
+          key: loong-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: loong-cargo-
+
+      # 脚本经 heredoc 落盘再 docker exec，避免多层引号转义。
+      - name: Docker login ghcr (pull private image)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build in QEMU loong64 container
+        run: |
+          cat > /tmp/loong-build.sh <<'EOS'
+          set -euxo pipefail
+          # commit 镜像不带 ENV（docker commit 不保留环境变量），ORT 探测
+          # 与加载路径显式给出（缺 PKG_CONFIG_PATH 时 ort-sys 回退下载
+          # 预编译包，loongarch64 无资产直接挂）
+          export PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig
+          export LD_LIBRARY_PATH=/opt/onnxruntime/lib
+          pkg-config --modversion libonnxruntime
+          # CTranslate2 预编译静态库（loong64-deps release）
+          mkdir -p /opt/ct2-prebuilt
+          curl -sSL -o /tmp/ct2.tgz \
+            "https://github.com/dwdcth/rumi-ocr/releases/download/deps/ct2-prebuilt-loongarch64-unknown-linux-gnu.tar.gz"
+          tar -xzf /tmp/ct2.tgz -C /opt/ct2-prebuilt
+          test -f /opt/ct2-prebuilt/libctranslate2.a
+
+          . ~/.cargo/env
+          cp -r /src/. /build/
+          cd /build
+          export CT2RS_PREBUILT_DIR=/opt/ct2-prebuilt
+          cargo build --release --workspace --target loongarch64-unknown-linux-gnu
+
+          # 打包（与 Linux 原生 job 同构：bins + ort so + run-*.sh）
+          target=loongarch64-unknown-linux-gnu
+          stage="rumi-${LABEL}-${target}"
+          mkdir -p "/out/${stage}/lib"
+          for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
+            cp "target/${target}/release/$b" "/out/${stage}/"
+            printf '#!/bin/sh\nDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$DIR/%s" "$@"\n' "$b" > "/out/${stage}/run-$b.sh"
+            chmod +x "/out/${stage}/run-$b.sh"
+          done
+          cp -P /opt/onnxruntime/lib/libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1 "/out/${stage}/lib/"
+          cp README.md "/out/${stage}/" 2>/dev/null || true
+          tar czf "/out/rumi-${LABEL}-${target}.tar.gz" -C /out "$stage"
+          ls -la /out
+          EOS
+
+          mkdir -p /tmp/loong-target /tmp/loong-cargo-registry /tmp/loong-cargo-git
+          docker run -d --name rumi-loong --platform linux/loong64 \
+            -v "$GITHUB_WORKSPACE":/src:ro \
+            -v /tmp/loong-target:/build/target \
+            -v /tmp/loong-cargo-registry:/root/.cargo/registry \
+            -v /tmp/loong-cargo-git:/root/.cargo/git \
+            ghcr.io/dwdcth/rumi-loong-build:v1 sleep infinity
+          docker cp /tmp/loong-build.sh rumi-loong:/tmp/loong-build.sh
+          docker exec -e LABEL="$LABEL" rumi-loong bash /tmp/loong-build.sh
+          mkdir -p dist
+          docker cp rumi-loong:/out/. dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rumi-${{ env.LABEL }}-loongarch64-unknown-linux-gnu
+          path: dist/rumi-${{ env.LABEL }}-loongarch64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+
+      # tag 发布：资产与其他 5 平台并进同一个 GitHub Release（独立
+      # workflow 并行跑不拖慢主线；softprops 自动挂到同名 tag release）
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: dist/rumi-${{ env.LABEL }}-loongarch64-unknown-linux-gnu.tar.gz
+
+
+
   release:
-    needs: build
+    needs: [build, build-loong64]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
