@@ -1,6 +1,8 @@
 # 龙芯（loongarch64，新世界）独立打包 workflow：手动触发。
-# 从 release.yml 拆出（发布不用等 2h 的 QEMU 长跑）。CTranslate2 用
-# loong64-deps release 的预编译 .a（CT2RS_PREBUILT_DIR），只编 Rust。
+# 提速三层：① 预装镜像 ghcr.io/dwdcth/rumi-loong-build（apt/rustup/
+# onnxruntime 全内嵌，秒起）② CTranslate2 用 loong64-deps release 的
+# 预编译 .a（CT2RS_PREBUILT_DIR，零 C++ 编译）③ cargo registry+target
+# 经宿主目录挂载 + actions/cache 跨轮增量（Rust 只重编改动）。
 name: loongarch64
 
 on:
@@ -54,59 +56,33 @@ jobs:
         with:
           platforms: loong64
 
+      # cargo 缓存挂载点（宿主目录，actions/cache 持久化；容器路径恒定
+      # /build/target 保证 build script fingerprint 跨轮有效）
+      - name: Restore cargo caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/loong-target
+            /tmp/loong-cargo-registry
+            /tmp/loong-cargo-git
+          key: loong-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: loong-cargo-
+
       # 脚本经 heredoc 落盘再 docker exec，避免多层引号转义。
       - name: Build in QEMU loong64 container
         run: |
           cat > /tmp/loong-build.sh <<'EOS'
           set -euxo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends \
-            build-essential cmake ninja-build git curl unzip python3 ca-certificates pkg-config \
-            libssl-dev libclang-dev clang \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libudev-dev \
-            libayatana-appindicator3-dev libglib2.0-dev libxdo-dev \
-            libpipewire-0.3-dev libspa-0.2-dev \
-            libgbm-dev libdrm-dev libx11-dev libxcb1-dev libwayland-dev
-
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-          . ~/.cargo/env
-
-          # onnxruntime：loong64 社区构建（wheel 内嵌 C 库）
-          VER="1.32.0"
-          mkdir -p /opt/onnxruntime/lib/pkgconfig
-          curl -sL -o /tmp/ort.whl \
-            "https://github.com/loong64/onnxruntime/releases/download/v${VER}/onnxruntime-${VER}-cp313-cp313-manylinux_2_38_loongarch64.whl"
-          python3 -c "import zipfile; zipfile.ZipFile('/tmp/ort.whl').extractall('/tmp/ortx')"
-          cp "/tmp/ortx/onnxruntime/capi/libonnxruntime.so.${VER}" /opt/onnxruntime/lib/
-          ln -sf "libonnxruntime.so.${VER}" /opt/onnxruntime/lib/libonnxruntime.so
-          # SONAME=libonnxruntime.so.1（与官方包一致，运行期 loader 按此名找）
-          ln -sf "libonnxruntime.so.${VER}" /opt/onnxruntime/lib/libonnxruntime.so.1
-          cat > /opt/onnxruntime/lib/pkgconfig/libonnxruntime.pc <<PC
-          prefix=/opt/onnxruntime
-          libdir=\${prefix}/lib
-
-          Name: libonnxruntime
-          Description: ONNX Runtime (loong64 community build, dynamic link)
-          Version: ${VER}
-          Libs: -L\${libdir} -lonnxruntime
-          PC
-          export PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig
-          pkg-config --modversion libonnxruntime
-
-          # CTranslate2 预编译静态库（QEMU 下 C++ 编译是大头）：从本仓库
-          # loong64-deps release 下载，ct2rs 的 CT2RS_PREBUILT_DIR 直接链入，
-          # 跳过 CMake。头文件仍用源码树（git checkout 照常发生）。
+          # CTranslate2 预编译静态库（loong64-deps release）
           mkdir -p /opt/ct2-prebuilt
           curl -sSL -o /tmp/ct2.tgz \
             "https://github.com/dwdcth/rumi-ocr/releases/download/loong64-deps/libctranslate2-loong64.tar.gz"
           tar -xzf /tmp/ct2.tgz -C /opt/ct2-prebuilt
           test -f /opt/ct2-prebuilt/libctranslate2.a
 
-          cp -r /src /build
+          . ~/.cargo/env
+          cp -r /src/. /build/
           cd /build
-          rm -rf target
-          export LD_LIBRARY_PATH=/opt/onnxruntime/lib
           export CT2RS_PREBUILT_DIR=/opt/ct2-prebuilt
           cargo build --release --workspace --target loongarch64-unknown-linux-gnu
 
@@ -125,9 +101,13 @@ jobs:
           ls -la /out
           EOS
 
+          mkdir -p /tmp/loong-target /tmp/loong-cargo-registry /tmp/loong-cargo-git
           docker run -d --name rumi-loong --platform linux/loong64 \
             -v "$GITHUB_WORKSPACE":/src:ro \
-            ghcr.io/loong64/debian:trixie sleep infinity
+            -v /tmp/loong-target:/build/target \
+            -v /tmp/loong-cargo-registry:/root/.cargo/registry \
+            -v /tmp/loong-cargo-git:/root/.cargo/git \
+            ghcr.io/dwdcth/rumi-loong-build:v1 sleep infinity
           docker cp /tmp/loong-build.sh rumi-loong:/tmp/loong-build.sh
           docker exec -e LABEL="$LABEL" rumi-loong bash /tmp/loong-build.sh
           mkdir -p dist
