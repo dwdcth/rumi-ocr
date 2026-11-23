@@ -82,6 +82,8 @@ for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
   abnormal=$({ grep -vE '^[[:space:]]*[^ ]+ => /[^ ]+ \(0x[0-9a-f]+\)$|^[[:space:]]*(linux-vdso\.so\.1|/[^ ]+ld-[^ ]*)? \(0x[0-9a-f]+\)$' <<<"$out" || true; } | tr '\n' ' ')
   if [ -n "$abnormal" ]; then
     fail "直接运行加载异常：$abnormal"
+    # 完整倾倒便于定位格式差异（一次性取证，格式定案后可移除）
+    sed 's/^/      | /' <<<"$out"
     continue
   fi
   echo "  加载器解析通过"
