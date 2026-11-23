@@ -127,8 +127,8 @@ jobs:
         with:
           # v2 前缀：启用 ccache/Ninja 前的 CMakeCache 无 COMPILER_LAUNCHER
           # 记录，存量恢复后 env 不会覆盖已存在的 cache，强制换前缀清一次
-          prefix: release-v2-${{ matrix.target }}
-          envVars: ORT_VERSION
+          prefix-key: release-v2-${{ matrix.target }}
+          env-vars: ORT_VERSION
           cache-on-failure: true
 
       - name: Install desktop system deps (linux only)
@@ -367,7 +367,7 @@ jobs:
               # libxdo：dioxus-desktop 的菜单栏/托盘后端（muda / tray-icon）链入，
               # 仅 rumi-ui 需要。构建机的 soname 换个发行版就可能不存在（Ubuntu
               # 是 libxdo.so.3，Arch 的 xdotool 新版只有 .so.4），随包携带。
-              xdo=$(ldconfig -p | awk '/libxdo\.so\.[0-9]+/ {print $NF; exit}')
+              xdo=$(ldconfig -p | awk '/libxdo\.so\.[0-9]+/ && !f {print $NF; f=1}')
               test -n "$xdo"
               cp -L "$xdo" "$stage/lib/"
               ;;
@@ -527,7 +527,7 @@ jobs:
           cp -L /opt/onnxruntime/lib/libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so"
           ln -sf libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so.1"
           # libxdo 随包携带（不同发行版 soname 不同，仅 rumi-ui 需要）
-          xdo=$(PATH="$PATH:/usr/sbin:/sbin" ldconfig -p | awk '/libxdo\.so\.[0-9]+/ {print $NF; exit}')
+          xdo=$(PATH="$PATH:/usr/sbin:/sbin" ldconfig -p | awk '/libxdo\.so\.[0-9]+/ && !f {print $NF; f=1}')
           test -n "$xdo"
           cp -L "$xdo" "/out/${stage}/lib/"
           cp README.md "/out/${stage}/" 2>/dev/null || true

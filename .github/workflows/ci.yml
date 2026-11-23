@@ -44,7 +44,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix: ci-v2
+          prefix-key: ci-v2
           cache-on-failure: true
 
       - name: Install desktop system deps (webkit2gtk 4.1 etc.)

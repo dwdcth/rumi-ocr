@@ -78,7 +78,7 @@ done
 cp -L /opt/onnxruntime/lib/libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so"
 ln -sf libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so.1"
 # libxdo 随包携带（不同发行版 soname 不同，仅 rumi-ui 需要）
-xdo=$(PATH="$PATH:/usr/sbin:/sbin" ldconfig -p | awk '/libxdo\.so\.[0-9]+/ {print $NF; exit}')
+xdo=$(PATH="$PATH:/usr/sbin:/sbin" ldconfig -p | awk '/libxdo\.so\.[0-9]+/ && !f {print $NF; f=1}')
 test -n "$xdo"
 cp -L "$xdo" "/out/${stage}/lib/"
 cp README.md "/out/${stage}/" 2>/dev/null || true

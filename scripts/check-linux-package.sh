@@ -75,10 +75,11 @@ for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
   # 加载器对致命错误也可能返回 0（实测符号版本不匹配时 --list 退出码为 0
   # 但打印了 "version ... not found"），所以不看退出码，看有没有非正常行
   out=$(LC_ALL=C "$loader" --list "$bin" 2>&1) || true
-  # 正常行形如 "lib => /path (0x...)"、"linux-vdso.so.1 (0x...)"、"/lib64/ld-*.so (0x...)"；
+  # 正常行形如 "lib => /path (0x...)"、"linux-vdso.so.1 (0x...)"、"/lib64/ld-*.so (0x...)"、
+  # 或 glibc 2.39 在某些库（如 libgbm/EGL）下输出的匿名映射行 "\t (0x...)"；
   # 加载器打印错误后，其余行会带制表符前缀，行首允许空白
   # grep -v 在"没有异常行"时退出码为 1，pipefail + set -e 下会中止脚本，故 || true
-  abnormal=$({ grep -vE '^[[:space:]]*[^ ]+ => /[^ ]+ \(0x[0-9a-f]+\)$|^[[:space:]]*(linux-vdso\.so\.1|/[^ ]+ld-[^ ]*) \(0x[0-9a-f]+\)$' <<<"$out" || true; } | tr '\n' ' ')
+  abnormal=$({ grep -vE '^[[:space:]]*[^ ]+ => /[^ ]+ \(0x[0-9a-f]+\)$|^[[:space:]]*(linux-vdso\.so\.1|/[^ ]+ld-[^ ]*)? \(0x[0-9a-f]+\)$' <<<"$out" || true; } | tr '\n' ' ')
   if [ -n "$abnormal" ]; then
     fail "直接运行加载异常：$abnormal"
     continue
