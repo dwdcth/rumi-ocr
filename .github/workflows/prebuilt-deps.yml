@@ -138,13 +138,15 @@ jobs:
       # 完整 CMake 构建一次（产出三个静态库）
       - name: Build C++ deps via ct2rs
         shell: bash
-        run: cargo build --release -p rumi-translate --target ${{ matrix.target }}
+        run: |
+          # 条件 export：env 空串会让 cmake-rs 收到 -G ""（release.yml 同款坑）
+          if [ "${{ runner.os }}" != "Windows" ]; then export CMAKE_GENERATOR=Ninja; fi
+          cargo build --release -p rumi-translate --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || '' }}
           OpenMP_ROOT: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/opt/libomp' || '/usr/local/opt/libomp') || '' }}
           CPATH: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/opt/libomp/include' || '/usr/local/opt/libomp/include') || '' }}
           LIBRARY_PATH: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/lib' || '/usr/local/lib') || '' }}
-          CMAKE_GENERATOR: ${{ runner.os != 'Windows' && 'Ninja' || '' }}
 
       # 捞产物：ct2rs OUT_DIR 的 build/libctranslate2.a、onednn-src 的
       # libdnnl.a、（x86_64）cpu_features 的 libcpu_features.a
@@ -154,8 +156,10 @@ jobs:
         run: |
           set -euxo pipefail
           T=${{ matrix.target }}
-          CT2=$(find target/$T/release/build/ct2rs-*/out -name 'libctranslate2.a' | head -1)
-          DNNL=$(find target/$T/release/build/onednn-src-*/out -name 'libdnnl.a' | head -1)
+          # 全 target 树兜底查找（build script 的 OUT_DIR hash 目录布局跨
+          # cargo 版本有差异，窄 glob 易漏）
+          CT2=$(find target -name 'libctranslate2.a' 2>/dev/null | head -1)
+          DNNL=$(find target -name 'libdnnl.a' 2>/dev/null | head -1)
           test -n "$CT2" && test -n "$DNNL"
           DIR=$(dirname "$CT2")
           CF=$(find "$DIR" -name 'libcpu_features.a' 2>/dev/null | head -1 || true)
