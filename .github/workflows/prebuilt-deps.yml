@@ -1,22 +1,25 @@
-# 预编译第三方 C++ 依赖（CTranslate2 + oneDNN + cpu_features）→ deps release。
-# 手动触发，仅在 ct2rs/CTranslate2/oneDNN 版本变化时跑一次；此后正式
-# release workflow 经 CT2RS_PREBUILT_DIR 直链预编译归档，跳过全部 C++ 编译。
-#
-# 产出方式：cargo build -p rumi-translate（feature=dnnl）触发 ct2rs 完整
-# CMake 构建，随后从 target 的 build script OUT_DIR 捞出三个静态库打包。
-# 资产命名：ct2-prebuilt-<target>.tar.gz（内容含版本戳，构建时写入）。
+# 预编译第三方 C++ 依赖 → 统一 deps release（CT2RS_PREBUILT_DIR 消费）。
+# 手动触发，仅 ct2rs/CTranslate2/oneDNN 版本变化时跑；两个开关支持只跑
+# 一部分（例：只补龙芯 → -f skip_matrix=true）。
+#   - build（5 主流平台矩阵）：cargo 触发 ct2rs 完整 CMake，捞三静态库
+#   - prebuilt-loong64：QEMU 容器纯 cmake 编 CTranslate2（无 dnnl）
 name: prebuilt-deps
 
 on:
   workflow_dispatch:
     inputs:
-      targets:
-        description: '要构建的平台（逗号分隔 target 名；all=全部。重跑只填报错的）'
+      skip_matrix:
+        description: 'true=跳过 5 主流平台（只跑龙芯）'
         required: false
-        default: 'all'
+        default: 'false'
+      skip_loong:
+        description: 'true=跳过龙芯（只跑 5 平台矩阵）'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
+  packages: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,6 +28,7 @@ env:
 jobs:
   build:
     name: prebuilt (${{ matrix.target }})
+    if: github.event.inputs.skip_matrix != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -44,19 +48,16 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             ort_rid: osx-arm64
-          - target: loongarch64-unknown-linux-gnu
-            os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        if: matrix.target != 'loongarch64-unknown-linux-gnu'
         with:
           targets: ${{ matrix.target }}
 
       - name: Install desktop system deps (linux only)
-        if: runner.os == 'Linux' && matrix.target != 'loongarch64-unknown-linux-gnu'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -72,11 +73,10 @@ jobs:
           brew install libomp ninja
           brew link --force libomp
 
-      # onnxruntime（NuGet）+ .pc —— ct2rs 构建不需要 ORT，但
-      # oar-ocr/ort-sys 在依赖图里，探测失败会回退静态下载（污染产物
-      # 语义），保持与 release.yml 相同的动态链环境。
+      # onnxruntime（NuGet）+ .pc：ort-sys 在依赖图里，探测失败会回退
+      # 静态下载（污染产物语义），保持与 release.yml 相同的动态链环境。
       - name: Prepare onnxruntime (unix)
-        if: runner.os != 'Windows' && matrix.target != 'loongarch64-unknown-linux-gnu'
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euxo pipefail
@@ -140,92 +140,45 @@ jobs:
           "PKG_CONFIG_PATH=C:\onnxruntime\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Verify onnxruntime discoverable via pkg-config
-        if: matrix.target != 'loongarch64-unknown-linux-gnu'
         shell: bash
         run: pkg-config --modversion libonnxruntime
 
-      # ---- 龙芯分支：QEMU 容器内纯 cmake 编 CTranslate2 ----
-      # （不经 cargo：loong 无 dnnl feature，直接 cmake 与本地 loong64-deps
-      #  产出参数一致；docker login 复用下方 ghcr 拉取）
-      - name: Docker login ghcr
-        if: matrix.target == 'loongarch64-unknown-linux-gnu'
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Build CT2 in QEMU container (loong64)
-        if: matrix.target == 'loongarch64-unknown-linux-gnu'
-        run: |
-          docker run -d --name rumi-loong-pre --platform linux/loong64 \
-            ghcr.io/dwdcth/rumi-loong-build:v1 sleep infinity
-          cat > /tmp/ct2-cmake.sh <<'EOS'
-          set -euxo pipefail
-          SRC=/root/.cargo/git/checkouts/ctranslate2-rs-*/*/ct2rs/CTranslate2
-          # 源码不在镜像（registry/git 缓存被清）——git clone fork 分支钉的
-          # CTranslate2（slim-submodules，90573db5）
-          test -d "$SRC" || {
-            git clone -q --depth 1 --branch slim-submodules \
-              https://github.com/dwdcth/CTranslate2 /tmp/c3
-            git -C /tmp/c3 fetch -q --depth 1 origin 90573db535c2b88ef2400a625de0249227e55090
-            git -C /tmp/c3 checkout -q 90573db535c2b88ef2400a625de0249227e55090
-            git -C /tmp/c3 submodule -q update --init --depth 1 third_party/cxxopts third_party/cpu_features third_party/spdlog
-            SRC=/tmp/c3
-          }
-          mkdir -p /tmp/ct2build && cd /tmp/ct2build
-          cmake "$SRC" -B . -DBUILD_CLI=OFF -DBUILD_SHARED_LIBS=OFF -DWITH_MKL=OFF \
-            -DOPENMP_RUNTIME=COMP -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_CPU_DISPATCH=OFF \
-            -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS= -ffunction-sections -fdata-sections -fPIC -w' \
-            '-DCMAKE_C_FLAGS= -ffunction-sections -fdata-sections -fPIC -w'
-          make -j"$(nproc)"
-          test -f libctranslate2.a
-          EOS
-          docker cp /tmp/ct2-cmake.sh rumi-loong-pre:/tmp/ct2-cmake.sh
-          docker exec rumi-loong-pre bash /tmp/ct2-cmake.sh
-          mkdir -p dist/ct2-prebuilt-${{ matrix.target }}
-          docker cp rumi-loong-pre:/tmp/ct2build/libctranslate2.a dist/ct2-prebuilt-${{ matrix.target }}/
-          printf 'ct2rs=%s\ntarget=%s\ncmake=native(openmp-comp,cpu-dispatch-off)\n' \
-            5007faae2b9f2d2147868be47a11e1be5da00f49 ${{ matrix.target }} > dist/ct2-prebuilt-${{ matrix.target }}/BUILD_INFO
-          tar czf ct2-prebuilt-${{ matrix.target }}.tar.gz -C dist ct2-prebuilt-${{ matrix.target }}
-          docker rm -f rumi-loong-pre
-
       # 完整 CMake 构建一次（产出三个静态库）
       - name: Build C++ deps via ct2rs
-        if: matrix.target != 'loongarch64-unknown-linux-gnu'
         shell: bash
         run: |
-          # 条件 export：env 空串会让 cmake-rs 收到 -G ""（release.yml 同款坑）
+          # 条件 export：env 空串会让 cmake-rs 收到 -G ""（同 release.yml 坑）
           if [ "${{ runner.os }}" != "Windows" ]; then export CMAKE_GENERATOR=Ninja; fi
           cargo build --release -p rumi-translate --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || '' }}
+          CXXFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-march=x86-64' || '' }}
           OpenMP_ROOT: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/opt/libomp' || '/usr/local/opt/libomp') || '' }}
           CPATH: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/opt/libomp/include' || '/usr/local/opt/libomp/include') || '' }}
           LIBRARY_PATH: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/lib' || '/usr/local/lib') || '' }}
 
-      # 捞产物：ct2rs OUT_DIR 的 build/libctranslate2.a、onednn-src 的
-      # libdnnl.a、（x86_64）cpu_features 的 libcpu_features.a
+      # 捞产物：ct2rs 的 libctranslate2.a、onednn-src 的 libdnnl.a、
+      # （x86_64）cpu_features 的 libcpu_features.a —— 全 target 树兜底 find
       - name: Collect archives (unix)
-        if: runner.os != 'Windows' && matrix.target != 'loongarch64-unknown-linux-gnu'
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euxo pipefail
-          T=${{ matrix.target }}
-          # 全 target 树兜底查找（build script 的 OUT_DIR hash 目录布局跨
-          # cargo 版本有差异，窄 glob 易漏）
           CT2=$(find target -name 'libctranslate2.a' 2>/dev/null | head -1)
           DNNL=$(find target -name 'libdnnl.a' 2>/dev/null | head -1)
           test -n "$CT2" && test -n "$DNNL"
           DIR=$(dirname "$CT2")
           CF=$(find "$DIR" -name 'libcpu_features.a' 2>/dev/null | head -1 || true)
-          STAGE=ct2-prebuilt-$T
+          STAGE=ct2-prebuilt-${{ matrix.target }}
           rm -rf /tmp/$STAGE && mkdir -p /tmp/$STAGE
           cp "$CT2" /tmp/$STAGE/
           cp "$DNNL" /tmp/$STAGE/
           [ -n "$CF" ] && cp "$CF" /tmp/$STAGE/ || true
-          # 版本戳：ct2rs commit（Cargo.lock 解析）+ 构建参数摘要
           CT2RS_SHA=$(grep -A2 'name = "ct2rs"' Cargo.lock | grep source | grep -oE '#[0-9a-f]+' | tr -d '#')
           printf 'ct2rs=%s\ntarget=%s\ncmake=native(dnnl,openmp-comp%s)\n' \
-            "$CT2RS_SHA" "$T" "${{ runner.os == 'Windows' && ',static-crt' || '' }}" > /tmp/$STAGE/BUILD_INFO
-          tar czf ct2-prebuilt-$T.tar.gz -C /tmp $STAGE
-          tar tzf ct2-prebuilt-$T.tar.gz
+            "$CT2RS_SHA" "${{ matrix.target }}" "${{ runner.os == 'Windows' && ',static-crt' || '' }}" > /tmp/$STAGE/BUILD_INFO
+          tar czf ct2-prebuilt-${{ matrix.target }}.tar.gz -C /tmp $STAGE
+          tar tzf ct2-prebuilt-${{ matrix.target }}.tar.gz
 
       - name: Collect archives (windows)
         if: runner.os == 'Windows'
@@ -260,8 +213,56 @@ jobs:
           path: ct2-prebuilt-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+  # 龙芯预编译：QEMU 容器纯 cmake 编 CTranslate2（不经 cargo：loong 的
+  # ct2rs 无 dnnl feature，直接 cmake 与 deps release 其他平台同构溯源）。
+  prebuilt-loong64:
+    if: github.event.inputs.skip_loong != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docker login ghcr
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build CT2 in QEMU container (loong64)
+        run: |
+          docker run -d --name rumi-loong-pre --platform linux/loong64 \
+            ghcr.io/dwdcth/rumi-loong-build:v1 sleep infinity
+          cat > /tmp/ct2-cmake.sh <<'EOS'
+          set -euxo pipefail
+          # 源钉 dwdcth/CTranslate2@slim-submodules（ct2rs fork gitlink 同点）
+          git clone -q --depth 1 --branch slim-submodules \
+            https://github.com/dwdcth/CTranslate2 /tmp/c3
+          git -C /tmp/c3 fetch -q --depth 1 origin 90573db535c2b88ef2400a625de0249227e55090
+          git -C /tmp/c3 checkout -q 90573db535c2b88ef2400a625de0249227e55090
+          git -C /tmp/c3 submodule -q update --init --depth 1 third_party/cxxopts third_party/cpu_features third_party/spdlog
+          mkdir -p /tmp/ct2build && cd /tmp/ct2build
+          cmake /tmp/c3 -B . -DBUILD_CLI=OFF -DBUILD_SHARED_LIBS=OFF -DWITH_MKL=OFF \
+            -DOPENMP_RUNTIME=COMP -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_CPU_DISPATCH=OFF \
+            -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS= -ffunction-sections -fdata-sections -fPIC -w' \
+            '-DCMAKE_C_FLAGS= -ffunction-sections -fdata-sections -fPIC -w'
+          make -j"$(nproc)"
+          test -f libctranslate2.a
+          EOS
+          docker cp /tmp/ct2-cmake.sh rumi-loong-pre:/tmp/ct2-cmake.sh
+          docker exec rumi-loong-pre bash /tmp/ct2-cmake.sh
+          mkdir -p dist/ct2-prebuilt-loongarch64-unknown-linux-gnu
+          docker cp rumi-loong-pre:/tmp/ct2build/libctranslate2.a dist/ct2-prebuilt-loongarch64-unknown-linux-gnu/
+          printf 'ct2rs=5007faae2b9f2d2147868be47a11e1be5da00f49\ntarget=loongarch64-unknown-linux-gnu\ncmake=native(openmp-comp,cpu-dispatch-off)\n' \
+            > dist/ct2-prebuilt-loongarch64-unknown-linux-gnu/BUILD_INFO
+          tar czf ct2-prebuilt-loongarch64-unknown-linux-gnu.tar.gz -C dist ct2-prebuilt-loongarch64-unknown-linux-gnu
+          docker rm -f rumi-loong-pre
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ct2-prebuilt-loongarch64-unknown-linux-gnu
+          path: ct2-prebuilt-loongarch64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+
   publish:
-    needs: build
+    needs: [build, prebuilt-loong64]
+    if: >-
+      !cancelled() &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (needs.prebuilt-loong64.result == 'success' || needs.prebuilt-loong64.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
