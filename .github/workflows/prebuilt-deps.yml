@@ -219,6 +219,10 @@ jobs:
     if: github.event.inputs.skip_loong != 'true'
     runs-on: ubuntu-latest
     steps:
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: loong64
+
       - name: Docker login ghcr
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
