@@ -235,7 +235,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          curl -sSL -o /tmp/ct2.tgz \
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/ct2.tgz \
             "https://github.com/dwdcth/rumi-ocr/releases/download/deps/ct2-prebuilt-${{ matrix.target }}.tar.gz"
           # 无 sudo（Windows bash 没有）；工作区相对路径（Windows 无 /tmp 语义）
           mkdir -p ct2-prebuilt
@@ -451,7 +451,7 @@ jobs:
           pkg-config --modversion libonnxruntime
           # CTranslate2 预编译静态库（loong64-deps release）
           mkdir -p /opt/ct2-prebuilt
-          curl -sSL -o /tmp/ct2.tgz \
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/ct2.tgz \
             "https://github.com/dwdcth/rumi-ocr/releases/download/deps/ct2-prebuilt-loongarch64-unknown-linux-gnu.tar.gz"
           tar -xzf /tmp/ct2.tgz --strip-components=1 -C /opt/ct2-prebuilt
           test -f /opt/ct2-prebuilt/libctranslate2.a
