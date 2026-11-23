@@ -20,7 +20,15 @@ path = "src/bin/rumi_translate_cli.rs"
 # 过渡开关：启用则回退 ct2rs 自带 C++ sentencepiece（含 protobuf-lite，会重新引入
 # 双 protobuf 风险，仅排查分词问题时用）；默认纯 Rust 路线。稳定 1-2 个版本后删除。
 spm-sys = ["ct2rs/sentencepiece"]
-default = []
+# ct2rs 的 oneDNN 后端两条互斥路线（不能同开：dnnl 拉 onednn-src 无条件
+# 编译 oneDNN，会击穿预编译的跳过）：
+# - ct2-dnnl（default）：源码编译（本地开发/CI bootstrap 出预编译用）
+# - ct2-prebuilt：链 deps release 的预编译归档（CT2RS_PREBUILT_DIR，
+#   CI 正式发布用，C++ 零编译）。构建命令：
+#   cargo build --no-default-features --features rumi-translate/ct2-prebuilt
+default = ["ct2-dnnl"]
+ct2-dnnl = ["ct2rs/dnnl"]
+ct2-prebuilt = ["ct2rs/dnnl-prebuilt"]
 
 [dependencies]
 # 分词：纯 Rust 直载 .spm（对拍 744/744 全等，见 docs/spm-parity-report.md）。
@@ -61,7 +69,7 @@ oxidize-pdf = "5"
 #   走 GENERIC 单 ISA 回退）。故去 dnnl，CT2 回退内建 GEMM（能跑但慢），
 #   等社区 oneDNN 移植后再放开。
 [target.'cfg(not(target_arch = "loongarch64"))'.dependencies]
-ct2rs = { git = "https://github.com/dwdcth/ctranslate2-rs", branch = "loongarch64", default-features = false, features = ["dnnl", "openmp-runtime-comp"] }
+ct2rs = { git = "https://github.com/dwdcth/ctranslate2-rs", branch = "loongarch64", default-features = false, features = ["openmp-runtime-comp"] }
 
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
 ct2rs = { git = "https://github.com/dwdcth/ctranslate2-rs", branch = "loongarch64", default-features = false, features = ["openmp-runtime-comp"] }

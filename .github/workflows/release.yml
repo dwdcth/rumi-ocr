@@ -235,6 +235,20 @@ jobs:
           brew install libomp ninja
           brew link --force libomp
 
+      # ---- C++ 预编译依赖（deps release）→ CT2RS_PREBUILT_DIR 直链 ----
+      # CT2+oneDNN(+cpu_features) 归档由 prebuilt-deps workflow 产出（仅
+      # 依赖版本变化时重建），正式发布 C++ 零编译。
+      - name: Download prebuilt C++ deps
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -sSL -o /tmp/ct2.tgz \
+            "https://github.com/dwdcth/rumi-ocr/releases/download/deps/ct2-prebuilt-${{ matrix.target }}.tar.gz"
+          sudo mkdir -p /opt/ct2-prebuilt
+          sudo tar -xzf /tmp/ct2.tgz --strip-components=1 -C /opt/ct2-prebuilt
+          ls -la /opt/ct2-prebuilt/
+          test -f /opt/ct2-prebuilt/libctranslate2.a || test -f /opt/ct2-prebuilt/ctranslate2.lib
+
       # ---- 构建 ----
       # CXXFLAGS 只在 x86_64 Linux 钉基线（原因见 ci.yml 同名注释：
       # CTranslate2 基础 kernels.cc 的 ISA 泄漏防御）。
@@ -245,7 +259,11 @@ jobs:
           # env 里条件表达式在 Windows 会产出空串变量，cmake-rs 转成 -G ""
           # 直接 'Could not create named generator'。
           if [ "${{ runner.os }}" != "Windows" ]; then export CMAKE_GENERATOR=Ninja; fi
-          cargo build --release --workspace --target ${{ matrix.target }}
+          export CT2RS_PREBUILT_DIR=/opt/ct2-prebuilt
+          # ct2-prebuilt：链预编译归档（translate 的 feature；no-default 关掉
+          # 源码编译的 ct2-dnnl——两者不能同开，onednn-src 会击穿跳过）
+          cargo build --release --workspace --target ${{ matrix.target }} \
+            --no-default-features --features rumi-translate/ct2-prebuilt
         env:
           CXXFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-march=x86-64' || '' }}
           OpenMP_ROOT: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/opt/libomp' || '/usr/local/opt/libomp') || '' }}
