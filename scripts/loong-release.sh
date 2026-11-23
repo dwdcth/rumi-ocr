@@ -40,7 +40,7 @@ CT2_DIR="$ROOT/target/loong-ct2-prebuilt"
 mkdir -p "$CT2_DIR" "$OUT"
 if [[ ! -f "$CT2_DIR/libctranslate2.a" ]]; then
   curl -sSL -o /tmp/ct2.tgz \
-    "https://github.com/${REPO}/releases/download/loong64-deps/libctranslate2-loong64.tar.gz"
+    "https://github.com/${REPO}/releases/download/deps/ct2-prebuilt-loongarch64-unknown-linux-gnu.tar.gz"
   tar -xzf /tmp/ct2.tgz -C "$CT2_DIR"
 fi
 test -f "$CT2_DIR/libctranslate2.a"

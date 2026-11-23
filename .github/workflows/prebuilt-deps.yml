@@ -44,16 +44,19 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             ort_rid: osx-arm64
+          - target: loongarch64-unknown-linux-gnu
+            os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        if: matrix.target != 'loongarch64-unknown-linux-gnu'
         with:
           targets: ${{ matrix.target }}
 
       - name: Install desktop system deps (linux only)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.target != 'loongarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -73,7 +76,7 @@ jobs:
       # oar-ocr/ort-sys 在依赖图里，探测失败会回退静态下载（污染产物
       # 语义），保持与 release.yml 相同的动态链环境。
       - name: Prepare onnxruntime (unix)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.target != 'loongarch64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euxo pipefail
@@ -137,11 +140,55 @@ jobs:
           "PKG_CONFIG_PATH=C:\onnxruntime\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Verify onnxruntime discoverable via pkg-config
+        if: matrix.target != 'loongarch64-unknown-linux-gnu'
         shell: bash
         run: pkg-config --modversion libonnxruntime
 
+      # ---- 龙芯分支：QEMU 容器内纯 cmake 编 CTranslate2 ----
+      # （不经 cargo：loong 无 dnnl feature，直接 cmake 与本地 loong64-deps
+      #  产出参数一致；docker login 复用下方 ghcr 拉取）
+      - name: Docker login ghcr
+        if: matrix.target == 'loongarch64-unknown-linux-gnu'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build CT2 in QEMU container (loong64)
+        if: matrix.target == 'loongarch64-unknown-linux-gnu'
+        run: |
+          docker run -d --name rumi-loong-pre --platform linux/loong64 \
+            ghcr.io/dwdcth/rumi-loong-build:v1 sleep infinity
+          cat > /tmp/ct2-cmake.sh <<'EOS'
+          set -euxo pipefail
+          SRC=/root/.cargo/git/checkouts/ctranslate2-rs-*/*/ct2rs/CTranslate2
+          # 源码不在镜像（registry/git 缓存被清）——git clone fork 分支钉的
+          # CTranslate2（slim-submodules，90573db5）
+          test -d "$SRC" || {
+            git clone -q --depth 1 --branch slim-submodules \
+              https://github.com/dwdcth/CTranslate2 /tmp/c3
+            git -C /tmp/c3 fetch -q --depth 1 origin 90573db535c2b88ef2400a625de0249227e55090
+            git -C /tmp/c3 checkout -q 90573db535c2b88ef2400a625de0249227e55090
+            git -C /tmp/c3 submodule -q update --init --depth 1 third_party/cxxopts third_party/cpu_features third_party/spdlog
+            SRC=/tmp/c3
+          }
+          mkdir -p /tmp/ct2build && cd /tmp/ct2build
+          cmake "$SRC" -B . -DBUILD_CLI=OFF -DBUILD_SHARED_LIBS=OFF -DWITH_MKL=OFF \
+            -DOPENMP_RUNTIME=COMP -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_CPU_DISPATCH=OFF \
+            -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS= -ffunction-sections -fdata-sections -fPIC -w' \
+            '-DCMAKE_C_FLAGS= -ffunction-sections -fdata-sections -fPIC -w'
+          make -j"$(nproc)"
+          test -f libctranslate2.a
+          EOS
+          docker cp /tmp/ct2-cmake.sh rumi-loong-pre:/tmp/ct2-cmake.sh
+          docker exec rumi-loong-pre bash /tmp/ct2-cmake.sh
+          mkdir -p dist/ct2-prebuilt-${{ matrix.target }}
+          docker cp rumi-loong-pre:/tmp/ct2build/libctranslate2.a dist/ct2-prebuilt-${{ matrix.target }}/
+          printf 'ct2rs=%s\ntarget=%s\ncmake=native(openmp-comp,cpu-dispatch-off)\n' \
+            5007faae2b9f2d2147868be47a11e1be5da00f49 ${{ matrix.target }} > dist/ct2-prebuilt-${{ matrix.target }}/BUILD_INFO
+          tar czf ct2-prebuilt-${{ matrix.target }}.tar.gz -C dist ct2-prebuilt-${{ matrix.target }}
+          docker rm -f rumi-loong-pre
+
       # 完整 CMake 构建一次（产出三个静态库）
       - name: Build C++ deps via ct2rs
+        if: matrix.target != 'loongarch64-unknown-linux-gnu'
         shell: bash
         run: |
           # 条件 export：env 空串会让 cmake-rs 收到 -G ""（release.yml 同款坑）
@@ -156,7 +203,7 @@ jobs:
       # 捞产物：ct2rs OUT_DIR 的 build/libctranslate2.a、onednn-src 的
       # libdnnl.a、（x86_64）cpu_features 的 libcpu_features.a
       - name: Collect archives (unix)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.target != 'loongarch64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euxo pipefail
