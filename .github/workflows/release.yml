@@ -234,7 +234,12 @@ jobs:
       # CTranslate2 基础 kernels.cc 的 ISA 泄漏防御）。
       - name: Build
         shell: bash
-        run: cargo build --release --workspace --target ${{ matrix.target }}
+        run: |
+          # Ninja 仅 Unix（Windows 的 MSBuild 生成器保持默认）。条件 export：
+          # env 里条件表达式在 Windows 会产出空串变量，cmake-rs 转成 -G ""
+          # 直接 'Could not create named generator'。
+          if [ "${{ runner.os }}" != "Windows" ]; then export CMAKE_GENERATOR=Ninja; fi
+          cargo build --release --workspace --target ${{ matrix.target }}
         env:
           CXXFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-march=x86-64' || '' }}
           OpenMP_ROOT: ${{ runner.os == 'macOS' && (runner.arch == 'ARM64' && '/opt/homebrew/opt/libomp' || '/usr/local/opt/libomp') || '' }}
@@ -257,7 +262,6 @@ jobs:
           #   大 C++ 静态库的链接期数十秒→数秒）
           # - macOS：留空（沿用 config.toml；其 linux 段本就不适用）
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || (runner.os == 'Linux' && '-Clink-arg=-Wl,--exclude-libs,ALL -Clink-arg=-fuse-ld=lld' || '') }}
-          CMAKE_GENERATOR: ${{ runner.os != 'Windows' && 'Ninja' || '' }}
           CMAKE_C_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'ccache' || '' }}
           CMAKE_CXX_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'ccache' || '' }}
           CCACHE_BASEDIR: ${{ github.workspace }}
