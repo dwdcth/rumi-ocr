@@ -49,6 +49,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Windows 弃 VS/MSBuild 生成器改 Ninja（agy 定位：MSBuild 多配置产物
+      # 落点诡异 + nodeReuse 孤儿进程；单配置 Ninja 与 Unix 行为一致，
+      # cmake-rs 有 msvc+ninja 专门路径）。msvc-dev-cmd 注入 cl.exe 环境。
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Install ninja (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install ninja --no-progress -y
+
       - name: Install desktop system deps (linux only)
         if: runner.os == 'Linux'
         run: |
@@ -140,8 +150,9 @@ jobs:
       - name: Build C++ deps via ct2rs
         shell: bash
         run: |
-          # 条件 export：env 空串会让 cmake-rs 收到 -G ""（同 release.yml 坑）
-          if [ "${{ runner.os }}" != "Windows" ]; then export CMAKE_GENERATOR=Ninja; fi
+          # 全平台统一 Ninja（Windows 经 msvc-dev-cmd 提供 cl 环境；
+          # env 空串坑已避——无条件 export）
+          export CMAKE_GENERATOR=Ninja
           cargo build --release -p rumi-translate --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || '' }}
