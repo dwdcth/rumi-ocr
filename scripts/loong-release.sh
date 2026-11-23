@@ -50,7 +50,9 @@ test -f "$CT2_DIR/libctranslate2.a"
 cat > /tmp/loong-rel-build.sh <<'EOS'
 set -euxo pipefail
 . ~/.cargo/env
-cp -r /src/. /build/
+# tar 管道复制（排除挂载点 target 与 .git）：/src/target 是宿主的
+# symlink，与容器挂载目录 /build/target 冲突，cp 直接报错
+tar -C /src --exclude=./target --exclude=./.git -cf - . | tar -C /build -xf -
 cd /build
 export CT2RS_PREBUILT_DIR=/opt2/ct2-prebuilt
 cargo build --release --workspace --target loongarch64-unknown-linux-gnu
