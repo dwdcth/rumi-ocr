@@ -71,7 +71,9 @@ for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
   printf '#!/bin/sh\nDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$DIR/%s" "$@"\n' "$b" > "/out/${stage}/run-$b.sh"
   chmod +x "/out/${stage}/run-$b.sh"
 done
-cp -P /opt/onnxruntime/lib/libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1 "/out/${stage}/lib/"
+# 实体（-L 解引用镜像里的 symlink）+ SONAME 链接 .so.1（DT_NEEDED 名）
+cp -L /opt/onnxruntime/lib/libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so"
+ln -sf libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so.1"
 cp README.md "/out/${stage}/" 2>/dev/null || true
 tar czf "/out/${stage}.tar.gz" -C /out "$stage"
 EOS
