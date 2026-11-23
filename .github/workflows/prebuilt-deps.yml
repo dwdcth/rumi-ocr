@@ -8,12 +8,12 @@ name: prebuilt-deps
 on:
   workflow_dispatch:
     inputs:
-      skip_matrix:
-        description: 'true=跳过 5 主流平台（只跑龙芯）'
+      targets:
+        description: '要跑的主流平台（JSON 数组；默认全部。例：只补 x64 两平台 ["x86_64-unknown-linux-gnu","x86_64-pc-windows-msvc"]）'
         required: false
-        default: 'false'
+        default: '["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","x86_64-pc-windows-msvc","x86_64-apple-darwin","aarch64-apple-darwin"]'
       skip_loong:
-        description: 'true=跳过龙芯（只跑 5 平台矩阵）'
+        description: 'true=跳过龙芯 job'
         required: false
         default: 'false'
 
@@ -28,27 +28,14 @@ env:
 jobs:
   build:
     name: prebuilt (${{ matrix.target }})
-    if: github.event.inputs.skip_matrix != 'true'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            ort_rid: linux-x64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            ort_rid: linux-arm64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            ort_rid: win-x64
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-            ort_rid: osx-x64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            ort_rid: osx-arm64
-    runs-on: ${{ matrix.os }}
+        target: ${{ fromJSON(github.event.inputs.targets) }}
+    # 平台属性查表（动态 matrix 无 include 字段）
+    runs-on: ${{ fromJSON('{"x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-unknown-linux-gnu":"ubuntu-24.04-arm","x86_64-pc-windows-msvc":"windows-latest","x86_64-apple-darwin":"macos-15-intel","aarch64-apple-darwin":"macos-latest"}')[matrix.target] }}
+    env:
+      ORT_RID: ${{ fromJSON('{"x86_64-unknown-linux-gnu":"linux-x64","aarch64-unknown-linux-gnu":"linux-arm64","x86_64-pc-windows-msvc":"win-x64","x86_64-apple-darwin":"osx-x64","aarch64-apple-darwin":"osx-arm64"}')[matrix.target] }}
     steps:
       - uses: actions/checkout@v4
 
@@ -86,13 +73,13 @@ jobs:
           unzip -q /tmp/ort.nupkg 'runtimes/*' 'build/native/include/*'
           sudo mkdir -p /opt/onnxruntime/lib /opt/onnxruntime/include
           sudo cp -r build/native/include/. /opt/onnxruntime/include/
-          case "${{ matrix.ort_rid }}" in
+          case "$ORT_RID" in
             linux-*)
-              sudo cp "runtimes/${{ matrix.ort_rid }}/native/libonnxruntime.so" /opt/onnxruntime/lib/
+              sudo cp "runtimes/$ORT_RID/native/libonnxruntime.so" /opt/onnxruntime/lib/
               sudo ln -sf libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1
               ;;
             osx-*)
-              sudo cp "runtimes/${{ matrix.ort_rid }}/native/libonnxruntime.dylib" /opt/onnxruntime/lib/
+              sudo cp "runtimes/$ORT_RID/native/libonnxruntime.dylib" /opt/onnxruntime/lib/
               ;;
           esac
           sudo mkdir -p /opt/onnxruntime/lib/pkgconfig
@@ -116,7 +103,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           choco install pkgconfiglite --no-progress -y
-          $rid = '${{ matrix.ort_rid }}'
+          $rid = $env:ORT_RID
           $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/$env:ORT_VERSION"
           Invoke-WebRequest -Uri $url -OutFile C:\ort.zip
           New-Item -ItemType Directory -Force C:\ort-raw | Out-Null
