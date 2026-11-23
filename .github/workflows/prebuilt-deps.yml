@@ -9,6 +9,11 @@ name: prebuilt-deps
 
 on:
   workflow_dispatch:
+    inputs:
+      targets:
+        description: '要构建的平台（逗号分隔 target 名；all=全部。重跑只填报错的）'
+        required: false
+        default: 'all'
 
 permissions:
   contents: write
@@ -40,6 +45,8 @@ jobs:
             os: macos-latest
             ort_rid: osx-arm64
     runs-on: ${{ matrix.os }}
+    # 平台过滤：inputs.targets 含 target 名（或 all）才跑
+    if: inputs.targets == 'all' || contains(inputs.targets, matrix.target)
     steps:
       - uses: actions/checkout@v4
 
