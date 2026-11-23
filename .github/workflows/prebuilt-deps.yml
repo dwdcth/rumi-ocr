@@ -5,6 +5,12 @@
 #   - prebuilt-loong64：QEMU 容器纯 cmake 编 CTranslate2（无 dnnl）
 name: prebuilt-deps
 
+concurrency:
+  # 同一 workflow+分支的新 run 自动取消旧 run（避免重复排队浪费）
+  group: prebuilt-deps-${ github.ref }
+  cancel-in-progress: true
+
+
 on:
   workflow_dispatch:
     inputs:

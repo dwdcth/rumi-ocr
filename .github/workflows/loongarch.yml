@@ -5,6 +5,12 @@
 # 经宿主目录挂载 + actions/cache 跨轮增量（Rust 只重编改动）。
 name: loongarch64
 
+concurrency:
+  # 同一 workflow+分支的新 run 自动取消旧 run（避免重复排队浪费）
+  group: loongarch64-${ github.ref }
+  cancel-in-progress: true
+
+
 on:
   workflow_dispatch:
     inputs:

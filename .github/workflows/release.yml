@@ -38,6 +38,12 @@
 
 name: release
 
+concurrency:
+  # 同一 workflow+分支的新 run 自动取消旧 run（避免重复排队浪费）
+  group: release-${ github.ref }
+  cancel-in-progress: true
+
+
 on:
   push:
     tags: ['v*']
