@@ -12,10 +12,11 @@
 #   3. x86_64-pc-windows-msvc      windows-latest
 #   4. x86_64-apple-darwin         macos-15-intel
 #   5. aarch64-apple-darwin        macos-latest
-#   6. loongarch64-unknown-linux-gnu QEMU 容器（ghcr.io/dwdcth/rumi-loong-build:v1
-#                                  Debian trixie 新世界）；CTranslate2 的 C++ 是 QEMU 编译
-#                                  大头（单轮 ~1h+），改用本仓库 deps release 里的预编译
-#                                  libctranslate2.a（CT2RS_PREBUILT_DIR，ct2rs fork 支持）。
+#   6. loongarch64-unknown-linux-gnu x86_64 宿主原生 rustc + clang/lld 交叉编译
+#                                  （从 ghcr.io/dwdcth/rumi-loong-build:v1 导出
+#                                  Debian trixie 新世界 sysroot，deps release 提供
+#                                  预编译 libctranslate2.a）；最后仅用 QEMU 容器跑
+#                                  check-linux-package.sh 与冒烟执行验包（冷编 2h+→~10m）。
 #   注：macOS x64/arm64 各自原生构建不做 lipo 合并（ct2rs build.rs 用宿主架构宏定
 #   CMAKE_OSX_ARCHITECTURES，交叉必错架构）。
 #
@@ -430,9 +431,10 @@ jobs:
             rumi-${{ env.LABEL }}-${{ matrix.target }}.zip
           if-no-files-found: error
 
-  # 龙芯（loongarch64，新世界）：QEMU 容器 + 预装镜像 + deps release 的
-  # 预编译 CT2。独立 job（流程与主流平台不同：无 ort 步骤/无 rust-toolchain，
-  # 全在容器内）。targets 含 loongarch64 或 all 时跑；tag 触发恒跑。
+  # 龙芯（loongarch64，新世界）：x86_64 宿主原生 rustc + clang/lld 交叉编译
+  # （从 ghcr.io/dwdcth/rumi-loong-build:v1 导出 sysroot + deps release 预编译
+  # libctranslate2.a），最后仅在 QEMU 容器内跑 check-linux-package.sh 与实机
+  # 加载/冒烟验包。targets 含 loongarch64 或 all 时跑；tag 触发恒跑。
   build-loong64:
     name: build (loongarch64-unknown-linux-gnu)
     if: >-
@@ -440,7 +442,7 @@ jobs:
       github.event.inputs.targets == 'all' ||
       contains(github.event.inputs.targets, 'loongarch64')
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 60
     permissions:
       contents: write
       packages: read
@@ -448,6 +450,16 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: loongarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-v2-loongarch64-unknown-linux-gnu
+          env-vars: ORT_VERSION
+          cache-on-failure: true
 
       - name: Determine release label
         shell: bash
@@ -462,91 +474,102 @@ jobs:
           fi
           echo "LABEL=$label" >> "$GITHUB_ENV"
 
+      - name: Install host cross-compile tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm libclang-dev pkg-config libssl-dev
+
+      - name: Docker login ghcr (pull loong64 sysroot image)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Extract loong64 sysroot & download prebuilt CT2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SYSROOT=/tmp/loong-sysroot
+          rm -rf "$SYSROOT" && mkdir -p "$SYSROOT"
+          cid=$(docker create --platform linux/loong64 ghcr.io/dwdcth/rumi-loong-build:v1 true)
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          docker export "$cid" | tar -xf - -C "$SYSROOT" \
+            usr/include usr/lib usr/lib64 usr/share/pkgconfig lib lib64 opt/onnxruntime
+          # 验证 sysroot 内 ORT pkg-config 可探测
+          PKG_CONFIG_ALLOW_CROSS=1 \
+          PKG_CONFIG_SYSROOT_DIR="$SYSROOT" \
+          PKG_CONFIG_LIBDIR="$SYSROOT/usr/lib/loongarch64-linux-gnu/pkgconfig:$SYSROOT/usr/share/pkgconfig:$SYSROOT/opt/onnxruntime/lib/pkgconfig" \
+            pkg-config --modversion libonnxruntime
+
+          # CTranslate2 预编译静态库（deps release，龙芯无 oneDNN，仅 libctranslate2.a）
+          mkdir -p ct2-prebuilt
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/ct2.tgz \
+            "https://github.com/dwdcth/rumi-ocr/releases/download/deps/ct2-prebuilt-loongarch64-unknown-linux-gnu.tar.gz"
+          tar -xzf /tmp/ct2.tgz --strip-components=1 -C ct2-prebuilt
+          test -f ct2-prebuilt/libctranslate2.a
+
+      - name: Cross-compile workspace (loongarch64)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SYSROOT=/tmp/loong-sysroot
+          cat > /tmp/loong-cc <<EOF
+          #!/bin/sh
+          exec clang --target=loongarch64-linux-gnu --sysroot=$SYSROOT --gcc-toolchain=$SYSROOT/usr -fuse-ld=lld "\$@"
+          EOF
+          cat > /tmp/loong-cxx <<EOF
+          #!/bin/sh
+          exec clang++ --target=loongarch64-linux-gnu --sysroot=$SYSROOT --gcc-toolchain=$SYSROOT/usr -fuse-ld=lld "\$@"
+          EOF
+          chmod +x /tmp/loong-cc /tmp/loong-cxx
+
+          # 目标级 env 隔离（避免污染宿主 x86_64 的 build script / proc-macro 编译）
+          export CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER=/tmp/loong-cc
+          export CC_loongarch64_unknown_linux_gnu=/tmp/loong-cc
+          export CXX_loongarch64_unknown_linux_gnu=/tmp/loong-cxx
+          export AR_loongarch64_unknown_linux_gnu=llvm-ar
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export PKG_CONFIG_SYSROOT_DIR_loongarch64_unknown_linux_gnu="$SYSROOT"
+          export PKG_CONFIG_LIBDIR_loongarch64_unknown_linux_gnu="$SYSROOT/usr/lib/loongarch64-linux-gnu/pkgconfig:$SYSROOT/usr/share/pkgconfig:$SYSROOT/opt/onnxruntime/lib/pkgconfig"
+          export BINDGEN_EXTRA_CLANG_ARGS_loongarch64_unknown_linux_gnu="--target=loongarch64-linux-gnu --sysroot=$SYSROOT"
+          export CT2RS_PREBUILT_DIR="$PWD/ct2-prebuilt"
+          # --exclude-libs,ALL（防静态库符号劫持 ORT）+ DT_RPATH=$ORIGIN/lib
+          export CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Clink-arg=-Wl,--exclude-libs,ALL -Clink-arg=-Wl,--disable-new-dtags -Clink-arg=-Wl,-rpath,$ORIGIN/lib'
+          # --no-default-features：龙芯无 oneDNN，关掉默认 ct2-dnnl，只链预编译 libctranslate2.a
+          cargo build --release --workspace --target loongarch64-unknown-linux-gnu --no-default-features
+
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: loong64
 
-      # cargo 缓存挂载点（宿主目录，actions/cache 持久化；容器路径恒定
-      # /build/target 保证 build script fingerprint 跨轮有效）
-      - name: Restore cargo caches
-        uses: actions/cache@v4
-        with:
-          path: |
-            /tmp/loong-target
-            /tmp/loong-cargo-registry
-            /tmp/loong-cargo-git
-          key: loong-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: loong-cargo-
-
-      # 脚本经 heredoc 落盘再 docker exec，避免多层引号转义。
-      - name: Docker login ghcr (pull private image)
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Build in QEMU loong64 container
+      - name: Package & verify in QEMU loong64 container
+        shell: bash
         run: |
-          cat > /tmp/loong-build.sh <<'EOS'
           set -euxo pipefail
-          # commit 镜像不带 ENV（docker commit 不保留环境变量），ORT 探测
-          # 与加载路径显式给出（缺 PKG_CONFIG_PATH 时 ort-sys 回退下载
-          # 预编译包，loongarch64 无资产直接挂）
-          export PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig
-          export LD_LIBRARY_PATH=/opt/onnxruntime/lib
-          pkg-config --modversion libonnxruntime
-          # CTranslate2 预编译静态库（loong64-deps release）
-          mkdir -p /opt/ct2-prebuilt
-          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/ct2.tgz \
-            "https://github.com/dwdcth/rumi-ocr/releases/download/deps/ct2-prebuilt-loongarch64-unknown-linux-gnu.tar.gz"
-          tar -xzf /tmp/ct2.tgz --strip-components=1 -C /opt/ct2-prebuilt
-          test -f /opt/ct2-prebuilt/libctranslate2.a
-
-          . ~/.cargo/env
-          # 镜像带着本地的中科大 crates 镜像配置（国内网络用）；GitHub 境外
-          # runner 拉它返回 403（cargo: failed to query replaced source
-          # registry），CI 上删掉改走 crates.io 官方源（runner 在美国机房，
-          # 直连最快最稳）。
-          rm -f /root/.cargo/config.toml
-          cp -r /src/. /build/
-          cd /build
-          export CT2RS_PREBUILT_DIR=/opt/ct2-prebuilt
-          # RUSTFLAGS 覆盖 config.toml，exclude-libs 必须一并携带；
-          # --disable-new-dtags + -rpath,$ORIGIN/lib 让直接运行优先命中包内 lib/
-          export RUSTFLAGS='-Clink-arg=-Wl,--exclude-libs,ALL -Clink-arg=-Wl,--disable-new-dtags -Clink-arg=-Wl,-rpath,$ORIGIN/lib'
-          # --no-default-features：龙芯无 oneDNN，关掉默认 ct2-dnnl，只链预编译 libctranslate2.a
-          cargo build --release --workspace --target loongarch64-unknown-linux-gnu --no-default-features
-
-          # 打包（与 Linux 原生 job 同构：bins + ort/xdo so + run-*.sh）
+          SYSROOT=/tmp/loong-sysroot
           target=loongarch64-unknown-linux-gnu
           stage="rumi-${LABEL}-${target}"
-          mkdir -p "/out/${stage}/lib"
+          rm -rf "dist/${stage}" && mkdir -p "dist/${stage}/lib"
           for b in rumi-ui rumi-server rumi-capture rumi-translate-cli; do
-            cp "target/${target}/release/$b" "/out/${stage}/"
-            printf '#!/bin/sh\nDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$DIR/%s" "$@"\n' "$b" > "/out/${stage}/run-$b.sh"
-            chmod +x "/out/${stage}/run-$b.sh"
+            cp "target/${target}/release/$b" "dist/${stage}/"
+            printf '#!/bin/sh\nDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$DIR/%s" "$@"\n' "$b" > "dist/${stage}/run-$b.sh"
+            chmod +x "dist/${stage}/run-$b.sh"
           done
           # 镜像里只有 libonnxruntime.so（无 .so.1 链接），解引用拷贝实体并建 SONAME 链接
-          cp -L /opt/onnxruntime/lib/libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so"
-          ln -sf libonnxruntime.so "/out/${stage}/lib/libonnxruntime.so.1"
+          cp -L "$SYSROOT/opt/onnxruntime/lib/libonnxruntime.so" "dist/${stage}/lib/libonnxruntime.so"
+          ln -sf libonnxruntime.so "dist/${stage}/lib/libonnxruntime.so.1"
           # libxdo 随包携带（不同发行版 soname 不同，仅 rumi-ui 需要）
-          xdo=$(PATH="$PATH:/usr/sbin:/sbin" ldconfig -p | awk '/libxdo\.so\.[0-9]+/ && !f {print $NF; f=1}')
+          xdo=$(find "$SYSROOT/usr/lib/loongarch64-linux-gnu" -maxdepth 1 -name 'libxdo.so.[0-9]*' | sort | awk 'NR==1')
           test -n "$xdo"
-          cp -L "$xdo" "/out/${stage}/lib/"
-          cp README.md "/out/${stage}/" 2>/dev/null || true
-          bash /build/scripts/check-linux-package.sh "/out/${stage}"
-          tar czf "/out/rumi-${LABEL}-${target}.tar.gz" -C /out "$stage"
-          ls -la /out
-          EOS
+          cp -L "$xdo" "dist/${stage}/lib/"
+          cp README.md "dist/${stage}/" 2>/dev/null || true
 
-          mkdir -p /tmp/loong-target /tmp/loong-cargo-registry /tmp/loong-cargo-git
-          docker run -d --name rumi-loong --platform linux/loong64 \
-            -v "$GITHUB_WORKSPACE":/src:ro \
-            -v /tmp/loong-target:/build/target \
-            -v /tmp/loong-cargo-registry:/root/.cargo/registry \
-            -v /tmp/loong-cargo-git:/root/.cargo/git \
-            ghcr.io/dwdcth/rumi-loong-build:v1 sleep infinity
-          docker cp /tmp/loong-build.sh rumi-loong:/tmp/loong-build.sh
-          docker exec -e LABEL="$LABEL" rumi-loong bash /tmp/loong-build.sh
-          mkdir -p dist
-          docker cp rumi-loong:/out/. dist/
+          # 进 QEMU 龙芯容器跑加载器自检 + 冒烟执行（不设 LD_LIBRARY_PATH，验证 RPATH）
+          docker run --rm --platform linux/loong64 \
+            -v "$PWD/scripts":/scripts:ro \
+            -v "$PWD/dist/${stage}":/pkg:ro \
+            ghcr.io/dwdcth/rumi-loong-build:v1 \
+            bash -c 'set -euxo pipefail; unset LD_LIBRARY_PATH; bash /scripts/check-linux-package.sh /pkg; /pkg/rumi-translate-cli --help | awk "NR<=5"'
+
+          tar czf "dist/rumi-${LABEL}-${target}.tar.gz" -C dist "$stage"
+          ls -lh "dist/rumi-${LABEL}-${target}.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
