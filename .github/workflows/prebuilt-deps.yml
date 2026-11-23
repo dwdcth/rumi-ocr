@@ -180,13 +180,29 @@ jobs:
           tar czf ct2-prebuilt-${{ matrix.target }}.tar.gz -C /tmp $STAGE
           tar tzf ct2-prebuilt-${{ matrix.target }}.tar.gz
 
+      - name: Diagnose Windows build artifacts
+        if: runner.os == 'Windows' && always()
+        shell: pwsh
+        run: |
+          $t = '${{ matrix.target }}'
+          $buildDir = "target/$t/release/build"
+          Write-Host "Inspecting: $buildDir (exists=$(Test-Path $buildDir))"
+          Get-ChildItem $buildDir -Directory | Where-Object Name -Match 'ct2rs|onednn' | ForEach-Object {
+            Write-Host "--- DIR: $($_.FullName) ---"
+            Get-ChildItem $_.FullName -Recurse -File | Where-Object Extension -In '.lib','.a','.exe' | ForEach-Object {
+              Write-Host "  LIB: $($_.FullName) ($($_.Length) bytes)"
+            }
+            $outLog = Join-Path $_.FullName "output"
+            if (Test-Path $outLog) { Write-Host "  [output tail 30]:"; Get-Content $outLog -Tail 30 }
+          }
+
       - name: Collect archives (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $t = '${{ matrix.target }}'
-          $ct2 = Get-ChildItem "target/$t/release/build/ct2s-*" -Recurse -Filter ctranslate2.lib | Select-Object -First 1
+          $ct2 = Get-ChildItem "target/$t/release/build/ct2rs-*" -Recurse -Filter ctranslate2.lib | Select-Object -First 1
           $dnnl = Get-ChildItem "target/$t/release/build/onednn-src-*" -Recurse -Filter dnnl.lib | Select-Object -First 1
           if (-not $ct2 -or -not $dnnl) {
             Write-Host "=== 取证：target 下的 .lib ==="
@@ -195,7 +211,7 @@ jobs:
             Get-ChildItem "target/$t/release/build" -Directory | Where-Object Name -Match 'ct2rs|onednn' | ForEach-Object { $_.FullName }
             throw "archive not found: ct2=$ct2 dnnl=$dnnl"
           }
-          $cf = Get-ChildItem "target/$t/release/build/ct2s-*" -Recurse -Filter cpu_features.lib | Select-Object -First 1
+          $cf = Get-ChildItem "target/$t/release/build/ct2rs-*" -Recurse -Filter cpu_features.lib | Select-Object -First 1
           $stage = "ct2-prebuilt-$t"
           New-Item -ItemType Directory -Force "dist/$stage" | Out-Null
           Copy-Item $ct2.FullName "dist/$stage/"
